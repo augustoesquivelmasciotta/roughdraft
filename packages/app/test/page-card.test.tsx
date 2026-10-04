@@ -1,4 +1,5 @@
 import type { Editor } from "@tiptap/react";
+import { parse as parseYaml } from "yaml";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1707,12 +1708,20 @@ describe("PageCard editor integration", () => {
       await Promise.resolve();
     });
 
-    const savedMarkdown = rendered.onSave.mock.calls[0]?.[1];
-    expect(savedMarkdown).toContain("alpha");
-    expect(savedMarkdown).not.toContain("Root comment");
-    expect(savedMarkdown).not.toContain("Nested reply");
-    expect(savedMarkdown).not.toContain('id="root"');
-    expect(savedMarkdown).not.toContain('id="child"');
+    const savedMarkdown = String(rendered.onSave.mock.calls[0]?.[1]);
+    const [body, endmatter = ""] = savedMarkdown.split("\n---\n");
+    expect(body).toContain("alpha");
+    expect(body).not.toContain("Root comment");
+    expect(body).not.toContain("Nested reply");
+    expect(body).not.toContain('id="root"');
+    expect(body).not.toContain('id="child"');
+    // Deleted comments stay on record in the endmatter `deleted` list.
+    expect(parseYaml(endmatter)).toMatchObject({
+      deleted: [
+        { id: "root", by: "user", body: "Root comment", anchor: "alpha" },
+        { id: "child", by: "user", body: "Nested reply", re: "root" },
+      ],
+    });
   });
 
   it("renders suggestion replies only inside the suggestion card", async () => {

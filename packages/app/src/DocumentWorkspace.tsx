@@ -45,6 +45,7 @@ import {
   type DocumentSaveState,
   PageCard,
 } from "./PageCard";
+import { readLastHandoffAt, writeLastHandoffAt } from "./review-navigation";
 import { RobotsHighFiveToy } from "./RobotsHighFiveToy";
 import type { CompleteReviewOptions, Page, StorageBackend } from "./storage";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
@@ -435,6 +436,9 @@ export function DocumentWorkspace({
   const [overallComment, setOverallComment] = useState("");
   const [documentChangedSinceOpen, setDocumentChangedSinceOpen] =
     useState(false);
+  const [lastHandoffAt, setLastHandoffAt] = useState<string | null>(() =>
+    readLastHandoffAt(documentCopyPath ?? activeDocumentPath),
+  );
   const sawNoWatcherAfterNotifiedRef = useRef(false);
   const copiedFileActionTimeoutRef = useRef<number | null>(null);
   const saveControllerRef = useRef<DocumentSaveController | null>(null);
@@ -470,11 +474,12 @@ export function DocumentWorkspace({
     setReviewHandoffState("idle");
     setReviewHandoffPopoverOpen(false);
     setDocumentChangedSinceOpen(false);
+    setLastHandoffAt(readLastHandoffAt(documentCopyPath ?? activeDocumentPath));
     const readyTimer = window.setTimeout(() => {
       documentChangeTrackingReadyRef.current = true;
     }, 0);
     return () => window.clearTimeout(readyTimer);
-  }, [activeDocumentPath, documentPage?.id]);
+  }, [activeDocumentPath, documentCopyPath, documentPage?.id]);
 
   useEffect(() => {
     if (!backend?.getReviewWatchStatus || !activeDocumentPath) {
@@ -582,6 +587,10 @@ export function DocumentWorkspace({
 
         const result = await onCompleteReview(options);
         if (result.delivered) {
+          // Comments the agent adds after this point show up as "New".
+          const handoffAt = new Date().toISOString();
+          writeLastHandoffAt(documentCopyPath ?? activeDocumentPath, handoffAt);
+          setLastHandoffAt(handoffAt);
           setReviewWatcherCount(0);
           setReviewHandoffState("notified");
           setOverallComment("");
@@ -597,7 +606,12 @@ export function DocumentWorkspace({
         setReviewHandoffPopoverOpen(true);
       }
     },
-    [activeDocumentPath, onCompleteReview, reviewHandoffState],
+    [
+      activeDocumentPath,
+      documentCopyPath,
+      onCompleteReview,
+      reviewHandoffState,
+    ],
   );
 
   const handleDocumentDirtyStateChange = useCallback(
@@ -1147,6 +1161,7 @@ export function DocumentWorkspace({
               }}
               saveBlocked={documentDiskChangeState !== "clean"}
               forceResetKey={documentForceResetKey}
+              lastHandoffAt={lastHandoffAt}
             />
           ) : null
         ) : (

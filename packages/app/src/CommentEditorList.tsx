@@ -1,4 +1,14 @@
-import { Bot, Check, Pencil, Reply, Trash2, User, X } from "lucide-react";
+import {
+  Bot,
+  Check,
+  CircleCheck,
+  Pencil,
+  Reply,
+  RotateCcw,
+  Trash2,
+  User,
+  X,
+} from "lucide-react";
 import {
   type KeyboardEvent,
   type MouseEvent,
@@ -37,6 +47,11 @@ interface CommentEditorListProps {
   onHoverComment?: (commentId: string | null) => void;
   onFocusComment?: (commentId: string) => void;
   onReplyComment?: (commentId: string) => void;
+  /** Marks a thread resolved (root comments only). */
+  onResolveComment?: (commentId: string) => void;
+  onReopenComment?: (commentId: string) => void;
+  /** Comments added since the reviewer's last handoff. */
+  newCommentIds?: ReadonlySet<string>;
   pendingFocusCommentId?: string | null;
   newCommentDraftIds?: string[];
   onAutoFocusComment?: (commentId: string) => void;
@@ -104,6 +119,9 @@ export function CommentEditorList({
   onHoverComment,
   onFocusComment,
   onReplyComment,
+  onResolveComment,
+  onReopenComment,
+  newCommentIds,
   pendingFocusCommentId = null,
   newCommentDraftIds = [],
   onAutoFocusComment,
@@ -283,6 +301,10 @@ export function CommentEditorList({
           parentLines={[]}
           variant={variant}
           interactive={interactive}
+          isActiveThread={threadContainsComment(thread, selectedCommentId)}
+          onResolveComment={onResolveComment}
+          onReopenComment={onReopenComment}
+          newCommentIds={newCommentIds}
           drafts={drafts}
           newCommentDraftIds={newCommentDraftIds}
           editingCommentIds={editingCommentIds}
@@ -313,6 +335,24 @@ export function CommentEditorList({
   );
 }
 
+function threadContainsComment(
+  thread: CriticCommentThread,
+  commentId: string | null,
+): boolean {
+  if (!commentId) return false;
+  if (thread.comment.id === commentId) return true;
+  return thread.replies.some((reply) =>
+    threadContainsComment(reply, commentId),
+  );
+}
+
+function countThreadReplies(thread: CriticCommentThread): number {
+  return thread.replies.reduce(
+    (count, reply) => count + 1 + countThreadReplies(reply),
+    0,
+  );
+}
+
 interface CommentThreadNodeProps {
   thread: CriticCommentThread;
   depth: number;
@@ -321,6 +361,11 @@ interface CommentThreadNodeProps {
   parentLines: boolean[];
   variant: "banner" | "rail";
   interactive: boolean;
+  /** The selected comment is in this thread (expands resolved threads). */
+  isActiveThread?: boolean;
+  onResolveComment?: (commentId: string) => void;
+  onReopenComment?: (commentId: string) => void;
+  newCommentIds?: ReadonlySet<string>;
   drafts: Record<string, string>;
   newCommentDraftIds: string[];
   editingCommentIds: string[];
@@ -415,6 +460,10 @@ function CommentThreadNode({
   parentLines,
   variant,
   interactive,
+  isActiveThread = false,
+  onResolveComment,
+  onReopenComment,
+  newCommentIds,
   drafts,
   newCommentDraftIds,
   editingCommentIds,
@@ -435,9 +484,16 @@ function CommentThreadNode({
   getCommentActions,
   onChangeDraft,
 }: CommentThreadNodeProps) {
-  const { comment, replies } = thread;
-  const hasReplies = replies.length > 0;
+  const { comment } = thread;
   const isRootThread = depth === 0;
+  const isResolved = isRootThread && comment.status === "resolved";
+  // Resolved threads stay out of the way until the reviewer opens them.
+  const isCollapsedResolved =
+    isResolved && !isActiveThread && !editingCommentIds.includes(comment.id);
+  const replies = isCollapsedResolved ? [] : thread.replies;
+  const hiddenReplyCount = isCollapsedResolved ? countThreadReplies(thread) : 0;
+  const hasReplies = replies.length > 0;
+  const isNew = newCommentIds?.has(comment.id) ?? false;
   const isSelected = comment.id === selectedCommentId;
   const isHovered = comment.id === hoveredCommentId;
   const isEditing = interactive && editingCommentIds.includes(comment.id);
@@ -516,6 +572,34 @@ function CommentThreadNode({
             onReplyComment?.(comment.id);
           },
         },
+        ...(isRootThread && isResolved && onReopenComment
+          ? [
+              {
+                key: "reopen",
+                label: "Reopen",
+                icon: <RotateCcw className="size-3.5" />,
+                compact: true,
+                onClick: (event: MouseEvent) => {
+                  event.stopPropagation();
+                  onReopenComment(comment.id);
+                },
+              } satisfies CommentActionDefinition,
+            ]
+          : []),
+        ...(isRootThread && !isResolved && onResolveComment
+          ? [
+              {
+                key: "resolve",
+                label: "Resolve",
+                icon: <CircleCheck className="size-3.5" />,
+                compact: true,
+                onClick: (event: MouseEvent) => {
+                  event.stopPropagation();
+                  onResolveComment(comment.id);
+                },
+              } satisfies CommentActionDefinition,
+            ]
+          : []),
         {
           key: "edit",
           label: "Edit",
@@ -686,13 +770,32 @@ function CommentThreadNode({
                 bodyTone,
               )}
             >
-              <div className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
-                {authorLabel}
+              <div className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
+                  {authorLabel}
+                </span>
+                {isNew ? (
+                  <span
+                    data-testid={`comment-${variant}-${comment.id}-new-badge`}
+                    className="shrink-0 rounded-full bg-sky-100 px-1.5 text-[10px] font-semibold leading-4 text-sky-800 dark:bg-sky-900 dark:text-sky-200"
+                  >
+                    New
+                  </span>
+                ) : null}
+                {isResolved ? (
+                  <span
+                    data-testid={`comment-${variant}-${comment.id}-resolved-badge`}
+                    className="shrink-0 rounded-full bg-emerald-100 px-1.5 text-[10px] font-semibold leading-4 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200"
+                  >
+                    Resolved
+                  </span>
+                ) : null}
               </div>
               <div
                 className={cn(
                   "mt-0.5 text-[13px] leading-5 whitespace-pre-wrap",
                   !hasCommentContent && "italic",
+                  isCollapsedResolved && "line-clamp-2 opacity-70",
                   variant === "banner"
                     ? "text-slate-800 dark:text-slate-200"
                     : "text-slate-700 dark:text-slate-300",
@@ -700,6 +803,21 @@ function CommentThreadNode({
               >
                 {isEditing ? null : renderedContent}
               </div>
+              {isResolved && comment.resolvedSummary && !isCollapsedResolved ? (
+                <div
+                  data-testid={`comment-${variant}-${comment.id}-resolution`}
+                  className="mt-1 text-[12px] leading-4 text-emerald-800 dark:text-emerald-300"
+                >
+                  Resolution: {comment.resolvedSummary}
+                </div>
+              ) : null}
+              {hiddenReplyCount > 0 ? (
+                <div className="mt-1 text-[11px] leading-4 text-stone-500 dark:text-stone-400">
+                  {hiddenReplyCount === 1
+                    ? "1 reply"
+                    : `${hiddenReplyCount} replies`}
+                </div>
+              ) : null}
               {isEditing ? (
                 <Textarea
                   data-testid={`comment-${variant}-${comment.id}-editor`}
@@ -783,6 +901,7 @@ function CommentThreadNode({
               parentLines={depth === 0 ? [] : [...parentLines, !isLast]}
               variant={variant}
               interactive={interactive}
+              newCommentIds={newCommentIds}
               drafts={drafts}
               newCommentDraftIds={newCommentDraftIds}
               editingCommentIds={editingCommentIds}

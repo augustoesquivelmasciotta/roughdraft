@@ -12,8 +12,10 @@ import {
   type CriticDocumentSource,
   createCriticChange,
   createCriticComment,
+  createDeletedCommentRecord,
   criticMarkdownHasReviewRail,
   criticMarkdownToEditorState,
+  type DeletedCommentRecord,
   editorStateToCriticMarkdown,
   getCommentDescendantIds,
 } from "./critic-markup";
@@ -21,7 +23,13 @@ import {
   type CriticChangeRailItem,
   DocumentReviewRail,
 } from "./DocumentReviewRail";
-import { getPreferredCommentId, parseCommentIds } from "./document-comments";
+import {
+  buildCommentThreadRailItems,
+  type CommentGroupAnchor,
+  getPreferredCommentId,
+  getRootThreadIdForCommentId,
+  parseCommentIds,
+} from "./document-comments";
 import { EditorContextMenu } from "./EditorContextMenu";
 import {
   commentHighlightPluginKey,
@@ -29,10 +37,21 @@ import {
   criticChangeHighlightPluginKey,
   SUGGESTED_PARAGRAPH_SENTINEL,
 } from "./editor-extensions";
+import { revealFoldedContent } from "./editor-folding";
 import { cn } from "./lib/utils";
 import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
 import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
 import { toHtml } from "./markdown";
+import {
+  buildReviewNavigationTargets,
+  findAdjacentNavigationTarget,
+  getNewCommentIds,
+  getReviewNavigationShortcutDirection,
+  type ReviewNavigationFilter,
+  type ReviewNavigationItem,
+} from "./review-navigation";
+import { ReviewNavigator } from "./ReviewNavigator";
+import { getNavigatorPlatform } from "./comment-shortcuts";
 import type { Page, StorageBackend } from "./storage";
 import { useCommentAnchorLayout } from "./useCommentAnchorLayout";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
@@ -69,6 +88,8 @@ interface PageCardProps {
   onSaveControllerChange?: (controller: DocumentSaveController | null) => void;
   saveBlocked?: boolean;
   forceResetKey?: string | null;
+  /** When the reviewer last clicked "I'm done" on this document. */
+  lastHandoffAt?: string | null;
 }
 
 interface PageCardEditorSurfaceProps {
@@ -89,6 +110,7 @@ interface PageCardEditorSurfaceProps {
   onSaveControllerChange?: (controller: DocumentSaveController | null) => void;
   saveBlocked?: boolean;
   forceResetKey?: string | null;
+  lastHandoffAt?: string | null;
 }
 
 interface RichTextEditorSurfaceProps {
@@ -103,6 +125,7 @@ interface RichTextEditorSurfaceProps {
   backend: StorageBackend;
   onEditorReady?: (editor: Editor | null) => void;
   onCommentRailPresenceChange?: (hasCommentRailSpace: boolean) => void;
+  lastHandoffAt?: string | null;
 }
 
 interface CodeEditorSurfaceProps {
@@ -320,6 +343,29 @@ function isDocumentLevelThread(
   }
 
   return false;
+}
+
+/** The highlighted text a comment is anchored to, for the deleted record. */
+function getCommentAnchorText(
+  editor: Editor | null,
+  commentId: string,
+): string | null {
+  if (!editor) return null;
+
+  const parts: string[] = [];
+  editor.state.doc.descendants((node) => {
+    if (!node.isText || !node.text) return;
+    const isAnchored = node.marks.some(
+      (mark) =>
+        mark.type.name === "commentRef" &&
+        Array.isArray(mark.attrs.commentIds) &&
+        mark.attrs.commentIds.includes(commentId),
+    );
+    if (isAnchored) parts.push(node.text);
+  });
+
+  const text = parts.join("").replaceAll("\u2060", "").trim();
+  return text || null;
 }
 
 function addCommentIdsToAnchor(
@@ -656,6 +702,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   backend,
   onEditorReady,
   onCommentRailPresenceChange,
+  lastHandoffAt = null,
 }: RichTextEditorSurfaceProps) {
   const editorRef = useRef<Editor | null>(null);
   const criticChangeFrameRef = useRef<number | null>(null);
@@ -709,6 +756,9 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const frontmatterRef = useRef<string | null>(parsedContent.frontmatter);
   const endmatterRef = useRef<string | null>(parsedContent.endmatter);
   const sourceRef = useRef<CriticDocumentSource | null>(parsedContent.source);
+  // Comments deleted since the file was loaded; saved in the endmatter
+  // `deleted` list so the removal stays on record.
+  const deletedRecordsRef = useRef<DeletedCommentRecord[]>([]);
 
   useEffect(() => {
     commentsRef.current = comments;
@@ -738,6 +788,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
             frontmatter: frontmatterRef.current,
             endmatter: endmatterRef.current,
             source: sourceRef.current,
+            deletedComments: deletedRecordsRef.current,
           },
         ),
       );
@@ -1316,6 +1367,30 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const { commentGroups, contentHeight, measureLayout } =
     useCommentAnchorLayout(editor, comments.size > 0);
 
+  // Document-level comments (for example overall handoff comments) have no
+  // highlight; show their threads at the top of the rail.
+  const railCommentGroups = useMemo<CommentGroupAnchor[]>(() => {
+    const documentRootIds = [...comments.values()]
+      .filter((comment) => comment.scope === "document")
+      .map((comment) => comment.id);
+    if (documentRootIds.length === 0) return commentGroups;
+
+    return [
+      {
+        key: "__document__",
+        commentIds: documentRootIds,
+        anchorTop: 0,
+        anchorBottom: 24,
+      },
+      ...commentGroups,
+    ];
+  }, [commentGroups, comments]);
+
+  const newCommentIds = useMemo(
+    () => getNewCommentIds(comments.values(), lastHandoffAt),
+    [comments, lastHandoffAt],
+  );
+
   useEffect(() => {
     onEditorReady?.(editor);
 
@@ -1342,6 +1417,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     frontmatterRef.current = parsedContent.frontmatter;
     endmatterRef.current = parsedContent.endmatter;
     sourceRef.current = parsedContent.source;
+    deletedRecordsRef.current = [];
     editorReservedIds.set(editor, new Set(parsedContent.reservedIds));
     commentsRef.current = parsedContent.comments;
     setComments(parsedContent.comments);
@@ -1704,6 +1780,29 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     [emitMarkdownChange],
   );
 
+  const resolveComment = useCallback(
+    (commentId: string, summary?: string) => {
+      const trimmedSummary = summary?.trim();
+      updateComment(commentId, (current) => ({
+        ...current,
+        status: "resolved",
+        resolvedSummary: trimmedSummary || current.resolvedSummary || null,
+      }));
+    },
+    [updateComment],
+  );
+
+  const reopenComment = useCallback(
+    (commentId: string) => {
+      updateComment(commentId, (current) => ({
+        ...current,
+        status: null,
+        resolvedSummary: null,
+      }));
+    },
+    [updateComment],
+  );
+
   const replyToComment = useCallback(
     (commentId: string) => {
       const currentEditor = editorRef.current;
@@ -1871,6 +1970,22 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       );
       const commentIdsToDelete = [commentId, ...descendantIds];
       const deletedIds = new Set(commentIdsToDelete);
+      const deletedAt = new Date().toISOString();
+      const anchorText = getCommentAnchorText(currentEditor, commentId);
+      const reservedIds = editorReservedIds.get(currentEditor);
+      for (const id of commentIdsToDelete) {
+        const deletedComment = commentsRef.current.get(id);
+        reservedIds?.add(id);
+        // Empty drafts were never saved, so there is nothing to record.
+        if (!deletedComment?.content.trim()) continue;
+        deletedRecordsRef.current = [
+          ...deletedRecordsRef.current,
+          createDeletedCommentRecord(deletedComment, {
+            deletedAt,
+            anchor: id === commentId ? anchorText : null,
+          }),
+        ];
+      }
       const nextComments = new Map(commentsRef.current);
       for (const id of commentIdsToDelete) {
         nextComments.delete(id);
@@ -1953,6 +2068,137 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   }, []);
 
   const hasReviewRail = comments.size > 0 || criticChanges.length > 0;
+
+  const navigationTargets = useMemo(() => {
+    const suggestionCommentIds = new Set(
+      criticChanges.flatMap((suggestion) => suggestion.commentIds),
+    );
+    const commentItems: ReviewNavigationItem[] = buildCommentThreadRailItems(
+      railCommentGroups
+        .map((group) => ({
+          ...group,
+          commentIds: group.commentIds.filter(
+            (commentId) => !suggestionCommentIds.has(commentId),
+          ),
+        }))
+        .filter((group) => group.commentIds.length > 0),
+      comments,
+    ).map((item) => ({
+      key: item.key,
+      rootId: item.rootCommentId,
+      kind:
+        comments.get(item.rootCommentId)?.scope === "document"
+          ? "document"
+          : "comment",
+      anchorTop: item.anchorTop,
+      commentIds: item.commentIds,
+    }));
+    const suggestionItems: ReviewNavigationItem[] = criticChanges.map(
+      (suggestion) => ({
+        key: suggestion.changeId,
+        rootId: suggestion.changeId,
+        kind: "suggestion",
+        anchorTop: suggestion.anchorTop,
+        commentIds: suggestion.commentIds,
+      }),
+    );
+
+    return buildReviewNavigationTargets(
+      [...commentItems, ...suggestionItems],
+      comments,
+      newCommentIds,
+    );
+  }, [comments, criticChanges, newCommentIds, railCommentGroups]);
+  const openThreadCount = navigationTargets.filter(
+    (target) => target.isOpen,
+  ).length;
+  const newThreadCount = navigationTargets.filter(
+    (target) => target.isNew,
+  ).length;
+  const [navigationFilter, setNavigationFilter] =
+    useState<ReviewNavigationFilter>("open");
+  const navigationFilterChosenRef = useRef(false);
+  const navigationTargetsRef = useRef(navigationTargets);
+  const navigationFilterRef = useRef(navigationFilter);
+  navigationTargetsRef.current = navigationTargets;
+  navigationFilterRef.current = navigationFilter;
+
+  useEffect(() => {
+    // Start on "new" when the agent left something new since the last handoff.
+    if (navigationFilterChosenRef.current || newThreadCount === 0) return;
+    navigationFilterChosenRef.current = true;
+    setNavigationFilter("new");
+  }, [newThreadCount]);
+
+  const navigateReview = useCallback((direction: 1 | -1) => {
+    const currentKey =
+      selectedChangeIdRef.current ??
+      getRootThreadIdForCommentId(
+        selectedCommentIdRef.current,
+        commentsRef.current,
+      );
+    const target = findAdjacentNavigationTarget(
+      navigationTargetsRef.current,
+      navigationFilterRef.current,
+      currentKey,
+      direction,
+    );
+    if (!target) return;
+
+    const currentEditor = editorRef.current;
+    // Scroll the highlight itself: ProseMirror only scrolls to the selection
+    // while the editor has focus, and the navigator keeps focus outside it.
+    let element: HTMLElement | null = null;
+    if (target.kind === "suggestion") {
+      setSelectedCommentId(null);
+      setSelectedChangeId(target.rootId);
+      element =
+        [
+          ...(currentEditor?.view.dom.querySelectorAll<HTMLElement>(
+            ".critic-change[data-critic-change-id]",
+          ) ?? []),
+        ].find(
+          (candidate) => candidate.dataset.criticChangeId === target.rootId,
+        ) ?? null;
+    } else {
+      setSelectedChangeId(null);
+      setSelectedCommentId(target.rootId);
+      element =
+        target.kind === "document"
+          ? document.querySelector<HTMLElement>(
+              `[data-testid="comment-thread-${CSS.escape(target.rootId)}"]`,
+            )
+          : findCommentAnchorElement(currentEditor, target.rootId);
+    }
+
+    if (currentEditor && element) {
+      revealFoldedContent(currentEditor, element);
+    }
+    requestAnimationFrame(() => {
+      element?.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
+  }, []);
+
+  useEffect(() => {
+    if (layout === "embedded-demo") return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const direction = getReviewNavigationShortcutDirection(
+        event,
+        getNavigatorPlatform(),
+      );
+      if (!direction) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      navigateReview(direction);
+    };
+
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, { capture: true });
+    };
+  }, [layout, navigateReview]);
   const documentShellRef =
     useReviewLayoutShiftAnimation<HTMLDivElement>(hasReviewRail);
   const activeComments = activeCommentIds
@@ -2014,6 +2260,9 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
                 }));
               }}
               onReplyComment={replyToComment}
+              onResolveComment={resolveComment}
+              onReopenComment={reopenComment}
+              newCommentIds={newCommentIds}
               onSelectComment={selectComment}
               onHoverComment={setHoveredCommentId}
               pendingFocusCommentId={pendingFocusCommentId}
@@ -2064,7 +2313,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
           className={reviewRailClass}
           layout={layout === "embedded-demo" ? "flow" : "anchored"}
           testId="document-review-rail"
-          commentGroups={commentGroups}
+          commentGroups={railCommentGroups}
           comments={comments}
           suggestions={criticChanges}
           selectedCommentId={selectedCommentId}
@@ -2080,6 +2329,9 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
             }));
           }}
           onReplyComment={replyToComment}
+          onResolveComment={resolveComment}
+          onReopenComment={reopenComment}
+          newCommentIds={newCommentIds}
           onSelectComment={selectComment}
           onFocusComment={focusComment}
           onHoverComment={setHoveredCommentId}
@@ -2107,6 +2359,19 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
           editor={editor}
         />
       </div>
+      {hasReviewRail && layout !== "embedded-demo" ? (
+        <ReviewNavigator
+          className="fixed right-4 bottom-4 z-[55]"
+          openCount={openThreadCount}
+          newCount={newThreadCount}
+          filter={navigationFilter}
+          onFilterChange={(filter) => {
+            navigationFilterChosenRef.current = true;
+            setNavigationFilter(filter);
+          }}
+          onNavigate={navigateReview}
+        />
+      ) : null}
     </div>
   );
 });
@@ -2197,6 +2462,7 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
   onSaveControllerChange,
   saveBlocked = false,
   forceResetKey = null,
+  lastHandoffAt = null,
 }: PageCardEditorSurfaceProps) {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inFlightSaveRef = useRef<Promise<ManualSaveResult> | null>(null);
@@ -2473,6 +2739,7 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       onCommentRailPresenceChange={onCommentRailPresenceChange}
       backend={backend}
       onEditorReady={onEditorReady}
+      lastHandoffAt={lastHandoffAt}
     />
   );
 });
@@ -2495,6 +2762,7 @@ export function PageCard({
   onSaveControllerChange,
   saveBlocked,
   forceResetKey,
+  lastHandoffAt,
 }: PageCardProps) {
   const [saveState, setSaveState] = useState<DocumentSaveState>("saved");
 
@@ -2522,6 +2790,7 @@ export function PageCard({
         onSaveControllerChange={onSaveControllerChange}
         saveBlocked={saveBlocked}
         forceResetKey={forceResetKey}
+        lastHandoffAt={lastHandoffAt}
       />
     </div>
   );

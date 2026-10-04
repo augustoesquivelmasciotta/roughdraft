@@ -174,6 +174,95 @@ test.describe("CriticMarkup review flows", () => {
     );
   });
 
+  test("shows endmatter replies, resolves and deletes from always-visible actions @smoke", async ({
+    page,
+  }) => {
+    const filePath = writeProjectFile(
+      projectDir,
+      "resolve.md",
+      [
+        "# Resolve And Delete",
+        "",
+        'First {==claim==}{>>Needs a source<<}{id="c1" by="user" at="2026-10-01T10:00:00.000Z"} here.',
+        "",
+        'Second {==point==}{>>Too vague<<}{id="c2" by="user" at="2026-10-01T10:05:00.000Z"} there.',
+        "",
+        "---",
+        "comments:",
+        "  c3:",
+        "    body: Added the 2025 report.",
+        "    by: AI",
+        '    at: "2026-10-01T11:00:00.000Z"',
+        "    re: c1",
+        "",
+      ].join("\n"),
+    );
+
+    await openMarkdownFile(page, filePath);
+    // The endmatter reply is threaded under its inline-attribute root.
+    await expect(page.getByTestId("comment-thread-c1")).toContainText(
+      "Added the 2025 report.",
+    );
+
+    // No need to select the thread first: its actions work directly.
+    await page.getByTestId("comment-rail-c1-action-resolve").click();
+    await expect
+      .poll(() => readProjectFile(projectDir, "resolve.md"))
+      .toContain(
+        '{>>Needs a source<<}{id="c1" by="user" at="2026-10-01T10:00:00.000Z" status="resolved"}',
+      );
+    await expect(
+      page.getByTestId("comment-rail-c1-resolved-badge"),
+    ).toBeVisible();
+
+    await page.getByTestId("comment-rail-c2-action-delete").click();
+    await expect
+      .poll(() => readProjectFile(projectDir, "resolve.md"))
+      .toMatch(/deleted:\n {2}- id: c2\n/);
+    const saved = readProjectFile(projectDir, "resolve.md");
+    expect(saved).toContain("Second point there.");
+    expect(saved).toContain("    body: Too vague");
+    expect(saved).toContain("    anchor: point");
+    expect(saved).toContain("    body: Added the 2025 report.");
+  });
+
+  test("jumps between open comments without scrolling through resolved ones", async ({
+    page,
+  }) => {
+    const filler = Array.from(
+      { length: 40 },
+      (_, index) => `Filler paragraph ${index + 1}.`,
+    );
+    const filePath = writeProjectFile(
+      projectDir,
+      "navigate.md",
+      [
+        "# Navigate",
+        "",
+        'Resolved {==old==}{>>Done already<<}{id="c1" by="user" at="2026-10-01T10:00:00.000Z" status="resolved"}.',
+        "",
+        ...filler.slice(0, 20).flatMap((line) => [line, ""]),
+        'Open {==middle==}{>>Still open<<}{id="c2" by="user" at="2026-10-01T10:05:00.000Z"}.',
+        "",
+        ...filler.slice(20).flatMap((line) => [line, ""]),
+        'Open {==bottom==}{>>Also open<<}{id="c3" by="user" at="2026-10-01T10:06:00.000Z"}.',
+        "",
+      ].join("\n"),
+    );
+
+    await openMarkdownFile(page, filePath);
+    await expect(page.getByTestId("review-navigator-filter-open")).toHaveText(
+      "2 open",
+    );
+
+    await page.getByTestId("review-navigator-next").click();
+    await expect(page.getByTestId("comment-thread-c2")).toBeInViewport();
+    await page.getByTestId("review-navigator-next").click();
+    await expect(page.getByTestId("comment-thread-c3")).toBeInViewport();
+    await page.getByTestId("review-navigator-next").click();
+    await expect(page.getByTestId("comment-thread-c2")).toBeInViewport();
+  });
+
   test("accepts and rejects suggested changes on disk @smoke", async ({
     page,
   }) => {

@@ -61,6 +61,10 @@ interface DocumentReviewRailProps {
   onDeleteComment: (commentId: string) => void;
   onUpdateComment: (commentId: string, nextContent: string) => void;
   onReplyComment: (commentId: string) => void;
+  onResolveComment?: (commentId: string) => void;
+  onReopenComment?: (commentId: string) => void;
+  /** Comments added since the reviewer's last handoff. */
+  newCommentIds?: ReadonlySet<string>;
   onSelectComment: (commentId: string) => void;
   onFocusComment: (commentId: string) => void;
   onHoverComment: (commentId: string | null) => void;
@@ -197,6 +201,9 @@ export function DocumentReviewRail({
   onDeleteComment,
   onUpdateComment,
   onReplyComment,
+  onResolveComment,
+  onReopenComment,
+  newCommentIds,
   onSelectComment,
   onFocusComment,
   onHoverComment,
@@ -441,6 +448,8 @@ export function DocumentReviewRail({
                 layout.thread.commentIds,
                 selectedCommentId,
               ) ?? layout.thread.visibleComments[0]?.id;
+            const isDocumentThread =
+              comments.get(layout.thread.rootCommentId)?.scope === "document";
 
             return (
               <div
@@ -468,16 +477,27 @@ export function DocumentReviewRail({
                   onFocusComment(primaryCommentId);
                 }}
               >
+                {isDocumentThread ? (
+                  <div
+                    data-testid={`comment-thread-${layout.thread.rootCommentId}-document-label`}
+                    className="px-4 pt-3 text-[10px] font-semibold tracking-[0.08em] text-stone-500 uppercase dark:text-stone-400"
+                  >
+                    Whole document
+                  </div>
+                ) : null}
+                {/* Actions stay clickable on every thread: no need to select it first. */}
                 <CommentEditorList
                   comments={layout.thread.visibleComments}
                   variant="rail"
-                  className={cn(!isExpanded && "pointer-events-none")}
-                  interactive={isExpanded}
+                  interactive
                   selectedCommentId={selectedCommentId}
                   hoveredCommentId={hoveredCommentId}
                   onDeleteComment={onDeleteComment}
                   onUpdateComment={onUpdateComment}
                   onReplyComment={onReplyComment}
+                  onResolveComment={onResolveComment}
+                  onReopenComment={onReopenComment}
+                  newCommentIds={newCommentIds}
                   onSelectComment={onSelectComment}
                   onFocusComment={onFocusComment}
                   onHoverComment={onHoverComment}
@@ -678,6 +698,7 @@ export function DocumentReviewRail({
                 }
                 onDeleteComment={onDeleteComment}
                 onUpdateComment={onUpdateComment}
+                newCommentIds={newCommentIds}
                 onReplyComment={(commentId) => {
                   if (commentId === suggestion.changeId) {
                     onReplySuggestion(suggestion.changeId);

@@ -1,7 +1,22 @@
-function isApplePlatform(platform?: string | null) {
+export function isApplePlatform(platform?: string | null) {
   if (!platform) return false;
 
   return /mac|iphone|ipad|ipod/i.test(platform);
+}
+
+export function getNavigatorPlatform(): string | null {
+  if (typeof navigator === "undefined") return null;
+
+  const navigatorWithUserAgentData = navigator as Navigator & {
+    userAgentData?: {
+      platform?: string;
+    };
+  };
+
+  // Headless browsers report an empty userAgentData.platform.
+  return (
+    navigatorWithUserAgentData.userAgentData?.platform || navigator.platform
+  );
 }
 
 export function getAddCommentShortcutLabel(platform?: string | null) {
