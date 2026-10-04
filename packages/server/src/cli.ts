@@ -15,6 +15,12 @@ import {
   ROUGHDRAFT_LOOPBACK_HOSTS,
   ROUGHDRAFT_PUBLIC_HOST,
 } from "./network.js";
+import {
+  openOrcaTab,
+  type RunOrcaCommand,
+  resolveOrcaTarget,
+  runOrcaCommand,
+} from "./orca.js";
 import { findAvailablePort } from "./ports.js";
 import { waitForReviewEvents } from "./review-watch.js";
 import { resolveUpdateStatus, type UpdateStatus } from "./update-status.js";
@@ -89,6 +95,8 @@ export interface CliDependencies {
   isProcessRunning: (pid: number) => boolean;
   stopProcess: (pid: number) => Promise<void>;
   openUrl: (url: string) => OpenMode;
+  /** Runs the Orca CLI; used to open documents as Orca tabs inside Orca. */
+  runOrcaCommand: RunOrcaCommand;
   resolveUpdateStatus: () => Promise<UpdateStatus>;
   log: (message: string) => void;
   error: (message: string) => void;
@@ -99,7 +107,9 @@ type OpenMode =
   | "chrome-app"
   | "disabled"
   | "existing-window"
-  | "none";
+  | "existing-orca-tab"
+  | "none"
+  | "orca-tab";
 
 interface EnsureRunningResult {
   server: {
@@ -820,6 +830,7 @@ export function createCliDependencies(
     isProcessRunning: overrides.isProcessRunning ?? defaultIsProcessRunning,
     stopProcess: overrides.stopProcess ?? defaultStopProcess,
     openUrl: overrides.openUrl ?? defaultOpenUrl,
+    runOrcaCommand: overrides.runOrcaCommand ?? runOrcaCommand,
     resolveUpdateStatus:
       overrides.resolveUpdateStatus ??
       (() => resolveUpdateStatus({ fetchImpl })),
@@ -920,6 +931,22 @@ function printCommandHelp(
     log("                        non-loopback host. Must match the value the");
     log("                        hosted server was started with.");
     log("  ROUGHDRAFT_NO_OPEN    Set to 1 to suppress browser launch.");
+    log("  ROUGHDRAFT_ORCA       Inside an Orca terminal, documents open as a");
+    log(
+      "                        tab of that worktree in Orca's browser, which",
+    );
+    log(
+      "                        Orca mobile can also show. Set to 0 to use the",
+    );
+    log(
+      "                        regular browser. Set to 1 to require Orca, also",
+    );
+    log(
+      "                        from another terminal: if Orca cannot open the",
+    );
+    log(
+      "                        tab, open exits 1 instead of using the browser.",
+    );
     log("  ROUGHDRAFT_BIND_HOST  Comma-separated bind hosts for the hosted");
     log(
       "                        server (default: loopback). Set to 0.0.0.0 or",
@@ -1296,7 +1323,15 @@ async function runRemoteOpen(
   }
 
   if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
-    deps.openUrl(viewerUrl);
+    try {
+      if (!(await openInOrcaTab(deps, viewerUrl))) {
+        deps.openUrl(viewerUrl);
+      }
+    } catch (error) {
+      if (!(error instanceof OrcaTabRequiredError)) throw error;
+      deps.error(error.message);
+      return 1;
+    }
   }
 
   if (options.json) {
@@ -1395,6 +1430,57 @@ async function runRemoteOpen(
     deps.log("Remote session disconnected.");
   }
   return 0;
+}
+
+/** `ROUGHDRAFT_ORCA=1` asked for an Orca tab and Orca could not open one. */
+class OrcaTabRequiredError extends Error {}
+
+/**
+ * Inside an Orca terminal, shows the document in an Orca browser tab of the
+ * terminal's worktree. Returns null when the regular browser should be used,
+ * either because this is not Orca or because Orca could not open the tab.
+ * With `ROUGHDRAFT_ORCA=1` a failure throws instead, so scripts that must not
+ * land in the default browser can fall back on their own.
+ */
+async function openInOrcaTab(
+  deps: CliDependencies,
+  url: string,
+): Promise<OpenMode | null> {
+  const target = resolveOrcaTarget(deps.env);
+  if (!target) return null;
+
+  const result = await openOrcaTab({
+    target,
+    url,
+    run: deps.runOrcaCommand,
+  });
+  if (result.opened) {
+    return result.reused ? "existing-orca-tab" : "orca-tab";
+  }
+
+  const message = `Could not open an Orca tab (${result.reason}).`;
+  if (deps.env.ROUGHDRAFT_ORCA?.trim() === "1") {
+    throw new OrcaTabRequiredError(message);
+  }
+  deps.error(`${message} Opening the browser instead.`);
+  return null;
+}
+
+function describeOpenedDocument(openMode: OpenMode, url: string): string {
+  switch (openMode) {
+    case "chrome-app":
+      return `Opened Roughdraft in a Chrome app window: ${url}`;
+    case "existing-window":
+      return `Reused an existing Roughdraft window: ${url}`;
+    case "browser":
+      return `Opened Roughdraft in the default browser: ${url}`;
+    case "orca-tab":
+      return `Opened Roughdraft in an Orca tab: ${url}`;
+    case "existing-orca-tab":
+      return `Reused the Roughdraft tab in Orca: ${url}`;
+    default:
+      return `Roughdraft is running at ${url}`;
+  }
 }
 
 async function sendOpenRequestToExistingWindow(
@@ -1959,6 +2045,7 @@ async function runDoctor(
     serverRoot: trackedStatus?.serverRoot ?? null,
     serverRootMatches,
     browserOpeningDisabled: deps.env.ROUGHDRAFT_NO_OPEN === "1",
+    orcaTabs: resolveOrcaTarget(deps.env),
     cwd: deps.cwd,
     cwdReadable,
     devWrapper:
@@ -2007,6 +2094,13 @@ async function runDoctor(
   );
   deps.log(
     `Browser opening disabled: ${report.browserOpeningDisabled ? "yes" : "no"}`,
+  );
+  deps.log(
+    `Opens documents in Orca tabs: ${
+      report.orcaTabs
+        ? `yes (${report.orcaTabs.worktree ?? "worktree of the current directory"})`
+        : "no"
+    }`,
   );
   deps.log(`Current directory readable: ${report.cwdReadable ? "yes" : "no"}`);
   if (report.devWrapper) {
@@ -2713,14 +2807,27 @@ export async function runCli(
       const targetUrl = buildTargetUrl(baseUrl, openPath);
       let openMode: OpenMode = "disabled";
       if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
-        openMode = (await sendOpenRequestToExistingWindow(
-          deps,
-          baseUrl,
-          targetUrl,
-          openPath,
-        ))
-          ? "existing-window"
-          : deps.openUrl(targetUrl);
+        // Why: inside Orca the tab in the agent's worktree wins over reusing a
+        // window that may be open elsewhere, so the review shows up where the
+        // agent runs, desktop or Orca mobile.
+        let orcaOpenMode: OpenMode | null;
+        try {
+          orcaOpenMode = await openInOrcaTab(deps, targetUrl);
+        } catch (error) {
+          if (!(error instanceof OrcaTabRequiredError)) throw error;
+          deps.error(error.message);
+          return 1;
+        }
+        openMode =
+          orcaOpenMode ??
+          ((await sendOpenRequestToExistingWindow(
+            deps,
+            baseUrl,
+            targetUrl,
+            openPath,
+          ))
+            ? "existing-window"
+            : deps.openUrl(targetUrl));
       }
 
       if (result?.portChanged) {
@@ -2741,15 +2848,7 @@ export async function runCli(
 
       if (shouldWatch) {
         if (!json) {
-          if (openMode === "chrome-app") {
-            deps.log(`Opened Roughdraft in a Chrome app window: ${targetUrl}`);
-          } else if (openMode === "existing-window") {
-            deps.log(`Reused an existing Roughdraft window: ${targetUrl}`);
-          } else if (openMode === "browser") {
-            deps.log(`Opened Roughdraft in the default browser: ${targetUrl}`);
-          } else {
-            deps.log(`Roughdraft is running at ${targetUrl}`);
-          }
+          deps.log(describeOpenedDocument(openMode, targetUrl));
           deps.log("Waiting for Done Reviewing...");
         }
 
@@ -2780,22 +2879,7 @@ export async function runCli(
       }
 
       shouldPrintUpdateNotice = true;
-      if (openMode === "chrome-app") {
-        deps.log(`Opened Roughdraft in a Chrome app window: ${targetUrl}`);
-        return 0;
-      }
-
-      if (openMode === "existing-window") {
-        deps.log(`Reused an existing Roughdraft window: ${targetUrl}`);
-        return 0;
-      }
-
-      if (openMode === "browser") {
-        deps.log(`Opened Roughdraft in the default browser: ${targetUrl}`);
-        return 0;
-      }
-
-      deps.log(`Roughdraft is running at ${targetUrl}`);
+      deps.log(describeOpenedDocument(openMode, targetUrl));
       return 0;
     }
 

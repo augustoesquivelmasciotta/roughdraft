@@ -402,6 +402,249 @@ describe("cli", () => {
     expect(lastOpenedUrl).toBeNull();
   });
 
+  describe("inside an Orca terminal", () => {
+    const worktreeId = "repo-1::/Users/me/orca/workspaces/app/feature";
+
+    /**
+     * Stands in for the `orca` CLI: records every call and answers like
+     * Orca 1.4 does. `tabs` is read on each `tab list` so a test can describe
+     * tabs that depend on the server port chosen at run time.
+     */
+    function fakeOrca(
+      tabs: () => Array<{ browserPageId: string; url: string }> = () => [],
+      options: { unavailable?: string } = {},
+    ) {
+      const calls: string[][] = [];
+      const reply = (result: unknown) => ({
+        exitCode: 0,
+        stdout: JSON.stringify({ id: "req", ok: true, result }),
+        stderr: "",
+      });
+      const runOrcaCommand = async (_command: string, args: string[]) => {
+        calls.push(args);
+        if (options.unavailable) {
+          return {
+            exitCode: 1,
+            stdout: JSON.stringify({
+              id: "req",
+              ok: false,
+              error: {
+                code: "runtime_unavailable",
+                message: options.unavailable,
+              },
+            }),
+            stderr: "",
+          };
+        }
+        const command = args.slice(0, 2).join(" ");
+        if (command === "tab list") {
+          return reply({
+            tabs: tabs().map((tab) => ({
+              ...tab,
+              title: "",
+              active: false,
+              loadError: null,
+            })),
+          });
+        }
+        if (command === "tab create") {
+          return reply({ browserPageId: "page-new" });
+        }
+        if (command === "tab switch") {
+          return reply({ switched: 0, browserPageId: args[3] });
+        }
+        throw new Error(`Unexpected orca call: ${args.join(" ")}`);
+      };
+      return { calls, runOrcaCommand };
+    }
+
+    function readPersistedPort(env: NodeJS.ProcessEnv) {
+      return (
+        JSON.parse(fs.readFileSync(getServerStateFilePath(env), "utf8")) as {
+          port: number;
+        }
+      ).port;
+    }
+
+    it("opens the document in a tab of the terminal's worktree and brings it forward", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const orca = fakeOrca();
+      let openRequestPosted = false;
+
+      const exitCode = await runCli(
+        ["open", documentPath, "--no-watch", "--json"],
+        {
+          ...test.deps,
+          env: { ...test.deps.env, ORCA_WORKTREE_ID: worktreeId },
+          runOrcaCommand: orca.runOrcaCommand,
+          fetchImpl: async (input, init) => {
+            if (String(input).includes("/api/open-request")) {
+              openRequestPosted = true;
+            }
+            return test.deps.fetchImpl(input, init);
+          },
+        },
+      );
+      const payload = parseOnlyJsonLog<{ url: string; openMode: string }>(
+        test.logs,
+      );
+
+      expect(exitCode).toBe(0);
+      expect(payload.openMode).toBe("orca-tab");
+      expect(payload.url).toBe(
+        expectedOpenUrl(
+          `http://localhost:${readPersistedPort(test.deps.env)}`,
+          documentPath,
+        ),
+      );
+      expect(orca.calls).toEqual([
+        ["tab", "list", "--worktree", `id:${worktreeId}`, "--json"],
+        [
+          "tab",
+          "create",
+          "--url",
+          payload.url,
+          "--worktree",
+          `id:${worktreeId}`,
+          "--json",
+        ],
+        ["tab", "switch", "--page", "page-new", "--focus", "--json"],
+      ]);
+      // The Orca tab replaces both the browser window and the reuse of a
+      // window that may be open somewhere else.
+      expect(test.getLastOpenedUrl()).toBeNull();
+      expect(openRequestPosted).toBe(false);
+    });
+
+    it("brings back the tab already showing the document instead of opening another", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const orca = fakeOrca(() => [
+        {
+          browserPageId: "page-draft",
+          url: `${expectedOpenUrl(
+            `http://localhost:${readPersistedPort(test.deps.env)}`,
+            documentPath,
+          )}&editor=code`,
+        },
+      ]);
+
+      const exitCode = await runCli(["open", documentPath, "--no-watch"], {
+        ...test.deps,
+        env: { ...test.deps.env, ORCA_WORKTREE_ID: worktreeId },
+        runOrcaCommand: orca.runOrcaCommand,
+      });
+
+      expect(exitCode).toBe(0);
+      expect(orca.calls.map((args) => args.slice(0, 2).join(" "))).toEqual([
+        "tab list",
+        "tab switch",
+      ]);
+      expect(orca.calls[1]).toContain("page-draft");
+      expect(test.logs).toContain(
+        `Reused the Roughdraft tab in Orca: ${expectedOpenUrl(
+          `http://localhost:${readPersistedPort(test.deps.env)}`,
+          documentPath,
+        )}`,
+      );
+    });
+
+    it("falls back to the browser and says why when Orca cannot open a tab", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const orca = fakeOrca(undefined, { unavailable: "Orca is not running" });
+
+      const exitCode = await runCli(["open", documentPath, "--no-watch"], {
+        ...test.deps,
+        env: { ...test.deps.env, ORCA_WORKTREE_ID: worktreeId },
+        runOrcaCommand: orca.runOrcaCommand,
+      });
+
+      expect(exitCode).toBe(0);
+      expect(test.errors).toEqual([
+        "Could not open an Orca tab (Orca is not running). Opening the browser instead.",
+      ]);
+      expect(test.getLastOpenedUrl()).toContain(
+        encodeURIComponent(documentPath),
+      );
+    });
+
+    it("fails without opening a browser when ROUGHDRAFT_ORCA=1 and Orca cannot open the tab", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const orca = fakeOrca(undefined, { unavailable: "Orca is not running" });
+
+      const exitCode = await runCli(["open", documentPath, "--no-watch"], {
+        ...test.deps,
+        env: { ...test.deps.env, ROUGHDRAFT_ORCA: "1" },
+        runOrcaCommand: orca.runOrcaCommand,
+      });
+
+      expect(exitCode).toBe(1);
+      expect(test.errors).toEqual([
+        "Could not open an Orca tab (Orca is not running).",
+      ]);
+      expect(test.getLastOpenedUrl()).toBeNull();
+    });
+
+    it("keeps the regular browser when ROUGHDRAFT_ORCA=0", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const orca = fakeOrca();
+
+      await runCli(["open", documentPath, "--no-watch"], {
+        ...test.deps,
+        env: {
+          ...test.deps.env,
+          ORCA_WORKTREE_ID: worktreeId,
+          ROUGHDRAFT_ORCA: "0",
+        },
+        runOrcaCommand: orca.runOrcaCommand,
+      });
+
+      expect(orca.calls).toEqual([]);
+      expect(test.getLastOpenedUrl()).not.toBeNull();
+    });
+
+    it("does not touch Orca when nothing should open", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const orca = fakeOrca();
+      const deps = {
+        ...test.deps,
+        env: { ...test.deps.env, ORCA_WORKTREE_ID: worktreeId },
+        runOrcaCommand: orca.runOrcaCommand,
+      };
+
+      await runCli(["open", documentPath, "--print-url"], deps);
+      await runCli(["open", documentPath, "--no-open", "--no-watch"], deps);
+
+      expect(orca.calls).toEqual([]);
+    });
+
+    it("reports the Orca tab target from doctor --json", async () => {
+      const test = createTestDependencies();
+
+      await runCli(["doctor", "--json"], {
+        ...test.deps,
+        env: { ...test.deps.env, ORCA_WORKTREE_ID: worktreeId },
+      });
+      const payload = parseOnlyJsonLog<{ orcaTabs: unknown }>(test.logs);
+
+      expect(payload.orcaTabs).toEqual({
+        command: "orca",
+        worktree: `id:${worktreeId}`,
+      });
+    });
+  });
+
   it("opens the default browser on macOS when Chrome is installed but not the default browser", () => {
     const opened: Array<{ command: string; args: string[] }> = [];
     const openUrl = createDefaultOpenUrl({
@@ -1913,6 +2156,67 @@ describe("runCli open in remote mode", () => {
       expect(
         logs.some((m) => m.includes("Opened remote Roughdraft session")),
       ).toBe(true);
+    } finally {
+      await remote.close();
+    }
+  });
+
+  it("opens the remote viewer in an Orca tab inside an Orca terminal", {
+    timeout: 15_000,
+  }, async () => {
+    const remote = await startRemoteHost();
+    try {
+      const filePath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(filePath, "before\n");
+      const orcaCalls: string[][] = [];
+      let openedInBrowser = false;
+
+      const cliPromise = runCli(["open", filePath], {
+        env: {
+          ROUGHDRAFT_HOST: remote.url,
+          ORCA_WORKTREE_ID: "repo-1::/Users/me/orca/workspaces/app/feature",
+        },
+        cwd: projectDir,
+        log: () => {},
+        error: () => {},
+        openUrl: () => {
+          openedInBrowser = true;
+          return "disabled";
+        },
+        runOrcaCommand: async (_command, args) => {
+          orcaCalls.push(args);
+          const result =
+            args[1] === "list"
+              ? { tabs: [] }
+              : { browserPageId: "page-remote", switched: 0 };
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({ ok: true, result }),
+            stderr: "",
+          };
+        },
+        resolveUpdateStatus: async () => ({
+          packageName: "roughdraft",
+          currentVersion: "0.1.0",
+          latestVersion: "0.1.0",
+          updateAvailable: false,
+          updateCommand: "",
+        }),
+      });
+
+      const deadline = Date.now() + 4000;
+      while (orcaCalls.length < 3 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      const createCall = orcaCalls.find((args) => args[1] === "create");
+      const viewerUrl = new URL(createCall?.[3] ?? "about:blank");
+
+      expect(viewerUrl.origin).toBe(remote.url);
+      expect(viewerUrl.searchParams.get("session")).toBeTruthy();
+      expect(openedInBrowser).toBe(false);
+
+      await remote.close();
+      expect(await cliPromise).toBe(0);
     } finally {
       await remote.close();
     }

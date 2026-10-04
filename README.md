@@ -55,6 +55,10 @@ roughdraft open ./path/to/my-essay/draft.md --print-url
 roughdraft status --json
 ```
 
+### Inside Orca
+
+Run from an [Orca](https://github.com/stablyai/orca) terminal (or by an agent running in one), `roughdraft open` shows the document as a browser tab of that Orca worktree instead of a separate window. Opening the same document again brings its tab back rather than adding another, and the command still waits for Done Reviewing. Orca mobile lists the tab with the worktree's other tabs, so the review can also happen from a phone; switch Orca mobile's browser to its mobile view for the phone layout. The Orca CLI (`orca`) must be on `PATH`; if Orca cannot open the tab, Roughdraft opens the browser as usual. Set `ROUGHDRAFT_ORCA=0` to keep the browser inside Orca.
+
 Check or stop the background server:
 
 ```bash
@@ -229,6 +233,12 @@ PORT
 
 ROUGHDRAFT_NO_OPEN=1
   Disable browser/app opening.
+
+ROUGHDRAFT_ORCA
+  Inside an Orca terminal, documents open as Orca browser tabs. Set to 0 to
+  use the browser instead. Set to 1 to require Orca, also from another
+  terminal: if Orca cannot open the tab, `open` exits 1 instead of opening
+  the browser, so scripts can fall back on their own.
 
 ROUGHDRAFT_STATE_FILE
   Exact path to the server state JSON file.
