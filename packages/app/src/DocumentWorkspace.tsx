@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { DocumentEditorViewMode } from "./app-navigation";
+import { getNavigatorPlatform, isApplePlatform } from "./comment-shortcuts";
 import { RemoteSessionBanner } from "./components/RemoteSessionBanner";
 import { Button } from "./components/ui/button";
 import {
@@ -350,6 +351,43 @@ export function isReviewHandoffDisabled({
   );
 }
 
+interface ShortcutKeyEventLike {
+  key: string;
+  altKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+}
+
+/** ⌘D on macOS, Ctrl+D elsewhere: the "I'm done" shortcut. */
+export function isReviewHandoffShortcut(
+  event: ShortcutKeyEventLike,
+  platform?: string | null,
+) {
+  if (event.key.toLowerCase() !== "d" || event.altKey || event.shiftKey) {
+    return false;
+  }
+
+  return isApplePlatform(platform)
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey;
+}
+
+export function getReviewHandoffShortcutLabel(platform?: string | null) {
+  return isApplePlatform(platform) ? "⌘D" : "Ctrl+D";
+}
+
+/** ⌘/Ctrl+Enter submits a comment box, as in the anchored comments. */
+export function isCommentSubmitShortcut(event: {
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+}) {
+  return (
+    (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "enter"
+  );
+}
+
 export function getReviewHandoffButtonLabel({
   reviewHandoffState,
   documentChangedSinceOpen,
@@ -439,7 +477,11 @@ export function DocumentWorkspace({
   const [lastHandoffAt, setLastHandoffAt] = useState<string | null>(() =>
     readLastHandoffAt(documentCopyPath ?? activeDocumentPath),
   );
+  const handoffShortcutLabel = getReviewHandoffShortcutLabel(
+    getNavigatorPlatform(),
+  );
   const sawNoWatcherAfterNotifiedRef = useRef(false);
+  const handoffShortcutActionRef = useRef<(() => void) | null>(null);
   const copiedFileActionTimeoutRef = useRef<number | null>(null);
   const saveControllerRef = useRef<DocumentSaveController | null>(null);
   const documentChangeTrackingReadyRef = useRef(false);
@@ -571,6 +613,37 @@ export function DocumentWorkspace({
       window.removeEventListener("keydown", handleKeyDown, { capture: true });
     };
   }, [documentDiskChangeState, documentPage]);
+
+  useEffect(() => {
+    if (!documentPage) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!isReviewHandoffShortcut(event, getNavigatorPlatform())) return;
+
+      // Keep Chrome's bookmark dialog out of the review window, even in a
+      // Chrome app window, whether or not a handoff can be sent right now.
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.repeat) return;
+
+      // A comment being typed is not saved yet; do not hand off without it.
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        target.closest("textarea, input") &&
+        !target.closest('[data-testid="review-handoff-overall-comment"]')
+      ) {
+        return;
+      }
+
+      handoffShortcutActionRef.current?.();
+    };
+
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, { capture: true });
+    };
+  }, [documentPage]);
 
   const handleCompleteReview = useCallback(
     async (options?: CompleteReviewOptions) => {
@@ -723,6 +796,18 @@ export function DocumentWorkspace({
   const reviewHandoffButtonDisabled =
     reviewHandoffDisabled && reviewHandoffState !== "notified";
   const trimmedOverallComment = overallComment.trim();
+  handoffShortcutActionRef.current =
+    showReviewHandoffButton &&
+    !reviewHandoffButtonDisabled &&
+    reviewHandoffState === "idle"
+      ? () => {
+          void handleCompleteReview(
+            trimmedOverallComment
+              ? { overallComment: trimmedOverallComment }
+              : undefined,
+          );
+        }
+      : null;
 
   return (
     <div
@@ -771,6 +856,10 @@ export function DocumentWorkspace({
                   className="h-9 rounded-r-none rounded-l-[7px] border-0 bg-[#2B2420] px-3 text-sm font-bold text-white hover:bg-[#3a322b] focus-visible:ring-slate-300 disabled:opacity-100 dark:bg-slate-700 dark:text-slate-100 dark:hover:bg-slate-600 dark:focus-visible:ring-slate-600"
                   disabled={reviewHandoffButtonDisabled}
                   aria-disabled={reviewHandoffButtonDisabled || undefined}
+                  aria-keyshortcuts={
+                    handoffShortcutLabel === "⌘D" ? "Meta+D" : "Control+D"
+                  }
+                  title={`${reviewHandoffButtonLabel} (${handoffShortcutLabel})`}
                   onClick={() => {
                     if (reviewHandoffState === "notified") {
                       setReviewHandoffPopoverOpen(true);
@@ -842,6 +931,14 @@ export function DocumentWorkspace({
                         onChange={(event) =>
                           setOverallComment(event.currentTarget.value)
                         }
+                        onKeyDown={(event) => {
+                          if (!isCommentSubmitShortcut(event)) return;
+                          event.preventDefault();
+                          if (!trimmedOverallComment) return;
+                          void handleCompleteReview({
+                            overallComment: trimmedOverallComment,
+                          });
+                        }}
                         maxLength={4000}
                         rows={4}
                         className="min-h-24 resize-none"

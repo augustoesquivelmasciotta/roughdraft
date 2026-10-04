@@ -73,6 +73,98 @@ test.describe("review handoff", () => {
     });
   });
 
+  test("Cmd+D sends I'm done without opening the browser bookmark dialog @smoke", async ({
+    page,
+    request,
+  }) => {
+    const filePath = writeProjectFile(
+      projectDir,
+      "shortcut-handoff.md",
+      ["# Shortcut Handoff", "", "Review this document.", ""].join("\n"),
+    );
+
+    pendingWatch = request.post("/api/review-events/watch", {
+      data: {
+        projectPath: projectDir,
+        path: "shortcut-handoff.md",
+        timeoutSeconds: 10,
+      },
+    });
+
+    await openMarkdownFile(page, filePath);
+    await expect(page.getByTestId("review-handoff-button")).toBeVisible();
+    await page.evaluate(() => {
+      const log: boolean[] = [];
+      (window as unknown as { handoffKeyLog: boolean[] }).handoffKeyLog = log;
+      window.addEventListener(
+        "keydown",
+        (event) => {
+          if (event.key.toLowerCase() === "d") log.push(event.defaultPrevented);
+        },
+        { capture: true },
+      );
+    });
+
+    await page.getByTestId("rich-text-editor").click();
+    // The shortcut follows the platform the page sees (Playwright's desktop
+    // device reports Windows): ⌘D on macOS, Ctrl+D elsewhere.
+    const isApplePlatform = await page.evaluate(() =>
+      /mac|iphone|ipad|ipod/i.test(navigator.platform),
+    );
+    await page.keyboard.press(isApplePlatform ? "Meta+d" : "Control+d");
+
+    await expect(page.getByTestId("review-handoff-button")).toHaveText("Sent");
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { handoffKeyLog: boolean[] }).handoffKeyLog,
+      ),
+    ).toEqual([true]);
+    const payload = await (
+      (await pendingWatch) as { json: () => Promise<{ events: unknown[] }> }
+    ).json();
+    expect(payload.events).toHaveLength(1);
+  });
+
+  test("Cmd+Enter in the overall comment box submits the handoff with the comment", async ({
+    page,
+    request,
+  }) => {
+    const filePath = writeProjectFile(
+      projectDir,
+      "comment-shortcut.md",
+      ["# Comment Shortcut", "", "Review this document.", ""].join("\n"),
+    );
+    const overallComment = "Ship it after the intro is shorter.";
+
+    pendingWatch = request.post("/api/review-events/watch", {
+      data: {
+        projectPath: projectDir,
+        path: "comment-shortcut.md",
+        timeoutSeconds: 10,
+      },
+    });
+
+    await openMarkdownFile(page, filePath);
+    await page.getByTestId("review-handoff-comment-trigger").click();
+    await page
+      .getByTestId("review-handoff-overall-comment")
+      .fill(overallComment);
+    await page.keyboard.press(
+      process.platform === "darwin" ? "Meta+Enter" : "Control+Enter",
+    );
+
+    await expect(page.getByTestId("review-handoff-button")).toHaveText("Sent");
+    await expect
+      .poll(() => readProjectFile(projectDir, "comment-shortcut.md"))
+      .toContain(overallComment);
+    const payload = await (
+      (await pendingWatch) as {
+        json: () => Promise<{ events: Array<{ overallComment?: string }> }>;
+      }
+    ).json();
+    expect(payload.events[0]?.overallComment).toBe(overallComment);
+  });
+
   test("reopens the sent handoff status from the muted primary button", async ({
     page,
     request,
