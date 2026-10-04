@@ -139,6 +139,8 @@ interface YamlMetadataEntry {
 interface RoughdraftEndmatter {
   comments: Map<string, YamlMetadataEntry>;
   suggestions: Map<string, YamlMetadataEntry>;
+  /** Ids recorded in the optional top-level `deleted` list. */
+  deletedIds: string[];
   data: Record<string, unknown> | null;
   raw: string | null;
   offset: number | null;
@@ -159,6 +161,7 @@ export function validateRoughdraftMarkdown(
   const diagnostics: RfmDiagnostic[] = [];
   const ids = new Map<string, IdReference>();
   const replies: ReplyReference[] = [];
+  const referencedCommentIds = new Set<string>();
   const summary: RfmValidationSummary = {
     comments: 0,
     suggestions: 0,
@@ -234,6 +237,7 @@ export function validateRoughdraftMarkdown(
       } else {
         ids.set(id, { id, kind, offset: metadata.offset });
       }
+      if (kind === "comment") referencedCommentIds.add(id);
 
       validateEndmatterEntry(id, entry, metadata.offset, addDiagnostic, false);
       return;
@@ -367,6 +371,9 @@ export function validateRoughdraftMarkdown(
 
   for (const [id, entry] of endmatter.comments) {
     if (!entry.body && !entry.re) continue;
+    // The full text of an inline `{#id}` comment that could not be written
+    // inline (line breaks, CriticMarkup delimiters), not another comment.
+    if (!entry.re && referencedCommentIds.has(id)) continue;
 
     const existing = ids.get(id);
     if (existing) {
@@ -455,10 +462,16 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
   const items: RfmReviewItem[] = [];
   const noopDiagnostic = () => {};
 
+  const referencedCommentIds = new Set<string>();
   const addComment = (parsed: ParsedComment, anchorText?: string) => {
     const attrs = hydrateMetadataAttrs(parsed.metadata, endmatter, "comment");
     const id = attrs.get("id") ?? `comment-${parsed.offset.toString()}`;
     const parentId = attrs.get("re") ?? null;
+    const isReference = parsed.metadata?.kind === "reference";
+    if (isReference) referencedCommentIds.add(id);
+    // A reference whose endmatter entry has a `body` keeps its full text
+    // there; the inline text is a one-line excerpt.
+    const fullBody = isReference && !parentId ? attrs.get("body") : undefined;
 
     items.push({
       id,
@@ -467,7 +480,7 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
       author: attrs.get("by") ?? null,
       createdAt: attrs.get("at") ?? null,
       status: attrs.get("status") ?? null,
-      text: parsed.content,
+      text: fullBody ?? parsed.content,
       anchorText,
       offset: parsed.offset,
       endOffset: parsed.endOffset,
@@ -568,6 +581,7 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
 
   for (const [id, entry] of endmatter.comments) {
     if (!entry.body) continue;
+    if (!entry.re && referencedCommentIds.has(id)) continue;
 
     items.push({
       id,
@@ -605,7 +619,8 @@ export function appendRoughdraftDocumentComment(
 
   const index = extractRoughdraftReviewIndex(markdown);
   const endmatter = parseRoughdraftEndmatter(markdown);
-  const commentId = options.id ?? nextCommentId(index.items);
+  const commentId =
+    options.id ?? nextCommentId(markdown, index.items, endmatter);
   const comments = new Map(endmatter.comments);
   comments.set(commentId, {
     body: options.message,
@@ -632,8 +647,10 @@ export function appendRoughdraftReply(
   }
 
   const endmatter = parseRoughdraftEndmatter(markdown);
-  if (isEndmatterBackedItem(markdown, parent)) {
-    const replyId = options.id ?? nextCommentId(index.items);
+  const replyId = options.id ?? nextCommentId(markdown, index.items, endmatter);
+  // Replies live in endmatter whenever the document already has review
+  // endmatter, even when the parent uses inline attribute metadata.
+  if (endmatter.offset !== null || isEndmatterBackedItem(markdown, parent)) {
     const comments = new Map(endmatter.comments);
     comments.set(replyId, {
       body: options.message,
@@ -648,7 +665,7 @@ export function appendRoughdraftReply(
   }
 
   const reply = `{>>${options.message}<<}${serializeMetadataAttributes({
-    id: options.id ?? nextCommentId(index.items),
+    id: replyId,
     by: options.author ?? "AI",
     at: options.at ?? new Date().toISOString(),
     re: options.parentId,
@@ -1102,6 +1119,7 @@ function parseRoughdraftEndmatter(markdown: string): RoughdraftEndmatter {
   const empty: RoughdraftEndmatter = {
     comments: new Map(),
     suggestions: new Map(),
+    deletedIds: [],
     data: null,
     raw: null,
     offset: null,
@@ -1112,7 +1130,7 @@ function parseRoughdraftEndmatter(markdown: string): RoughdraftEndmatter {
 
   let parsed: unknown;
   try {
-    parsed = parseYaml(match.yaml);
+    parsed = parseYaml(match.yaml, { uniqueKeys: false });
   } catch (error) {
     if (!match.raw.includes("{#")) return empty;
 
@@ -1131,11 +1149,18 @@ function parseRoughdraftEndmatter(markdown: string): RoughdraftEndmatter {
   }
 
   if (!isPlainObject(parsed)) return empty;
-  const hasRoughdraftKeys = "comments" in parsed || "suggestions" in parsed;
+  const hasRoughdraftKeys =
+    "comments" in parsed || "suggestions" in parsed || "deleted" in parsed;
   if (!hasRoughdraftKeys) return empty;
+  const deletedIds = readDeletedIds(parsed.deleted);
+  // Without a `{#id}` reference the block is still review endmatter when it
+  // holds a document-level comment, a reply (whose parent may use inline
+  // attribute metadata), or a record of a deleted comment.
   if (
     !markdown.slice(0, match.offset).includes("{#") &&
-    !hasDocumentLevelComment(parsed)
+    !hasDocumentLevelComment(parsed) &&
+    !hasReplyEntry(parsed) &&
+    deletedIds.length === 0
   ) {
     return empty;
   }
@@ -1143,11 +1168,40 @@ function parseRoughdraftEndmatter(markdown: string): RoughdraftEndmatter {
   return {
     comments: readEndmatterEntries(parsed.comments),
     suggestions: readEndmatterEntries(parsed.suggestions),
+    deletedIds,
     data: parsed,
     raw: match.raw,
     offset: match.offset,
     diagnostics: [],
   };
+}
+
+function hasReplyEntry(parsed: Record<string, unknown>): boolean {
+  for (const entry of readEndmatterEntries(parsed.comments).values()) {
+    if (
+      typeof entry.body === "string" &&
+      typeof entry.by === "string" &&
+      typeof entry.re === "string" &&
+      typeof entry.at === "string" &&
+      isValidDateTime(entry.at)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function readDeletedIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.flatMap((record) =>
+    isPlainObject(record) &&
+    typeof record.id === "string" &&
+    typeof record.deletedAt === "string"
+      ? [record.id]
+      : [],
+  );
 }
 
 function hasDocumentLevelComment(parsed: Record<string, unknown>): boolean {
@@ -1275,19 +1329,82 @@ function writeRoughdraftEndmatter(
     existing.offset === null
       ? markdown.replace(/\s*$/, "\n")
       : markdown.slice(0, existing.offset).replace(/\s*$/, "\n");
-  const data: Record<string, unknown> = { ...(existing.data ?? {}) };
-  if (endmatter.comments.size > 0) {
-    data.comments = Object.fromEntries(endmatter.comments);
-  } else {
-    delete data.comments;
-  }
-  if (endmatter.suggestions.size > 0) {
-    data.suggestions = Object.fromEntries(endmatter.suggestions);
-  } else {
-    delete data.suggestions;
+
+  // Edit the YAML in place so untouched entries keep their quoting, order
+  // and comments.
+  const document =
+    existing.raw === null
+      ? new Document({})
+      : parseDocument(existing.raw.replace(/^\n---[ \t]*\r?\n/, ""), {
+          uniqueKeys: false,
+        });
+  if (document.errors.length > 0 || !isMap(document.contents)) {
+    const data: Record<string, unknown> = { ...(existing.data ?? {}) };
+    if (endmatter.comments.size > 0) {
+      data.comments = Object.fromEntries(endmatter.comments);
+    } else {
+      delete data.comments;
+    }
+    if (endmatter.suggestions.size > 0) {
+      data.suggestions = Object.fromEntries(endmatter.suggestions);
+    } else {
+      delete data.suggestions;
+    }
+    return `${body}\n---\n${stringifyYaml(data)}`;
   }
 
-  return `${body}\n---\n${stringifyYaml(data)}`;
+  syncEndmatterMap(document, "comments", endmatter.comments);
+  syncEndmatterMap(document, "suggestions", endmatter.suggestions);
+
+  return `${body}\n---\n${document.toString({ lineWidth: 0 })}`;
+}
+
+function syncEndmatterMap(
+  document: Document,
+  key: string,
+  desired: Map<string, YamlMetadataEntry>,
+): void {
+  if (desired.size === 0) {
+    document.delete(key);
+    return;
+  }
+
+  let map = document.get(key, true);
+  if (!isMap(map)) {
+    map = document.createNode({}) as YAMLMap;
+    document.set(key, map);
+  }
+  const entries = map as YAMLMap;
+  const seen = new Set<string>();
+
+  for (const pair of [...entries.items]) {
+    const id = isScalar(pair.key) ? String(pair.key.value) : String(pair.key);
+    const fields = desired.get(id);
+    if (!fields || seen.has(id) || !isMap(pair.value)) {
+      entries.items.splice(entries.items.indexOf(pair), 1);
+      continue;
+    }
+
+    seen.add(id);
+    const entry = pair.value;
+    for (const [field, value] of Object.entries(fields)) {
+      if (value === undefined || value === null) {
+        entry.delete(field);
+      } else if (entry.get(field) !== value) {
+        entry.set(field, document.createNode(value));
+      }
+    }
+    for (const item of [...entry.items]) {
+      const field = isScalar(item.key)
+        ? String(item.key.value)
+        : String(item.key);
+      if (!(field in fields)) entry.delete(field);
+    }
+  }
+
+  for (const [id, fields] of desired) {
+    if (!seen.has(id)) entries.set(id, document.createNode(fields));
+  }
 }
 
 function isEndmatterBackedItem(markdown: string, item: RfmReviewItem): boolean {
@@ -1320,11 +1437,32 @@ function escapeMetadataAttributeValue(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
 
-function nextCommentId(items: RfmReviewItem[]): string {
+/**
+ * Picks `c<n>` above every id the document uses anywhere: indexed items,
+ * every YAML endmatter key (even unreferenced ones), deleted-comment records,
+ * and inline metadata.
+ */
+function nextCommentId(
+  markdown: string,
+  items: RfmReviewItem[],
+  endmatter: RoughdraftEndmatter,
+): string {
+  const ids = [
+    ...items.map((item) => item.id),
+    ...endmatter.comments.keys(),
+    ...endmatter.suggestions.keys(),
+    ...endmatter.deletedIds,
+    ...Array.from(
+      markdown.matchAll(
+        /\bid="([A-Za-z][A-Za-z0-9_-]*)"|\{#([A-Za-z][A-Za-z0-9_-]*)\}/g,
+      ),
+      (match) => match[1] ?? match[2] ?? "",
+    ),
+  ];
   let maxId = 0;
 
-  for (const item of items) {
-    const match = item.id.match(/^c(\d+)$/);
+  for (const id of ids) {
+    const match = id.match(/^c(\d+)$/);
     if (!match) continue;
 
     const parsed = Number.parseInt(match[1] ?? "0", 10);
@@ -1360,4 +1498,12 @@ function findCanonicalMetadataStart(
 function isValidDateTime(value: string): boolean {
   return dateTimePattern.test(value) && !Number.isNaN(Date.parse(value));
 }
-import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import {
+  Document,
+  isMap,
+  isScalar,
+  parseDocument,
+  parse as parseYaml,
+  stringify as stringifyYaml,
+  type YAMLMap,
+} from "yaml";
