@@ -10,6 +10,8 @@ import {
   type StoredAsset,
 } from "./storage";
 
+const FILE_POLL_INTERVAL_MS = 1_000;
+
 export class ApiBackend implements StorageBackend {
   info: BackendInfo;
   canManageProjects = true;
@@ -86,28 +88,44 @@ export class ApiBackend implements StorageBackend {
     return res.json();
   }
 
+  // Why not an event stream: a browser allows 6 connections per server, shared
+  // by every tab, and a stream holds one for as long as the tab lives. A few
+  // open tabs used them all, and a later save request waited forever.
   watchMarkdownFile(
     relativePath: string,
     onChange: (event: MarkdownFileChangeEvent) => void,
   ): () => void {
-    const source = new EventSource(
-      this.buildUrl("/api/markdown-file/events", { path: relativePath }),
-    );
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let lastSeen: string | null | undefined;
 
-    source.addEventListener("change", (event) => {
+    const poll = async () => {
       try {
-        onChange(JSON.parse((event as MessageEvent<string>).data));
+        const res = await fetch(
+          this.buildUrl("/api/markdown-file/version", { path: relativePath }),
+        );
+        if (res.ok) {
+          const event = (await res.json()) as MarkdownFileChangeEvent;
+          const seen = event.exists ? event.version : null;
+          if (!stopped && seen !== lastSeen) {
+            lastSeen = seen;
+            onChange(event);
+          }
+        }
       } catch (error) {
-        console.error("Failed to read markdown file change event:", error);
+        console.error("Failed to read markdown file version:", error);
       }
-    });
 
-    source.onerror = (error) => {
-      console.error("Markdown file event stream failed:", error);
+      if (!stopped) {
+        timer = setTimeout(poll, FILE_POLL_INTERVAL_MS);
+      }
     };
 
+    void poll();
+
     return () => {
-      source.close();
+      stopped = true;
+      if (timer) clearTimeout(timer);
     };
   }
 

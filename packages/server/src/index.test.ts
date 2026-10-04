@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "./index";
 
 describe("createApp", () => {
@@ -706,6 +706,111 @@ describe("createApp", () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ delivered: false });
+  });
+
+  // Why: a browser allows 6 connections per server, shared by every tab. Event
+  // streams held open by each tab used them all up, so a save request from a
+  // fourth Orca tab waited forever. Tabs poll with short requests instead.
+  describe("tabs that hold no long-lived connection", () => {
+    it("reports a markdown file's version for polling", async () => {
+      const filePath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(filePath, "# Draft\n");
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const query = { projectPath: projectDir, path: "draft.md" };
+
+      const page = await request(app).get("/api/markdown-file").query(query);
+      const first = await request(app)
+        .get("/api/markdown-file/version")
+        .query(query);
+
+      expect(first.status).toBe(200);
+      expect(first.body).toEqual({
+        path: "draft.md",
+        exists: true,
+        version: page.body.version,
+      });
+
+      fs.writeFileSync(filePath, "# Draft edited on disk\n");
+      const second = await request(app)
+        .get("/api/markdown-file/version")
+        .query(query);
+
+      expect(second.body.exists).toBe(true);
+      expect(second.body.version).not.toBe(first.body.version);
+
+      fs.rmSync(filePath);
+      const removed = await request(app)
+        .get("/api/markdown-file/version")
+        .query(query);
+
+      expect(removed.status).toBe(200);
+      expect(removed.body).toEqual({
+        path: "draft.md",
+        exists: false,
+        version: null,
+      });
+    });
+
+    it("delivers an open request to the tab that polls for the path", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const target = path.join(projectDir, "draft.md");
+      const url = "http://localhost:4312/?path=/tmp/draft.md";
+
+      const idle = await request(app)
+        .get("/api/open-requests/poll")
+        .query({ path: target, clientId: "tab-1" });
+      expect(idle.status).toBe(200);
+      expect(idle.body).toEqual({ requests: [] });
+
+      const sent = await request(app)
+        .post("/api/open-request")
+        .send({ path: target, url });
+      expect(sent.body).toEqual({ delivered: true });
+
+      const polled = await request(app)
+        .get("/api/open-requests/poll")
+        .query({ path: target, clientId: "tab-1" });
+      expect(polled.body).toEqual({ requests: [{ path: target, url }] });
+
+      const drained = await request(app)
+        .get("/api/open-requests/poll")
+        .query({ path: target, clientId: "tab-1" });
+      expect(drained.body).toEqual({ requests: [] });
+    });
+
+    it("matches an open request across NFC and NFD spellings of the path", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const url = "http://localhost:4312/?path=/tmp/draft.md";
+
+      await request(app)
+        .get("/api/open-requests/poll")
+        .query({ path: "/tmp/\u00c1reas/draft.md", clientId: "tab-1" });
+      const sent = await request(app)
+        .post("/api/open-request")
+        .send({ path: "/tmp/A\u0301reas/draft.md", url });
+
+      expect(sent.body).toEqual({ delivered: true });
+    });
+
+    it("does not deliver to a tab that stopped polling", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const { app } = createApp({ homeDir, staticDirPath: projectDir });
+        const target = path.join(projectDir, "draft.md");
+
+        await request(app)
+          .get("/api/open-requests/poll")
+          .query({ path: target, clientId: "tab-1" });
+        vi.advanceTimersByTime(60_000);
+        const sent = await request(app)
+          .post("/api/open-request")
+          .send({ path: target, url: "http://localhost:4312/" });
+
+        expect(sent.body).toEqual({ delivered: false });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe("closing the Orca tab that shows a page", () => {

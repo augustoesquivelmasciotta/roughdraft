@@ -94,6 +94,17 @@ interface OpenRequestPayload {
   url?: string;
 }
 
+// A tab that polls for open requests instead of holding an event stream.
+interface OpenRequestPoller {
+  path: string | null;
+  lastSeenAt: number;
+  pending: Array<{ path: string; url: string }>;
+}
+
+// Why: a tab that stops polling (closed, crashed) must stop receiving
+// requests, so a poller counts as listening only while it keeps polling.
+const OPEN_REQUEST_POLLER_TTL_MS = 10_000;
+
 interface RemoteSession {
   id: string;
   originPath: string;
@@ -424,6 +435,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   };
   const app = express();
   const openRequestClients = new Set<OpenRequestClient>();
+  const openRequestPollers = new Map<string, OpenRequestPoller>();
   const reviewEvents = new ReviewEventQueue();
   const remoteSessions = new Map<string, RemoteSession>();
 
@@ -585,6 +597,27 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     }
 
     res.json(markdownPageFromFile(relativePath, absolutePath));
+  });
+
+  app.get("/api/markdown-file/version", (req, res) => {
+    const projectDir = projectDirFromRequest(req, res);
+    if (!projectDir) return;
+
+    const relativePath =
+      typeof req.query.path === "string" ? req.query.path : "";
+    const absolutePath = ensureProjectPath(projectDir, relativePath);
+
+    if (!absolutePath?.toLowerCase().endsWith(".md")) {
+      res.status(404).json({ error: "Markdown file not found" });
+      return;
+    }
+
+    const exists = fs.existsSync(absolutePath);
+    res.json({
+      path: relativePath,
+      exists,
+      version: exists ? fileVersionFromFile(absolutePath) : null,
+    });
   });
 
   app.get("/api/markdown-file/events", (req, res) => {
@@ -869,6 +902,39 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     });
   });
 
+  app.get("/api/open-requests/poll", (req, res) => {
+    const clientId =
+      typeof req.query.clientId === "string" ? req.query.clientId.trim() : "";
+    if (!clientId) {
+      res.status(400).json({ error: "clientId is required" });
+      return;
+    }
+
+    const now = Date.now();
+    for (const [id, poller] of openRequestPollers) {
+      if (now - poller.lastSeenAt > OPEN_REQUEST_POLLER_TTL_MS) {
+        openRequestPollers.delete(id);
+      }
+    }
+
+    const requestedPath =
+      typeof req.query.path === "string" && req.query.path.trim().length > 0
+        ? req.query.path.trim()
+        : null;
+    const poller = openRequestPollers.get(clientId) ?? {
+      path: requestedPath,
+      lastSeenAt: now,
+      pending: [],
+    };
+    poller.path = requestedPath;
+    poller.lastSeenAt = now;
+    openRequestPollers.set(clientId, poller);
+
+    const requests = poller.pending;
+    poller.pending = [];
+    res.json({ requests });
+  });
+
   app.post("/api/open-request", (req, res) => {
     const payload = req.body as OpenRequestPayload;
     const targetPath =
@@ -885,11 +951,31 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
+    // Why: macOS can spell the same path in NFC or NFD, so compare normalized.
+    const samePath = (candidate: string | null) =>
+      candidate !== null &&
+      candidate.normalize("NFC") === targetPath.normalize("NFC");
+
     const matchingClient = Array.from(openRequestClients)
       .reverse()
-      .find((client) => client.path === targetPath);
+      .find((client) => samePath(client.path));
 
     if (!matchingClient) {
+      const now = Date.now();
+      const matchingPoller = Array.from(openRequestPollers.values())
+        .filter(
+          (poller) =>
+            samePath(poller.path) &&
+            now - poller.lastSeenAt <= OPEN_REQUEST_POLLER_TTL_MS,
+        )
+        .sort((left, right) => right.lastSeenAt - left.lastSeenAt)[0];
+
+      if (matchingPoller) {
+        matchingPoller.pending.push({ path: targetPath, url: targetUrl });
+        res.json({ delivered: true });
+        return;
+      }
+
       res.json({ delivered: false });
       return;
     }

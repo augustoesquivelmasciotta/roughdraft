@@ -18,6 +18,28 @@ function eventInput(documentPath = "/tmp/project/draft.md") {
 }
 
 describe("ReviewEventQueue", () => {
+  // macOS can store "Áreas" decomposed (NFD) while a typed path is composed
+  // (NFC); both spellings name the same file.
+  it("treats NFC and NFD spellings of a path as the same document", async () => {
+    vi.useFakeTimers();
+    const nfc = "/tmp/\u00c1reas/draft.md";
+    const nfd = "/tmp/A\u0301reas/draft.md";
+    const queue = new ReviewEventQueue();
+    const waiting = queue.wait({
+      documentPath: nfc,
+      timeoutMs: 1_000,
+      batchWindowMs: 10,
+    });
+
+    expect(queue.waiterCountForDocument(nfd)).toBe(1);
+
+    queue.emit(eventInput(nfd));
+    await vi.advanceTimersByTimeAsync(10);
+
+    await expect(waiting).resolves.toMatchObject({ timedOut: false });
+    vi.useRealTimers();
+  });
+
   it("queues events in creation order", async () => {
     const queue = new ReviewEventQueue();
 

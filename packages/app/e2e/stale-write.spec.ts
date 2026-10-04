@@ -27,7 +27,9 @@ test.describe("stale writes", () => {
   test("surfaces a save conflict when the file changed externally @smoke", async ({
     page,
   }) => {
-    await page.route("**/api/markdown-file/events**", (route) => route.abort());
+    await page.route("**/api/markdown-file/version**", (route) =>
+      route.abort(),
+    );
 
     const filePath = writeProjectFile(
       projectDir,
@@ -73,7 +75,9 @@ test.describe("stale writes", () => {
   test("overwrite after conflict marks the current draft saved", async ({
     page,
   }) => {
-    await page.route("**/api/markdown-file/events**", (route) => route.abort());
+    await page.route("**/api/markdown-file/version**", (route) =>
+      route.abort(),
+    );
 
     const filePath = writeProjectFile(
       projectDir,
@@ -118,7 +122,9 @@ test.describe("stale writes", () => {
   test("manual save preserves expected-version conflict behavior", async ({
     page,
   }) => {
-    await page.route("**/api/markdown-file/events**", (route) => route.abort());
+    await page.route("**/api/markdown-file/version**", (route) =>
+      route.abort(),
+    );
 
     const filePath = writeProjectFile(
       projectDir,
@@ -154,6 +160,9 @@ test.describe("stale writes", () => {
   test("rejects autosave after external content changes with stable metadata", async ({
     page,
   }) => {
+    await page.route("**/api/markdown-file/version**", (route) =>
+      route.abort(),
+    );
     const fixedTimestamp = new Date("2026-01-01T00:00:00.000Z");
     const filePath = writeProjectFile(
       projectDir,
@@ -185,7 +194,9 @@ test.describe("stale writes", () => {
   test("keeps explanatory conflict choices visible while scrolled in a long document", async ({
     page,
   }) => {
-    await page.route("**/api/markdown-file/events**", (route) => route.abort());
+    await page.route("**/api/markdown-file/version**", (route) =>
+      route.abort(),
+    );
 
     const longBody = Array.from(
       { length: 120 },
@@ -231,7 +242,9 @@ test.describe("stale writes", () => {
   test("keeps conflict banner and save status stack from overlapping", async ({
     page,
   }) => {
-    await page.route("**/api/markdown-file/events**", (route) => route.abort());
+    await page.route("**/api/markdown-file/version**", (route) =>
+      route.abort(),
+    );
 
     const filePath = writeProjectFile(
       projectDir,

@@ -132,7 +132,7 @@ export class ReviewEventQueue {
   }
 
   waiterCountForDocument(documentPath: string): number {
-    const normalizedPath = path.resolve(documentPath);
+    const normalizedPath = normalizeDocumentPath(documentPath);
     return [...this.waiters].filter(
       (waiter) => waiter.options.documentPath === normalizedPath,
     ).length;
@@ -178,7 +178,7 @@ function normalizeWaitOptions(
 ): NormalizedWaitOptions {
   return {
     documentPath: options.documentPath
-      ? path.resolve(options.documentPath)
+      ? normalizeDocumentPath(options.documentPath)
       : undefined,
     afterSequence: Math.max(0, options.afterSequence ?? 0),
     timeoutMs:
@@ -199,7 +199,14 @@ function matchesWaiter(
 ): boolean {
   if (event.sequence <= options.afterSequence) return false;
   if (!options.documentPath) return true;
-  return path.resolve(event.documentPath) === options.documentPath;
+  return normalizeDocumentPath(event.documentPath) === options.documentPath;
+}
+
+// Why: macOS can store a folder like "Áreas" decomposed (NFD) while a typed or
+// copied path is composed (NFC). Both name the same file, so a watcher started
+// with one spelling must match a page or event that uses the other.
+function normalizeDocumentPath(documentPath: string): string {
+  return path.resolve(documentPath).normalize("NFC");
 }
 
 function resultForEvents(
