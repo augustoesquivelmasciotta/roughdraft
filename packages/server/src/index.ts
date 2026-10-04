@@ -11,10 +11,17 @@ import {
 import express, { type Express, type Request, type Response } from "express";
 import {
   hasNonLoopbackHost,
+  isLoopbackHost,
   ROUGHDRAFT_DEFAULT_PORT,
   ROUGHDRAFT_PUBLIC_HOST,
   resolveBindHosts,
 } from "./network.js";
+import {
+  closeOrcaTabShowing,
+  isSameRoughdraftDocument,
+  type RunOrcaCommand,
+  runOrcaCommand,
+} from "./orca.js";
 import { ReviewEventQueue } from "./review-events.js";
 import { resolveUpdateStatus } from "./update-status.js";
 
@@ -67,6 +74,8 @@ interface CreateAppOptions {
   fetchImpl?: typeof fetch;
   packageName?: string;
   remoteDocumentToken?: string;
+  /** How to reach the Orca CLI when a page asks to close its Orca tab. */
+  orca?: { command: string; run: RunOrcaCommand };
 }
 
 interface CreateAppResult {
@@ -112,6 +121,12 @@ const REMOTE_SESSION_KEEPALIVE_MS = 15 * 1000;
 const MAX_OVERALL_COMMENT_LENGTH = 4_000;
 
 let nextOpenRequestClientId = 1;
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  // Node reports IPv4 clients of a dual-stack socket as ::ffff:127.0.0.1.
+  return isLoopbackHost(address.replace(/^::ffff:/i, ""));
+}
 
 function remoteSessionVersion(content: string): string {
   const hash = crypto.createHash("sha256").update(content).digest("hex");
@@ -403,6 +418,10 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     options.remoteDocumentToken.length > 0
       ? options.remoteDocumentToken
       : null;
+  const orca = options.orca ?? {
+    command: process.env.ORCA_CLI_COMMAND?.trim() || "orca",
+    run: runOrcaCommand,
+  };
   const app = express();
   const openRequestClients = new Set<OpenRequestClient>();
   const reviewEvents = new ReviewEventQueue();
@@ -882,6 +901,29 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       })}\n\n`,
     );
     res.json({ delivered: true });
+  });
+
+  // Orca browser tabs ignore window.close(), so the "Close window" button
+  // asks for its tab to be closed here. Only this machine may ask, and only
+  // for a Roughdraft document URL.
+  app.post("/api/orca/close-tab", async (req, res) => {
+    const pageUrl =
+      typeof req.body?.url === "string" ? req.body.url.trim() : "";
+    if (!isSameRoughdraftDocument(pageUrl, pageUrl)) {
+      res.status(400).json({ error: "url must be a Roughdraft document URL" });
+      return;
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      res.status(403).json({ error: "Only this computer can close its tabs" });
+      return;
+    }
+
+    const result = await closeOrcaTabShowing({
+      command: orca.command,
+      url: pageUrl,
+      run: orca.run,
+    });
+    res.json({ closed: result.closed });
   });
 
   app.post("/api/remote-document", (req, res) => {

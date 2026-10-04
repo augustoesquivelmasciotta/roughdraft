@@ -67,6 +67,12 @@ export interface StorageBackend {
     options?: CompleteReviewOptions,
   ): Promise<CompleteReviewResult>;
   getReviewWatchStatus?(relativePath: string): Promise<ReviewWatchStatus>;
+  /**
+   * Closes the Orca browser tab showing `pageUrl`. Orca tabs ignore
+   * `window.close()`, so the page asks the local server to do it. Resolves
+   * false when no single Orca tab shows the page.
+   */
+  closeOrcaTab?(pageUrl: string): Promise<boolean>;
   saveAsset(file: File): Promise<StoredAsset>;
   resolveFileUrl(path: string): string | null;
   openProject(path: string): Promise<void>;

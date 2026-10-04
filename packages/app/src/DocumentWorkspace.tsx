@@ -472,6 +472,7 @@ export function DocumentWorkspace({
   const [copiedFileAction, setCopiedFileAction] =
     useState<FileCopyAction | null>(null);
   const [overallComment, setOverallComment] = useState("");
+  const [closeWindowFailed, setCloseWindowFailed] = useState(false);
   const [documentChangedSinceOpen, setDocumentChangedSinceOpen] =
     useState(false);
   const [lastHandoffAt, setLastHandoffAt] = useState<string | null>(() =>
@@ -515,6 +516,7 @@ export function DocumentWorkspace({
     documentChangeTrackingReadyRef.current = false;
     setReviewHandoffState("idle");
     setReviewHandoffPopoverOpen(false);
+    setCloseWindowFailed(false);
     setDocumentChangedSinceOpen(false);
     setLastHandoffAt(readLastHandoffAt(documentCopyPath ?? activeDocumentPath));
     const readyTimer = window.setTimeout(() => {
@@ -687,6 +689,18 @@ export function DocumentWorkspace({
     ],
   );
 
+  const handleCloseWindow = useCallback(async () => {
+    window.close();
+    // Why: an Orca browser tab, like any tab the page did not open, ignores
+    // window.close(). If the page is still here, ask the local server to close
+    // the Orca tab showing it, and otherwise say how to close it.
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
+    const closed = await (
+      backend?.closeOrcaTab?.(window.location.href) ?? Promise.resolve(false)
+    ).catch(() => false);
+    if (!closed) setCloseWindowFailed(true);
+  }, [backend]);
+
   const handleDocumentDirtyStateChange = useCallback(
     (isDirty: boolean) => {
       if (
@@ -812,8 +826,14 @@ export function DocumentWorkspace({
   return (
     <div
       className={cn(
-        "min-h-0 flex-1 overflow-y-auto px-8 pb-8 sm:px-12",
-        conflictNotice ? "pt-40 sm:pt-28" : "pt-10",
+        "min-h-0 flex-1 overflow-y-auto px-3 pb-8 sm:px-12",
+        conflictNotice
+          ? "pt-40 sm:pt-28"
+          : // Without the rail beside it, the header would sit under the
+            // fixed "I'm done" button.
+            showReviewHandoffButton
+            ? "pt-16 min-[900px]:pt-10"
+            : "pt-10",
       )}
     >
       <RemoteSessionBanner backend={backend} />
@@ -1012,10 +1032,18 @@ export function DocumentWorkspace({
                               size="lg"
                               variant="outline"
                               className="mt-4 w-full rounded-[7px] text-sm font-semibold"
-                              onClick={() => window.close()}
+                              onClick={() => void handleCloseWindow()}
                             >
                               Close window
                             </Button>
+                            {closeWindowFailed ? (
+                              <p
+                                data-testid="review-handoff-close-window-hint"
+                                className="mt-2 text-center text-xs text-stone-500 dark:text-slate-400"
+                              >
+                                Close this tab from the tab bar.
+                              </p>
+                            ) : null}
                           </div>
                         )}
                       </div>

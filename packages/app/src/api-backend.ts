@@ -161,6 +161,18 @@ export class ApiBackend implements StorageBackend {
     };
   }
 
+  async closeOrcaTab(pageUrl: string): Promise<boolean> {
+    const res = await fetch("/api/orca/close-tab", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: pageUrl }),
+    });
+    if (!res.ok) return false;
+
+    const payload = (await res.json()) as { closed?: unknown };
+    return payload.closed === true;
+  }
+
   async saveAsset(file: File): Promise<StoredAsset> {
     const buffer = await file.arrayBuffer();
     let binary = "";

@@ -23,8 +23,10 @@ import type {
 
 function createBackend({
   watcherCount,
+  closeOrcaTab,
 }: {
   watcherCount?: number;
+  closeOrcaTab?: StorageBackend["closeOrcaTab"];
 } = {}): StorageBackend {
   const backend: StorageBackend = {
     info: {
@@ -57,6 +59,10 @@ function createBackend({
       watching: watcherCount > 0,
       watcherCount,
     });
+  }
+
+  if (closeOrcaTab) {
+    backend.closeOrcaTab = closeOrcaTab;
   }
 
   return backend;
@@ -786,11 +792,13 @@ describe("review handoff watcher affordance", () => {
   async function renderWorkspace({
     getWatcherCount,
     onCompleteReview = async () => ({ delivered: false }),
+    closeOrcaTab,
   }: {
     getWatcherCount: () => number;
     onCompleteReview?: (
       options?: CompleteReviewOptions,
     ) => Promise<CompleteReviewResult>;
+    closeOrcaTab?: StorageBackend["closeOrcaTab"];
   }) {
     await act(async () => {
       root.render(
@@ -810,7 +818,10 @@ describe("review handoff watcher affordance", () => {
           onKeepEditingWithoutAutosave={() => {}}
           onOverwriteDocumentOnDisk={() => {}}
           onCompleteReview={onCompleteReview}
-          backend={createBackend({ watcherCount: getWatcherCount() })}
+          backend={createBackend({
+            watcherCount: getWatcherCount(),
+            closeOrcaTab,
+          })}
         />,
       );
       await Promise.resolve();
@@ -1166,5 +1177,48 @@ describe("review handoff watcher affordance", () => {
     await click(getByTestId(document.body, "review-handoff-close-window"));
 
     expect(closeWindow).toHaveBeenCalled();
+  });
+
+  async function handOffAndCloseWindow(
+    closeOrcaTab: NonNullable<StorageBackend["closeOrcaTab"]>,
+  ) {
+    // An Orca tab ignores window.close(), like this mock.
+    vi.spyOn(window, "close").mockImplementation(() => {});
+    let watcherCount = 1;
+    await renderWorkspace({
+      getWatcherCount: () => watcherCount,
+      onCompleteReview: async () => {
+        watcherCount = 0;
+        return { delivered: true };
+      },
+      closeOrcaTab,
+    });
+    await click(getByTestId(container, "review-handoff-button"));
+    await click(getByTestId(document.body, "review-handoff-close-window"));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    });
+  }
+
+  it("asks Roughdraft to close the Orca tab when the window stays open", async () => {
+    const closeOrcaTab = vi
+      .fn<NonNullable<StorageBackend["closeOrcaTab"]>>()
+      .mockResolvedValue(true);
+
+    await handOffAndCloseWindow(closeOrcaTab);
+
+    expect(closeOrcaTab).toHaveBeenCalledWith(window.location.href);
+    expect(
+      queryByTestId(document.body, "review-handoff-close-window-hint"),
+    ).toBeNull();
+  });
+
+  it("says how to close the tab when nothing could close it", async () => {
+    await handOffAndCloseWindow(async () => false);
+
+    expect(
+      getByTestId(document.body, "review-handoff-close-window-hint")
+        .textContent,
+    ).toBe("Close this tab from the tab bar.");
   });
 });

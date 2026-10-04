@@ -708,6 +708,92 @@ describe("createApp", () => {
     expect(response.body).toEqual({ delivered: false });
   });
 
+  describe("closing the Orca tab that shows a page", () => {
+    const pageUrl = "http://localhost:7373/?path=%2Frepo%2Fplan.md";
+
+    function fakeOrca(tabs: Array<{ browserPageId: string; url: string }>) {
+      const calls: string[][] = [];
+      return {
+        calls,
+        orca: {
+          command: "orca",
+          run: async (_command: string, args: string[]) => {
+            calls.push(args);
+            const result =
+              args[1] === "list"
+                ? {
+                    tabs: tabs.map((tab) => ({
+                      ...tab,
+                      active: false,
+                      loadError: null,
+                    })),
+                  }
+                : { closed: true };
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({ ok: true, result }),
+              stderr: "",
+            };
+          },
+        },
+      };
+    }
+
+    it("closes the Orca tab showing the page", async () => {
+      const orca = fakeOrca([{ browserPageId: "page-plan", url: pageUrl }]);
+      const { app } = createApp({
+        homeDir,
+        staticDirPath: projectDir,
+        orca: orca.orca,
+      });
+
+      const response = await request(app)
+        .post("/api/orca/close-tab")
+        .send({ url: pageUrl });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ closed: true });
+      expect(orca.calls.at(-1)).toEqual([
+        "tab",
+        "close",
+        "--page",
+        "page-plan",
+        "--json",
+      ]);
+    });
+
+    it("reports when no Orca tab shows the page", async () => {
+      const orca = fakeOrca([]);
+      const { app } = createApp({
+        homeDir,
+        staticDirPath: projectDir,
+        orca: orca.orca,
+      });
+
+      const response = await request(app)
+        .post("/api/orca/close-tab")
+        .send({ url: pageUrl });
+
+      expect(response.body).toEqual({ closed: false });
+    });
+
+    it("refuses URLs that are not Roughdraft documents without asking Orca", async () => {
+      const orca = fakeOrca([]);
+      const { app } = createApp({
+        homeDir,
+        staticDirPath: projectDir,
+        orca: orca.orca,
+      });
+
+      const response = await request(app)
+        .post("/api/orca/close-tab")
+        .send({ url: "https://example.com/" });
+
+      expect(response.status).toBe(400);
+      expect(orca.calls).toEqual([]);
+    });
+  });
+
   it("serves local files and stores uploaded assets inside the project", async () => {
     fs.writeFileSync(path.join(projectDir, "image.txt"), "asset text\n");
 
