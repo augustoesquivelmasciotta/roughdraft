@@ -5,7 +5,6 @@ import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { CommentEditorList } from "./CommentEditorList";
 import {
   type CriticChangeAttrs,
   type CriticComment,
@@ -30,6 +29,7 @@ import {
   getRootThreadIdForCommentId,
   parseCommentIds,
 } from "./document-comments";
+import { DocumentReviewSheet } from "./DocumentReviewSheet";
 import { EditorContextMenu } from "./EditorContextMenu";
 import {
   commentHighlightPluginKey,
@@ -53,6 +53,7 @@ import {
 import { ReviewNavigator } from "./ReviewNavigator";
 import { getNavigatorPlatform } from "./comment-shortcuts";
 import type { Page, StorageBackend } from "./storage";
+import { useMediaQuery } from "./use-media-query";
 import { useCommentAnchorLayout } from "./useCommentAnchorLayout";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
 
@@ -294,6 +295,48 @@ function findCommentAnchorElement(editor: Editor | null, commentId: string) {
       parseCommentIds(anchor.dataset.commentIds).includes(commentId),
     ) ?? null
   );
+}
+
+/**
+ * Viewports where the review rail cannot sit beside the document, such as a
+ * phone in Orca mobile or a narrow split pane. The selected thread opens in a
+ * bottom sheet there. Mirrors the 900px breakpoint of `.review-layout-grid`.
+ */
+const NARROW_REVIEW_LAYOUT_QUERY = "(width < 900px)";
+
+function findScrollParent(element: HTMLElement): HTMLElement | null {
+  for (
+    let parent = element.parentElement;
+    parent;
+    parent = parent.parentElement
+  ) {
+    const { overflowY } = window.getComputedStyle(parent);
+    if (
+      (overflowY === "auto" || overflowY === "scroll") &&
+      parent.scrollHeight > parent.clientHeight
+    ) {
+      return parent;
+    }
+  }
+  return null;
+}
+
+/** Scrolls `anchor` into the part of the viewport the review sheet leaves free. */
+function revealAboveReviewSheet(anchor: HTMLElement, sheet: HTMLElement) {
+  const margin = 16;
+  const anchorRect = anchor.getBoundingClientRect();
+  const visibleBottom = sheet.getBoundingClientRect().top - margin;
+  const scroller = findScrollParent(anchor);
+  if (!scroller) return;
+
+  if (anchorRect.bottom > visibleBottom) {
+    scroller.scrollBy({
+      top: anchorRect.bottom - visibleBottom,
+      behavior: "smooth",
+    });
+  } else if (anchorRect.top < margin) {
+    scroller.scrollBy({ top: anchorRect.top - margin, behavior: "smooth" });
+  }
 }
 
 function getAnchorCommentIds(
@@ -727,6 +770,11 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     string | null
   >(null);
   const [newCommentDraftIds, setNewCommentDraftIds] = useState<string[]>([]);
+  const isNarrowLayout =
+    useMediaQuery(NARROW_REVIEW_LAYOUT_QUERY) && layout !== "embedded-demo";
+  const isNarrowLayoutRef = useRef(isNarrowLayout);
+  isNarrowLayoutRef.current = isNarrowLayout;
+  const reviewSheetRef = useRef<HTMLElement>(null);
 
   const resolveFileUrl = useCallback(
     (path: string) => backend.resolveFileUrl(path),
@@ -858,6 +906,10 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       content: parsedContent.doc,
       immediatelyRender: false,
       shouldRerenderOnTransaction: false,
+      // Why: Orca mobile turns a tap on an element with a tabindex into
+      // focus() + click() instead of a real click, so the caret never landed
+      // where the finger did. The editable element is focusable without it.
+      enableCoreExtensions: { tabindex: false },
       editorProps: {
         attributes: {
           class: "tiptap min-h-[70vh]",
@@ -2174,9 +2226,60 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     if (currentEditor && element) {
       revealFoldedContent(currentEditor, element);
     }
+    // On narrow screens the review sheet covers the bottom of the page; the
+    // sheet effect scrolls the highlight into the part it leaves free.
+    if (isNarrowLayoutRef.current) return;
     requestAnimationFrame(() => {
       element?.scrollIntoView({ block: "center", behavior: "smooth" });
     });
+  }, []);
+
+  const reviewSheetOpen =
+    isNarrowLayout &&
+    Boolean(draftSuggestion || selectedChangeId || selectedCommentId);
+  const reviewSheetKey = draftSuggestion
+    ? "__draft_suggestion__"
+    : (selectedChangeId ?? selectedCommentId);
+
+  useEffect(() => {
+    if (!reviewSheetOpen || !reviewSheetKey) return;
+
+    const frame = requestAnimationFrame(() => {
+      const currentEditor = editorRef.current;
+      const sheet = reviewSheetRef.current;
+      if (!currentEditor || !sheet) return;
+
+      const changeId = selectedChangeIdRef.current;
+      const commentId = selectedCommentIdRef.current;
+      const anchor = changeId
+        ? ([
+            ...currentEditor.view.dom.querySelectorAll<HTMLElement>(
+              ".critic-change[data-critic-change-id]",
+            ),
+          ].find(
+            (candidate) => candidate.dataset.criticChangeId === changeId,
+          ) ?? null)
+        : commentId
+          ? findCommentAnchorElement(
+              currentEditor,
+              findAnchoredAncestorId(
+                currentEditor,
+                commentId,
+                commentsRef.current,
+              ) ?? commentId,
+            )
+          : null;
+      if (anchor) revealAboveReviewSheet(anchor, sheet);
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [reviewSheetKey, reviewSheetOpen]);
+
+  const closeReviewSheet = useCallback(() => {
+    setSelectedCommentId(null);
+    setSelectedChangeId(null);
+    setDraftSuggestion(null);
+    setPendingFocusCommentId(null);
   }, []);
 
   useEffect(() => {
@@ -2201,9 +2304,6 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   }, [layout, navigateReview]);
   const documentShellRef =
     useReviewLayoutShiftAnimation<HTMLDivElement>(hasReviewRail);
-  const activeComments = activeCommentIds
-    .map((commentId) => comments.get(commentId))
-    .filter((comment): comment is CriticComment => Boolean(comment));
   const contentCardClass =
     "rounded-[0.75rem] border border-[#E9E9E8] dark:border-slate-800 bg-white dark:bg-card shadow-[0_18px_44px_rgba(57,47,38,0.08)] dark:shadow-[0_18px_44px_rgba(0,0,0,0.35)]";
   const documentShellClass = cn(
@@ -2222,17 +2322,81 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       ? "max-w-none"
       : "review-layout-main max-w-[46.5rem]",
   );
-  const contentInsetClass = layout === "embedded-demo" ? "pb-0" : "pb-24";
-  const fallbackClass = cn(
-    "document-comment-fallback mb-4",
-    layout === "embedded-demo" ? "hidden" : "min-[1100px]:hidden",
-  );
+  const contentInsetClass =
+    layout === "embedded-demo"
+      ? "pb-0"
+      : // Room to scroll the last lines above an open review sheet.
+        reviewSheetOpen
+        ? "pb-[60vh]"
+        : "pb-24";
   const reviewRailClass = cn(
     "document-comment-rail",
     layout === "embedded-demo"
       ? "block px-4 pb-4 min-[900px]:p-0"
-      : "review-layout-rail hidden min-[1100px]:block",
+      : "review-layout-rail hidden min-[900px]:block",
   );
+  const reviewRailProps = {
+    commentGroups: railCommentGroups,
+    comments,
+    suggestions: criticChanges,
+    selectedCommentId,
+    hoveredCommentId,
+    selectedChangeId,
+    hoveredChangeId,
+    contentHeight,
+    onDeleteComment: deleteComment,
+    onUpdateComment: (commentId: string, nextContent: string) => {
+      updateComment(commentId, (current) => ({
+        ...current,
+        content: nextContent,
+      }));
+    },
+    onReplyComment: replyToComment,
+    onResolveComment: resolveComment,
+    onReopenComment: reopenComment,
+    newCommentIds,
+    onSelectComment: selectComment,
+    onFocusComment: focusComment,
+    onHoverComment: setHoveredCommentId,
+    onAcceptSuggestion: acceptSuggestion,
+    onRejectSuggestion: rejectSuggestion,
+    onReplySuggestion: replyToSuggestion,
+    onSelectSuggestion: selectSuggestion,
+    onFocusSuggestion: focusSuggestion,
+    onHoverSuggestion: setHoveredChangeId,
+    pendingFocusCommentId,
+    newCommentDraftIds,
+    onAutoFocusComment: (commentId: string) => {
+      setPendingFocusCommentId((current) =>
+        current === commentId ? null : current,
+      );
+    },
+    draftSuggestion,
+    onDraftSuggestionTextChange: (text: string) => {
+      setDraftSuggestion((current) =>
+        current ? { ...current, text } : current,
+      );
+    },
+    onApplyDraftSuggestion: applyDraftSuggestion,
+    onCancelDraftSuggestion: () => setDraftSuggestion(null),
+    editor,
+  };
+  const reviewNavigator =
+    hasReviewRail && layout !== "embedded-demo" ? (
+      <ReviewNavigator
+        className={
+          reviewSheetOpen ? undefined : "fixed right-4 bottom-4 z-[55]"
+        }
+        openCount={openThreadCount}
+        newCount={newThreadCount}
+        filter={navigationFilter}
+        onFilterChange={(filter) => {
+          navigationFilterChosenRef.current = true;
+          setNavigationFilter(filter);
+        }}
+        onNavigate={navigateReview}
+      />
+    ) : null;
 
   return (
     <div
@@ -2245,39 +2409,15 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
         className={documentShellClass}
       >
         <div className={documentMainClass}>
-          {activeComments.length > 0 ? (
-            <CommentEditorList
-              comments={activeComments}
-              className={fallbackClass}
-              testId="document-comment-fallback"
-              selectedCommentId={selectedCommentId}
-              hoveredCommentId={hoveredCommentId}
-              onDeleteComment={deleteComment}
-              onUpdateComment={(commentId, nextContent) => {
-                updateComment(commentId, (current) => ({
-                  ...current,
-                  content: nextContent,
-                }));
-              }}
-              onReplyComment={replyToComment}
-              onResolveComment={resolveComment}
-              onReopenComment={reopenComment}
-              newCommentIds={newCommentIds}
-              onSelectComment={selectComment}
-              onHoverComment={setHoveredCommentId}
-              pendingFocusCommentId={pendingFocusCommentId}
-              newCommentDraftIds={newCommentDraftIds}
-              onAutoFocusComment={(commentId) => {
-                setPendingFocusCommentId((current) =>
-                  current === commentId ? null : current,
-                );
-              }}
-            />
-          ) : null}
           <div className={contentInsetClass}>
             <div
               data-testid="document-content-card"
-              className={cn(contentCardClass, "px-10 py-10 sm:px-14 sm:py-14")}
+              className={cn(
+                contentCardClass,
+                layout === "embedded-demo"
+                  ? "px-10 py-10 sm:px-14 sm:py-14"
+                  : "px-5 py-7 sm:px-14 sm:py-14",
+              )}
             >
               <EditorContextMenu
                 editor={editor}
@@ -2309,69 +2449,31 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
             </div>
           </div>
         </div>
-        <DocumentReviewRail
-          className={reviewRailClass}
-          layout={layout === "embedded-demo" ? "flow" : "anchored"}
-          testId="document-review-rail"
-          commentGroups={railCommentGroups}
-          comments={comments}
-          suggestions={criticChanges}
-          selectedCommentId={selectedCommentId}
-          hoveredCommentId={hoveredCommentId}
-          selectedChangeId={selectedChangeId}
-          hoveredChangeId={hoveredChangeId}
-          contentHeight={contentHeight}
-          onDeleteComment={deleteComment}
-          onUpdateComment={(commentId, nextContent) => {
-            updateComment(commentId, (current) => ({
-              ...current,
-              content: nextContent,
-            }));
-          }}
-          onReplyComment={replyToComment}
-          onResolveComment={resolveComment}
-          onReopenComment={reopenComment}
-          newCommentIds={newCommentIds}
-          onSelectComment={selectComment}
-          onFocusComment={focusComment}
-          onHoverComment={setHoveredCommentId}
-          onAcceptSuggestion={acceptSuggestion}
-          onRejectSuggestion={rejectSuggestion}
-          onReplySuggestion={replyToSuggestion}
-          onSelectSuggestion={selectSuggestion}
-          onFocusSuggestion={focusSuggestion}
-          onHoverSuggestion={setHoveredChangeId}
-          pendingFocusCommentId={pendingFocusCommentId}
-          newCommentDraftIds={newCommentDraftIds}
-          onAutoFocusComment={(commentId) => {
-            setPendingFocusCommentId((current) =>
-              current === commentId ? null : current,
-            );
-          }}
-          draftSuggestion={draftSuggestion}
-          onDraftSuggestionTextChange={(text) => {
-            setDraftSuggestion((current) =>
-              current ? { ...current, text } : current,
-            );
-          }}
-          onApplyDraftSuggestion={applyDraftSuggestion}
-          onCancelDraftSuggestion={() => setDraftSuggestion(null)}
-          editor={editor}
-        />
+        {isNarrowLayout ? null : (
+          <DocumentReviewRail
+            {...reviewRailProps}
+            className={reviewRailClass}
+            layout={layout === "embedded-demo" ? "flow" : "anchored"}
+            testId="document-review-rail"
+          />
+        )}
       </div>
-      {hasReviewRail && layout !== "embedded-demo" ? (
-        <ReviewNavigator
-          className="fixed right-4 bottom-4 z-[55]"
-          openCount={openThreadCount}
-          newCount={newThreadCount}
-          filter={navigationFilter}
-          onFilterChange={(filter) => {
-            navigationFilterChosenRef.current = true;
-            setNavigationFilter(filter);
-          }}
-          onNavigate={navigateReview}
-        />
-      ) : null}
+      {reviewSheetOpen ? (
+        <DocumentReviewSheet
+          ref={reviewSheetRef}
+          navigator={reviewNavigator}
+          onClose={closeReviewSheet}
+        >
+          <DocumentReviewRail
+            {...reviewRailProps}
+            layout="flow"
+            activeOnly
+            testId="document-review-sheet-rail"
+          />
+        </DocumentReviewSheet>
+      ) : (
+        reviewNavigator
+      )}
     </div>
   );
 });
@@ -2404,7 +2506,7 @@ const CodeEditorSurface = memo(function CodeEditorSurface({
     "document-comment-rail pointer-events-none invisible",
     layout === "embedded-demo"
       ? "block px-4 pb-4 min-[900px]:p-0"
-      : "review-layout-rail hidden min-[1100px]:block",
+      : "review-layout-rail hidden min-[900px]:block",
   );
   const documentShellRef =
     useReviewLayoutShiftAnimation<HTMLDivElement>(hasCommentRailSpace);

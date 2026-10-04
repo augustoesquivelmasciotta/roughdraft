@@ -57,6 +57,8 @@ interface DocumentReviewRailProps {
   contentHeight: number;
   className?: string;
   layout?: "anchored" | "flow";
+  /** Show only the selected thread or draft, as the narrow-screen sheet does. */
+  activeOnly?: boolean;
   testId?: string;
   onDeleteComment: (commentId: string) => void;
   onUpdateComment: (commentId: string, nextContent: string) => void;
@@ -197,6 +199,7 @@ export function DocumentReviewRail({
   contentHeight,
   className,
   layout: railLayout = "anchored",
+  activeOnly = false,
   testId,
   onDeleteComment,
   onUpdateComment,
@@ -339,8 +342,13 @@ export function DocumentReviewRail({
       activeSuggestionIdForComment ??
       activeRootThreadId;
 
-    return resolveAnchoredRailLayouts(entries, itemHeights, activeKey);
+    return resolveAnchoredRailLayouts(
+      activeOnly ? entries.filter((entry) => entry.key === activeKey) : entries,
+      itemHeights,
+      activeKey,
+    );
   }, [
+    activeOnly,
     activeRootThreadId,
     activeSuggestionIdForComment,
     commentEntries,
@@ -462,7 +470,7 @@ export function DocumentReviewRail({
                   isSelected
                     ? "border-[#DFDFDC] dark:border-slate-600 bg-white dark:bg-card shadow-[0_20px_48px_rgba(57,47,38,0.14)] dark:shadow-[0_20px_48px_rgba(0,0,0,0.4)]"
                     : "",
-                  isSelected && "-translate-x-2",
+                  isSelected && !activeOnly && "-translate-x-2",
                   isExpanded ? "cursor-default" : "cursor-pointer",
                 )}
                 style={railLayoutItemStyle(railLayout, layout.railTop)}
@@ -518,7 +526,8 @@ export function DocumentReviewRail({
                 data-suggestion-thread-container="true"
                 className={cn(
                   railLayoutItemClass(railLayout),
-                  "-translate-x-2 border-[#DFDFDC] dark:border-slate-600 bg-white dark:bg-card px-4 py-3 shadow-[0_20px_48px_rgba(57,47,38,0.14)] dark:shadow-[0_20px_48px_rgba(0,0,0,0.4)]",
+                  !activeOnly && "-translate-x-2",
+                  "border-[#DFDFDC] dark:border-slate-600 bg-white dark:bg-card px-4 py-3 shadow-[0_20px_48px_rgba(57,47,38,0.14)] dark:shadow-[0_20px_48px_rgba(0,0,0,0.4)]",
                 )}
                 style={railLayoutItemStyle(railLayout, layout.railTop)}
               >
@@ -674,8 +683,9 @@ export function DocumentReviewRail({
               className={cn(
                 railLayoutItemClass(railLayout),
                 isSelected
-                  ? "-translate-x-2 border-[#DFDFDC] dark:border-slate-600 bg-white dark:bg-card shadow-[0_20px_48px_rgba(57,47,38,0.14)] dark:shadow-[0_20px_48px_rgba(0,0,0,0.4)]"
+                  ? "border-[#DFDFDC] dark:border-slate-600 bg-white dark:bg-card shadow-[0_20px_48px_rgba(57,47,38,0.14)] dark:shadow-[0_20px_48px_rgba(0,0,0,0.4)]"
                   : "",
+                isSelected && !activeOnly && "-translate-x-2",
                 isHovered && !isSelected && "cursor-pointer",
               )}
               style={railLayoutItemStyle(railLayout, layout.railTop)}

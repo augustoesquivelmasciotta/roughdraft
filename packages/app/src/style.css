@@ -880,7 +880,10 @@
  * translate animates back to zero. This avoids relying on grid-template-columns
  * interpolation while the first comment UI mounts.
  *
- * Below the breakpoint the shell falls back to a simple stacked column.
+ * Below the breakpoint the shell falls back to a simple stacked column and
+ * the selected thread opens in a bottom sheet (NARROW_REVIEW_LAYOUT_QUERY in
+ * PageCard.tsx). Between 900px and 1100px, for example an Orca tab in a split
+ * pane, the rail stays beside the document with a narrower width.
  */
 .review-layout-grid {
   --review-layout-shift-x: 0px;
@@ -890,15 +893,15 @@
   transform: translateX(var(--review-layout-shift-x));
 }
 
-@media (min-width: 1100px) {
+@media (min-width: 900px) {
   .review-layout-grid {
     display: grid;
     /* comments present: document on the left, fixed-width rail on the right */
-    --review-rail-width: 18rem;
+    --review-rail-width: 16rem;
     grid-template-columns: minmax(0, 46.5rem) var(--review-rail-width);
     justify-content: center;
     align-items: start;
-    column-gap: 2rem;
+    column-gap: 1.5rem;
   }
 
   /* no comments: rail collapses to nothing and the document re-centers */
@@ -914,6 +917,13 @@
   .review-layout-grid > .review-layout-rail {
     grid-column: 2;
     min-width: 0;
+  }
+}
+
+@media (min-width: 1100px) {
+  .review-layout-grid {
+    --review-rail-width: 18rem;
+    column-gap: 2rem;
   }
 }
 

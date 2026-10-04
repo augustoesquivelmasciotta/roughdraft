@@ -477,8 +477,26 @@ describe("PageCard editor integration", () => {
 
     vi.useRealTimers();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     window.history.replaceState(null, "", "/");
   });
+
+  /**
+   * A phone-sized viewport, as in Orca mobile: no rail beside the document,
+   * and the selected thread opens in the bottom review sheet.
+   */
+  function stubNarrowViewport() {
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query === "(width < 900px)",
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    }));
+  }
 
   it("document mode edits trigger autosave", async () => {
     const rendered = await renderPageCard({
@@ -1447,6 +1465,7 @@ describe("PageCard editor integration", () => {
   });
 
   it("recent local save echo does not immediately overwrite current editor state", async () => {
+    stubNarrowViewport();
     const rendered = await renderPageCard({
       page: {
         id: "doc-4",
@@ -1470,9 +1489,13 @@ describe("PageCard editor integration", () => {
     expect(typeof savedMarkdown).toBe("string");
 
     await selectText(editor, "alpha");
+    // Fake timers also drive animation frames, where highlights are measured.
+    await act(async () => {
+      vi.advanceTimersByTime(32);
+      await Promise.resolve();
+    });
     expect(
-      queryByTestId(rendered.container, "document-comment-fallback")
-        ?.textContent,
+      queryByTestId(rendered.container, "document-review-sheet")?.textContent,
     ).toContain("Comment body");
 
     await act(async () => {
@@ -1488,8 +1511,7 @@ describe("PageCard editor integration", () => {
     });
 
     expect(
-      queryByTestId(rendered.container, "document-comment-fallback")
-        ?.textContent,
+      queryByTestId(rendered.container, "document-review-sheet")?.textContent,
     ).toContain("Comment body");
   });
 
@@ -1539,7 +1561,8 @@ describe("PageCard editor integration", () => {
     expect(rendered.getEditor().getText()).toContain("Start updated");
   });
 
-  it("comment selection still updates fallback UI", async () => {
+  it("opens the selected thread in the review sheet on a narrow screen", async () => {
+    stubNarrowViewport();
     const rendered = await renderPageCard({
       page: {
         id: "doc-5",
@@ -1549,16 +1572,36 @@ describe("PageCard editor integration", () => {
       selected: true,
     });
 
-    await selectText(rendered.getEditor(), "alpha");
+    expect(queryByTestId(rendered.container, "document-review-sheet")).toBe(
+      null,
+    );
+    expect(queryByTestId(rendered.container, "document-review-rail")).toBe(
+      null,
+    );
 
+    await selectText(rendered.getEditor(), "alpha");
+    await flushAnimationFrame();
+
+    const sheet = getByTestId(rendered.container, "document-review-sheet");
+    expect(sheet.textContent).toContain("Comment body");
+    expect(sheet.textContent).toContain("Me");
+    // The navigator moves into the sheet instead of floating over it.
+    expect(queryByTestId(sheet, "review-navigator")).not.toBeNull();
+
+    await act(async () => {
+      getByTestId(sheet, "document-review-sheet-close").click();
+    });
+
+    expect(queryByTestId(rendered.container, "document-review-sheet")).toBe(
+      null,
+    );
     expect(
-      queryByTestId(rendered.container, "document-comment-fallback")
-        ?.textContent,
-    ).toContain("Comment body");
-    expect(rendered.container.textContent).toContain("Me");
+      queryByTestId(rendered.container, "review-navigator"),
+    ).not.toBeNull();
   });
 
   it("does not autosave a newly-created empty comment before it is submitted", async () => {
+    stubNarrowViewport();
     const rendered = await renderPageCard({
       page: {
         id: "doc-comment-empty-draft-1",
@@ -1575,7 +1618,7 @@ describe("PageCard editor integration", () => {
 
     const commentEditor = queryByTestId<HTMLTextAreaElement>(
       rendered.container,
-      "comment-banner-c1-editor",
+      "comment-rail-c1-editor",
     );
     expect(commentEditor).not.toBeNull();
 
@@ -1598,7 +1641,7 @@ describe("PageCard editor integration", () => {
 
     const saveButton = queryByTestId<HTMLButtonElement>(
       rendered.container,
-      "comment-banner-c1-action-save",
+      "comment-rail-c1-action-save",
     );
     expect(saveButton).not.toBeNull();
     expect(saveButton?.className).toContain("rounded-xl");
@@ -1609,7 +1652,7 @@ describe("PageCard editor integration", () => {
     expect(
       queryByTestId<HTMLButtonElement>(
         rendered.container,
-        "comment-banner-c1-action-cancel",
+        "comment-rail-c1-action-cancel",
       ),
     ).toBeNull();
 
@@ -1631,6 +1674,7 @@ describe("PageCard editor integration", () => {
   });
 
   it("opens a reply to the root comment when r is pressed in a focused thread", async () => {
+    stubNarrowViewport();
     const rendered = await renderPageCard({
       page: {
         id: "doc-comment-reply-shortcut-1",
@@ -1642,10 +1686,11 @@ describe("PageCard editor integration", () => {
     });
 
     await selectText(rendered.getEditor(), "alpha");
+    await flushAnimationFrame();
 
     const nestedEditButton = getByTestId<HTMLButtonElement>(
       rendered.container,
-      "comment-banner-child-action-edit",
+      "comment-rail-child-action-edit",
     );
 
     vi.useFakeTimers();
@@ -1664,7 +1709,7 @@ describe("PageCard editor integration", () => {
 
     const replyEditor = queryByTestId<HTMLTextAreaElement>(
       rendered.container,
-      "comment-banner-c1-editor",
+      "comment-rail-c1-editor",
     );
     expect(replyEditor).not.toBeNull();
 
@@ -1677,6 +1722,7 @@ describe("PageCard editor integration", () => {
   });
 
   it("deletes a whole root comment thread from the thread action", async () => {
+    stubNarrowViewport();
     const rendered = await renderPageCard({
       page: {
         id: "doc-delete-comment-thread-1",
@@ -1688,10 +1734,11 @@ describe("PageCard editor integration", () => {
     });
 
     await selectText(rendered.getEditor(), "alpha");
+    await flushAnimationFrame();
 
     const deleteThreadButton = queryByTestId<HTMLButtonElement>(
       rendered.container,
-      "comment-banner-root-action-delete-thread",
+      "comment-rail-root-action-delete-thread",
     );
     expect(deleteThreadButton).not.toBeNull();
 
