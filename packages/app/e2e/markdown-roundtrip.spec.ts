@@ -10,6 +10,7 @@ import {
   readProjectFile,
   removeMarkdownProject,
   richTextEditor,
+  selectRichText,
   writeProjectFile,
 } from "./helpers";
 
@@ -89,6 +90,80 @@ test.describe("markdown round-trips", () => {
     logE2eEvent("markdown-roundtrip.code-save", {
       size: fs.statSync(filePath).size,
     });
+  });
+
+  test("editing one paragraph leaves every untouched block byte-identical @smoke", async ({
+    page,
+  }) => {
+    const original = [
+      "# Campaign review",
+      "",
+      'Intro with a {==claim==}{>>Is this right?<<}{id="c1" by="user" at="2026-10-01T10:00:00.000Z"}.',
+      "",
+      "* Star bullet",
+      "* Another one",
+      "",
+      "<details>",
+      "<summary>Full diff</summary>",
+      "",
+      "````diff",
+      " ```bash",
+      " # comment line",
+      "",
+      " echo hi",
+      " ```",
+      "+</details>",
+      "````",
+      "",
+      "</details>",
+      "",
+      "```bash",
+      "# first comment",
+      "",
+      "",
+      "echo two",
+      "```",
+      "",
+      "Closing paragraph.",
+      "",
+      "---",
+      "comments:",
+      "  c2:",
+      "    body: Yes, I checked the source.",
+      "    by: AI",
+      '    at: "2026-10-01T11:00:00.000Z"',
+      "    re: c1",
+      "",
+    ].join("\n");
+    const filePath = writeProjectFile(projectDir, "untouched.md", original);
+
+    await openMarkdownFile(page, filePath, "rich-text");
+    await expect(page.getByTestId("comment-thread-c1")).toContainText(
+      "Yes, I checked the source.",
+    );
+    await selectRichText(page, "Closing paragraph");
+    await page.keyboard.press("End");
+    await page.keyboard.type(" Edited");
+
+    await expect
+      .poll(() => readProjectFile(projectDir, "untouched.md"))
+      .toContain("Edited");
+    // Typing in Suggesting mode adds a suggestion entry to the endmatter;
+    // everything else, body and existing endmatter, stays byte-identical.
+    const saved = readProjectFile(projectDir, "untouched.md");
+    const [savedBody, savedEndmatter] = saved.split("\n---\n");
+    const [originalBody, originalEndmatter] = original.split("\n---\n");
+    const savedLines = savedBody?.split("\n") ?? [];
+    const originalLines = originalBody?.split("\n") ?? [];
+    expect(savedLines).toHaveLength(originalLines.length);
+    savedLines.forEach((line, index) => {
+      if (originalLines[index] === "Closing paragraph.") {
+        expect(line).toContain("Edited");
+      } else {
+        expect(line).toBe(originalLines[index]);
+      }
+    });
+    expect(savedEndmatter?.startsWith(originalEndmatter ?? "")).toBe(true);
   });
 
   test("initial open shows persistent saved status", async ({ page }) => {

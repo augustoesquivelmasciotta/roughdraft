@@ -157,7 +157,7 @@ describe("CriticMarkup comments", () => {
 
     expect(endmatter).toBeNull();
     expect(comments.size).toBe(0);
-    expect(output).toContain("* * *");
+    expect(output).toBe(input);
     expect(output).toContain("```yaml");
     expect(output).toContain("comments:");
     expect(output).toContain("suggestions:");
@@ -551,11 +551,9 @@ describe("CriticMarkup comments", () => {
     const { doc, comments } = criticMarkdownToEditorState(input);
     const output = editorStateToCriticMarkdown(doc, comments);
 
-    expect(output).toContain("## Sprint Notes");
-    expect(output).toContain(
-      '{==Second item==}{>>Needs review<<}{id="cmt4" by="AI" at="2024-01-15T10:33:00.000Z"}',
-    );
-    expect(output).toContain("- First item");
+    // Untouched blocks keep their original markdown, including `*` bullets.
+    expect(output).toBe(input);
+    expect(comments.get("cmt4")).toMatchObject({ content: "Needs review" });
   });
 
   it("does not import a trailing blank line into fenced code blocks", () => {
@@ -915,8 +913,9 @@ const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-2
     expect(output).toContain(
       '## Use {++new title++}{id="s1" by="user" at="2024-01-15T10:30:00.000Z"}',
     );
+    // Untouched blocks keep their original markdown, including `*` bullets.
     expect(output).toContain(
-      '- Keep {--old item--}{id="s2" by="user" at="2024-01-15T10:31:00.000Z"}',
+      '* Keep {--old item--}{id="s2" by="user" at="2024-01-15T10:31:00.000Z"}',
     );
   });
 

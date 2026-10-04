@@ -39,6 +39,8 @@ const allowedSelectorPatterns = [
   /^\[data-comment-thread-root-id\]/,
   /^\[data-suggestion-thread-container="true"\]$/,
   /^\[data-comment-thread-container="true"\]$/,
+  // Markdown rendering tests check the rendered HTML structure itself.
+  /^pre$/,
 ];
 
 function walk(dir) {

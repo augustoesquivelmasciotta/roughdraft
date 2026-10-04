@@ -9,6 +9,7 @@ import { CommentEditorList } from "./CommentEditorList";
 import {
   type CriticChangeAttrs,
   type CriticComment,
+  type CriticDocumentSource,
   createCriticChange,
   createCriticComment,
   criticMarkdownHasReviewRail,
@@ -281,6 +282,46 @@ function getAnchorCommentIds(
   return parseCommentIds(anchorElement.dataset.commentIds);
 }
 
+/**
+ * The comment itself or its closest ancestor that sits on a highlight in the
+ * document. Replies stored only in YAML endmatter have no highlight of their
+ * own.
+ */
+function findAnchoredAncestorId(
+  editor: Editor | null,
+  commentId: string,
+  comments: ReadonlyMap<string, CriticComment>,
+): string | null {
+  const visited = new Set<string>();
+  let currentId: string | null | undefined = commentId;
+
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    if (getAnchorCommentIds(editor, currentId).length > 0) return currentId;
+    currentId = comments.get(currentId)?.parentCommentId;
+  }
+
+  return null;
+}
+
+function isDocumentLevelThread(
+  commentId: string,
+  comments: ReadonlyMap<string, CriticComment>,
+): boolean {
+  const visited = new Set<string>();
+  let current = comments.get(commentId);
+
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    if (current.scope === "document") return true;
+    current = current.parentCommentId
+      ? comments.get(current.parentCommentId)
+      : undefined;
+  }
+
+  return false;
+}
+
 function addCommentIdsToAnchor(
   editor: Editor | null,
   anchorCommentId: string,
@@ -328,10 +369,24 @@ function addCommentIdsToAnchor(
   return nextCommentIds;
 }
 
+/**
+ * Ids the open file already uses outside the editor document (YAML endmatter
+ * entries, deleted-comment records, ids deleted in this session). New comment
+ * and suggestion ids must avoid them.
+ */
+const editorReservedIds = new WeakMap<Editor, Set<string>>();
+
+function getReservedIds(editor: Editor | null): string[] {
+  return editor ? [...(editorReservedIds.get(editor) ?? [])] : [];
+}
+
 function getDocumentCriticChanges(
   editor: Editor,
 ): Array<Pick<CriticChangeAttrs, "changeId">> {
   const changes = new Map<string, Pick<CriticChangeAttrs, "changeId">>();
+  for (const changeId of getReservedIds(editor)) {
+    changes.set(changeId, { changeId });
+  }
 
   editor.state.doc.descendants((node) => {
     if (!node.isText) return;
@@ -653,6 +708,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   );
   const frontmatterRef = useRef<string | null>(parsedContent.frontmatter);
   const endmatterRef = useRef<string | null>(parsedContent.endmatter);
+  const sourceRef = useRef<CriticDocumentSource | null>(parsedContent.source);
 
   useEffect(() => {
     commentsRef.current = comments;
@@ -681,6 +737,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
           {
             frontmatter: frontmatterRef.current,
             endmatter: endmatterRef.current,
+            source: sourceRef.current,
           },
         ),
       );
@@ -1233,6 +1290,9 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   editorRef.current = editor;
   selectedCommentIdRef.current = selectedCommentId;
   selectedChangeIdRef.current = selectedChangeId;
+  if (editor && !editorReservedIds.has(editor)) {
+    editorReservedIds.set(editor, new Set(parsedContent.reservedIds));
+  }
 
   useEffect(() => {
     editor?.setEditable(interactionMode !== "viewing", false);
@@ -1281,6 +1341,8 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
 
     frontmatterRef.current = parsedContent.frontmatter;
     endmatterRef.current = parsedContent.endmatter;
+    sourceRef.current = parsedContent.source;
+    editorReservedIds.set(editor, new Set(parsedContent.reservedIds));
     commentsRef.current = parsedContent.comments;
     setComments(parsedContent.comments);
     setSelectedCommentId(null);
@@ -1290,8 +1352,13 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     setDraftSuggestion(null);
     setPendingFocusCommentId(null);
 
+    // Compare only the editor content: the parsed doc also carries file
+    // metadata (frontmatter, endmatter, source snapshot) the editor drops.
     const nextDoc = parsedContent.doc;
-    if (JSON.stringify(editor.getJSON()) !== JSON.stringify(nextDoc)) {
+    if (
+      JSON.stringify(editor.getJSON().content) !==
+      JSON.stringify(nextDoc.content)
+    ) {
       editor.commands.setContent(nextDoc, { emitUpdate: false });
     }
 
@@ -1475,6 +1542,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     const existingIds = getSelectionCommentIds(currentEditor);
     const comment = createCriticComment(undefined, {
       existingComments: commentsRef.current.values(),
+      reservedIds: getReservedIds(currentEditor),
     });
     const nextComments = new Map(commentsRef.current);
     nextComments.set(comment.id, comment);
@@ -1647,18 +1715,31 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
         },
         {
           existingComments: commentsRef.current.values(),
+          reservedIds: getReservedIds(currentEditor),
         },
       );
-      suppressNextMarkdownUpdateRef.current = true;
-      const nextAnchorCommentIds = addCommentIdsToAnchor(
+      // Replies kept only in YAML endmatter, and document-level comments, are
+      // not on any highlight: attach the new reply to the closest ancestor
+      // that is. Document-level threads need no anchor at all.
+      const anchoredAncestorId = findAnchoredAncestorId(
         currentEditor,
         commentId,
-        [comment.id],
+        commentsRef.current,
       );
-      if (suppressNextMarkdownUpdateRef.current) {
-        suppressNextMarkdownUpdateRef.current = false;
+      if (anchoredAncestorId) {
+        suppressNextMarkdownUpdateRef.current = true;
+        const nextAnchorCommentIds = addCommentIdsToAnchor(
+          currentEditor,
+          anchoredAncestorId,
+          [comment.id],
+        );
+        if (suppressNextMarkdownUpdateRef.current) {
+          suppressNextMarkdownUpdateRef.current = false;
+        }
+        if (!nextAnchorCommentIds) return;
+      } else if (!isDocumentLevelThread(commentId, commentsRef.current)) {
+        return;
       }
-      if (!nextAnchorCommentIds) return;
 
       const nextComments = new Map(commentsRef.current);
       nextComments.set(comment.id, comment);
@@ -1747,6 +1828,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
         },
         {
           existingComments: commentsRef.current.values(),
+          reservedIds: getReservedIds(currentEditor),
         },
       );
       suppressNextMarkdownUpdateRef.current = true;
@@ -2265,9 +2347,24 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       setMarkdown(nextMarkdown);
       onLocalContentChange?.(nextMarkdown);
       reportDirtyState(nextMarkdown !== lastAcceptedMarkdownRef.current);
+
+      // Editor-only changes (focus, an empty trailing paragraph) serialize
+      // to what is already on disk: do not rewrite the file for them.
+      if (
+        nextMarkdown === lastAcceptedMarkdownRef.current &&
+        !inFlightSaveRef.current
+      ) {
+        if (saveTimer.current) {
+          clearTimeout(saveTimer.current);
+          saveTimer.current = null;
+        }
+        onSaveStateChange("saved");
+        return;
+      }
+
       scheduleSave(nextMarkdown);
     },
-    [onLocalContentChange, reportDirtyState, scheduleSave],
+    [onLocalContentChange, onSaveStateChange, reportDirtyState, scheduleSave],
   );
 
   useEffect(() => {

@@ -226,9 +226,55 @@ comments:
     at: "2026-04-28T12:00:00.000Z"
 ```
 
-Implementations SHOULD generate simple document-local ids. Roughdraft uses `c1`, `c2`, and so on for comments and `s1`, `s2`, and so on for suggestions. Implementations MUST preserve unknown valid attributes or YAML keys when possible, but they MUST NOT require unknown metadata for correct review rendering.
+Implementations SHOULD generate simple document-local ids. Roughdraft uses `c1`, `c2`, and so on for comments and `s1`, `s2`, and so on for suggestions. Ids MUST be unique within a document: a new id MUST NOT reuse any id that appears in inline metadata (attribute blocks, `{#id}` references, legacy blocks), as a YAML endmatter key (including entries no inline marker references), or in the `deleted` list. A comment highlighted in several places MUST be written once; writers MAY keep only its first highlight. Readers that find the same id on two different comments SHOULD keep both and give the later one a new id on write.
+
+Implementations MUST preserve unknown valid attributes or YAML keys when possible, but they MUST NOT require unknown metadata for correct review rendering.
 
 For compatibility, readers MAY accept legacy comment metadata of the form `{@id:c1; by:AI; at:2026-04-28T12:00:00.000Z@}`. Writers SHOULD emit compact references plus YAML endmatter for new review data.
+
+### Mixed Metadata Formats
+
+One document MAY mix the metadata formats above, for example root comments with inline attribute blocks and replies that live only in YAML endmatter. A final YAML block is review endmatter when it has a `comments`, `suggestions` or `deleted` key and at least one of: a `{#id}` reference in the body, a document-level comment (`body`, `by` and `at`, no `re`), a reply entry (`body`, `by`, `re` and an ISO 8601 `at`), or a `deleted` record. Writers SHOULD keep each item in the format it was read in and SHOULD NOT rewrite content nobody changed.
+
+### Long Or Multi-Line Comment Text
+
+Comment text is inline content, so it cannot hold line breaks or CriticMarkup delimiters. When a root comment's text has either, writers MAY store the full text as the `body` of its endmatter entry and write a one-line excerpt inline:
+
+```markdown
+See {==the launch plan==}{>>Pasted article: launch risks …<<}{#c4}.
+
+---
+comments:
+  c4:
+    body: |-
+      Pasted article: launch risks
+
+      - Supplier delays
+      - Regulatory review
+    by: user
+    at: "2026-10-01T10:00:00.000Z"
+```
+
+Readers SHOULD use the endmatter `body` of an entry without `re` as the full text of the inline comment that references it, and MUST NOT treat it as a separate document-level comment.
+
+### Resolved And Deleted Items
+
+Resolving an item writes `status="resolved"` (or `status: resolved` in endmatter) and, optionally, a short `resolved` summary. Reopening removes both.
+
+Deleting a comment MAY leave a record in an optional top-level `deleted` list, so reviewers can see later what was removed:
+
+```yaml
+deleted:
+  - id: c3
+    by: user
+    at: "2026-10-01T10:05:00.000Z"
+    deletedAt: "2026-10-02T09:00:00.000Z"
+    re: c1
+    anchor: the launch plan
+    body: Original text of the deleted comment
+```
+
+`id`, `deletedAt` and `body` are required in a record; `by`, `at`, `re` (the parent of a deleted reply) and `anchor` (the highlighted text of a deleted root) are optional. Readers MUST NOT show deleted records as comments, and their ids stay reserved.
 
 ## Threads
 
@@ -257,10 +303,11 @@ Implementations SHOULD parse Roughdraft review markers as inline review annotati
 
 Round trips SHOULD preserve:
 
+- Every block nobody edited, byte for byte, including blank lines and list markers.
 - YAML frontmatter delimiters and content.
 - Local links and image paths.
 - Tables and task lists.
-- Inline code and fenced code blocks.
+- Inline code and fenced code blocks, including the fence length and character (a fence of four or more backticks is closed only by a fence at least as long).
 - Raw review marker text inside code contexts.
 - Metadata values, including escaped quotes and backslashes.
 

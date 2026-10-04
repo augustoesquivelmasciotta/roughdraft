@@ -715,6 +715,26 @@ const MarkdownCode = Code.extend({
 
 const MarkdownCodeBlock = CodeBlock.extend({
   marks: "commentRef criticChange",
+
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      // The original fence (for example ```` or ~~~) and full info string, so
+      // an edited block is written back the way it was opened.
+      fence: {
+        default: null,
+        parseHTML: (element) => element.getAttribute("data-fence"),
+        renderHTML: (attributes) =>
+          attributes.fence ? { "data-fence": attributes.fence } : {},
+      },
+      info: {
+        default: null,
+        parseHTML: (element) => element.getAttribute("data-info"),
+        renderHTML: (attributes) =>
+          attributes.info ? { "data-info": attributes.info } : {},
+      },
+    };
+  },
 });
 
 const MarkdownImage = Image.extend({

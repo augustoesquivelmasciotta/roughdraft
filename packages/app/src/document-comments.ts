@@ -2,6 +2,7 @@ import {
   buildCommentThreads,
   type CriticComment,
   flattenCommentThreads,
+  getCommentDescendantIds,
 } from "./critic-markup";
 
 interface CommentAnchorMeasurement {
@@ -192,6 +193,32 @@ export function groupCommentAnchorMeasurements(
   );
 }
 
+/**
+ * The comments a rail group shows: the ids on its anchor plus every reply
+ * that descends from them. Replies stored only in YAML endmatter (`re: c1`)
+ * are not on the anchor, so they would otherwise be invisible.
+ */
+export function expandCommentIdsWithReplies(
+  commentIds: string[],
+  comments: ReadonlyMap<string, CriticComment>,
+): string[] {
+  const expanded: string[] = [];
+  const seen = new Set<string>();
+
+  for (const commentId of commentIds) {
+    for (const id of [
+      commentId,
+      ...getCommentDescendantIds(commentId, comments),
+    ]) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      expanded.push(id);
+    }
+  }
+
+  return expanded;
+}
+
 export function buildCommentThreadRailItems(
   groups: CommentGroupAnchor[],
   comments: ReadonlyMap<string, CriticComment>,
@@ -199,7 +226,10 @@ export function buildCommentThreadRailItems(
   const items: CommentThreadRailItem[] = [];
 
   for (const group of groups) {
-    const visibleComments = group.commentIds
+    const visibleComments = expandCommentIdsWithReplies(
+      group.commentIds,
+      comments,
+    )
       .map((commentId) => comments.get(commentId))
       .filter((comment): comment is CriticComment => Boolean(comment));
 

@@ -1,7 +1,14 @@
 import { tables, taskListItems } from "@joplin/turndown-plugin-gfm";
-import { marked } from "marked";
+import { Marked, marked, type TokenizerObject } from "marked";
 import TurndownService from "turndown";
-import { parse as parseYaml } from "yaml";
+import {
+  findDetailsBlocks,
+  findFencedCodeRanges,
+  findHtmlCommentBlocks,
+  type MarkdownBlockSpan,
+  transformOutsideFencedCode,
+} from "./markdown-fences";
+import { isReviewEndmatter, parseReviewEndmatter } from "./review-endmatter";
 
 export const rawMarkdownBlockAttribute = "data-markdown-raw-block";
 
@@ -19,6 +26,12 @@ export interface YamlDocumentMetadataSplit {
   frontmatter: string | null;
   body: string;
   endmatter: string | null;
+  /**
+   * The body exactly as it appears on disk. When endmatter exists, `body`
+   * normalizes the whitespace before the endmatter delimiter; `rawBody` keeps
+   * it, so that `rawBody + "\n" + endmatter` is the original text.
+   */
+  rawBody: string;
 }
 
 function isExternalUrl(path: string): boolean {
@@ -55,26 +68,95 @@ function createRawMarkdownBlock(markdown: string): string {
   )}"></div>\n`;
 }
 
-function protectRawHtmlBlocks(markdown: string): string {
-  return markdown
-    .replace(
-      /^[ \t]*<details\b[\s\S]*?<\/details>[ \t]*(?:\r?\n|$)/gim,
-      (raw) => createRawMarkdownBlock(raw),
-    )
-    .replace(/^[ \t]*<!--[\s\S]*?-->[ \t]*(?:\r?\n|$)/gm, (raw) =>
-      createRawMarkdownBlock(raw),
-    );
-}
+const rawMarkdownBlockPlaceholderPattern = new RegExp(
+  `<div ${rawMarkdownBlockAttribute}="([^"]*)"></div>(\\n?)`,
+  "g",
+);
 
-function protectIndentedCodeAfterLists(markdown: string): string {
+/**
+ * Turns raw-block placeholders created by `protectRichTextRoundTripMarkdown`
+ * back into the markdown they stand for.
+ */
+export function decodeRawMarkdownPlaceholders(markdown: string): string {
   return markdown.replace(
-    /^(?:[-*+]|\d+[.)]) [^\r\n]*(?:\r?\n)[ \t]*(?:\r?\n)(?:(?: {4}|\t)[^\r\n]*(?:\r?\n|$))+/gm,
-    (raw) => createRawMarkdownBlock(raw),
+    rawMarkdownBlockPlaceholderPattern,
+    (_match, encoded: string, newline: string) => {
+      const original = decodeRawMarkdownBlock(encoded);
+      return newline ? original : original.replace(/\r?\n$/, "");
+    },
   );
 }
 
+function replaceSpans(markdown: string, spans: MarkdownBlockSpan[]): string {
+  if (spans.length === 0) return markdown;
+
+  let output = "";
+  let cursor = 0;
+  for (const span of [...spans].sort(
+    (left, right) => left.start - right.start,
+  )) {
+    if (span.start < cursor) continue;
+    output += markdown.slice(cursor, span.start);
+    output += createRawMarkdownBlock(markdown.slice(span.start, span.end));
+    cursor = span.end;
+  }
+
+  return output + markdown.slice(cursor);
+}
+
+function protectRawHtmlBlocks(markdown: string): string {
+  const withDetailsProtected = replaceSpans(
+    markdown,
+    findDetailsBlocks(markdown),
+  );
+  return replaceSpans(
+    withDetailsProtected,
+    findHtmlCommentBlocks(withDetailsProtected),
+  );
+}
+
+function protectIndentedCodeAfterLists(markdown: string): string {
+  return transformOutsideFencedCode(markdown, (segment) =>
+    segment.replace(
+      /^(?:[-*+]|\d+[.)]) [^\r\n]*(?:\r?\n)[ \t]*(?:\r?\n)(?:(?: {4}|\t)[^\r\n]*(?:\r?\n|$))+/gm,
+      (raw) => createRawMarkdownBlock(raw),
+    ),
+  );
+}
+
+// Ported from peterhartree/roughdraft d4c6c30: pair backtick runs of equal
+// length, so adjacent cells with inline code are not mistaken for a code span
+// that contains the cell separator.
 function codeSpanContainsPipe(value: string): boolean {
-  return /`[^`\n]*\|[^`\n]*`/.test(value);
+  const runs = Array.from(value.matchAll(/`+/g), (match) => ({
+    start: match.index,
+    length: match[0].length,
+  }));
+
+  for (let openingIndex = 0; openingIndex < runs.length; openingIndex += 1) {
+    const opening = runs[openingIndex];
+    if (!opening) continue;
+
+    for (
+      let closingIndex = openingIndex + 1;
+      closingIndex < runs.length;
+      closingIndex += 1
+    ) {
+      const closing = runs[closingIndex];
+      if (!closing || closing.length !== opening.length) continue;
+
+      if (
+        value.slice(opening.start + opening.length, closing.start).includes("|")
+      ) {
+        return true;
+      }
+
+      openingIndex = closingIndex;
+      break;
+    }
+  }
+
+  return false;
 }
 
 function protectPipeSensitiveTables(markdown: string): string {
@@ -112,9 +194,16 @@ function protectPipeSensitiveTables(markdown: string): string {
   return output.join("");
 }
 
+/**
+ * Replaces constructs the rich-text editor cannot represent faithfully with
+ * opaque placeholders that serialize back to their original text. Fenced
+ * code is never rewritten: diffs often contain `<details>`, HTML comments or
+ * table-like lines as literal text.
+ */
 export function protectRichTextRoundTripMarkdown(markdown: string): string {
-  return protectPipeSensitiveTables(
+  return transformOutsideFencedCode(
     protectIndentedCodeAfterLists(protectRawHtmlBlocks(markdown)),
+    protectPipeSensitiveTables,
   );
 }
 
@@ -176,44 +265,25 @@ function isYamlFrontmatterDelimiter(line: string): boolean {
   return /^(?:---|\.\.\.)[ \t]*$/.test(line.replace(/\r$/, ""));
 }
 
-function isReviewEndmatterMap(value: unknown): boolean {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
+/**
+ * Offset of the newline that starts the last `---` line outside fenced code,
+ * or `null`. Review endmatter always starts at that line.
+ */
+function findFinalDelimiterOffset(body: string): number | null {
+  const fences = findFencedCodeRanges(body);
+  const delimiters = [...body.matchAll(/\n---[ \t]*\r?\n/g)];
 
-function hasDocumentLevelComment(value: unknown): boolean {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-
-  return Object.values(value as Record<string, unknown>).some(
-    (entry) =>
-      Boolean(entry) &&
-      typeof entry === "object" &&
-      !Array.isArray(entry) &&
-      typeof (entry as Record<string, unknown>).body === "string" &&
-      typeof (entry as Record<string, unknown>).by === "string" &&
-      typeof (entry as Record<string, unknown>).at === "string" &&
-      typeof (entry as Record<string, unknown>).re !== "string",
-  );
-}
-
-function isRoughdraftReviewEndmatter(endmatter: string): boolean {
-  const yamlText = endmatter.replace(/^---[ \t]*(?:\r\n|\n)/, "");
-  let parsed: unknown;
-
-  try {
-    parsed = parseYaml(yamlText);
-  } catch {
-    return false;
+  for (let index = delimiters.length - 1; index >= 0; index -= 1) {
+    const match = delimiters[index];
+    if (match?.index === undefined) continue;
+    const lineStart = match.index + 1;
+    const insideFence = fences.some(
+      (range) => lineStart > range.start && lineStart < range.end,
+    );
+    if (!insideFence) return match.index;
   }
 
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return false;
-  }
-
-  const record = parsed as Record<string, unknown>;
-  return (
-    isReviewEndmatterMap(record.comments) ||
-    isReviewEndmatterMap(record.suggestions)
-  );
+  return null;
 }
 
 export function splitYamlFrontmatter(markdown: string): YamlFrontmatterSplit {
@@ -269,32 +339,23 @@ export function splitYamlDocumentMetadata(
   markdown: string,
 ): YamlDocumentMetadataSplit {
   const { frontmatter, body } = splitYamlFrontmatter(markdown);
-  const matches = [...body.matchAll(/\n---[ \t]*\r?\n/g)];
-  const match = matches.at(-1);
+  const delimiterOffset = findFinalDelimiterOffset(body);
 
-  if (!match || match.index === undefined) {
-    return { frontmatter, body, endmatter: null };
+  if (delimiterOffset === null) {
+    return { frontmatter, body, endmatter: null, rawBody: body };
   }
 
-  const endmatter = body.slice(match.index);
-  const candidate = endmatter.replace(/^\n/, "");
-
-  const precedingBody = body.slice(0, match.index);
-  if (!isRoughdraftReviewEndmatter(candidate)) {
-    return { frontmatter, body, endmatter: null };
-  }
-  if (!precedingBody.includes("{#")) {
-    const yamlText = candidate.replace(/^---[ \t]*(?:\r\n|\n)/, "");
-    const parsed = parseYaml(yamlText) as Record<string, unknown> | null;
-    if (!hasDocumentLevelComment(parsed?.comments)) {
-      return { frontmatter, body, endmatter: null };
-    }
+  const candidate = body.slice(delimiterOffset + 1);
+  const precedingBody = body.slice(0, delimiterOffset);
+  if (!isReviewEndmatter(parseReviewEndmatter(candidate), precedingBody)) {
+    return { frontmatter, body, endmatter: null, rawBody: body };
   }
 
   return {
     frontmatter,
-    body: body.slice(0, match.index).replace(/\s*$/, "\n"),
+    body: precedingBody.replace(/\s*$/, "\n"),
     endmatter: candidate,
+    rawBody: precedingBody,
   };
 }
 
@@ -376,11 +437,36 @@ export function createMarkedRenderer(options?: MarkdownOptions) {
   return renderer;
 }
 
+const doubleTildeDelPattern =
+  /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
+
+/**
+ * Only `~~text~~` is strikethrough. GFM in marked also accepts single tildes,
+ * which made saves rewrite "~57% (~100h)" as strikethrough markup (ported
+ * from peterhartree/roughdraft 1daf2f7, upstream PR #135).
+ */
+export const markedTokenizer: TokenizerObject = {
+  del(src) {
+    const match = doubleTildeDelPattern.exec(src);
+    if (!match) return undefined;
+
+    const text = match[2] ?? "";
+    return {
+      type: "del",
+      raw: match[0],
+      text,
+      tokens: this.lexer.inlineTokens(text),
+    };
+  },
+};
+
 export function createTurndownService(): TurndownService {
   const service = new TurndownService({
     headingStyle: "atx",
     codeBlockStyle: "fenced",
     bulletListMarker: "-",
+    emDelimiter: "*",
+    hr: "---",
     blankReplacement(_content, node) {
       if (node.hasAttribute(rawMarkdownBlockAttribute)) {
         return `\n\n${decodeRawMarkdownBlock(
@@ -400,10 +486,20 @@ export function createTurndownService(): TurndownService {
   service.addRule("compactListItem", {
     filter: "li",
     replacement(content, node, options) {
-      const trimmed = content
+      // Task items render their checkbox and text as separate blocks; keep
+      // them on one line (ported from peterhartree/roughdraft 4618273).
+      const normalizedContent =
+        (node as HTMLElement).getAttribute("data-type") === "taskItem"
+          ? content
+              .replace(/^(\[[ xX]\])[ \t]*(?:\r?\n[ \t]*)+(?=\S)/, "$1 ")
+              .trimEnd()
+          : content;
+      // Indent continuation lines, but never turn a blank line into a
+      // whitespace-only line.
+      const trimmed = collapseBlankLines(normalizedContent)
         .replace(/^\n+/, "")
         .replace(/\n+$/, "\n")
-        .replace(/\n/gm, "\n  ");
+        .replace(/\n(?=[^\n])/g, "\n  ");
 
       let prefix = `${options.bulletListMarker} `;
       const parent = node.parentNode;
@@ -537,12 +633,27 @@ const turndown = createTurndownService();
  * gratuitous whitespace changes.
  */
 export function normalizeBlockSpacing(md: string): string {
-  let normalized = md.replace(/\n{3,}/g, "\n\n");
-  // Remove blank line immediately before a heading.
-  normalized = normalized.replace(/\n\n(#{1,6} )/g, "\n$1");
-  // Remove blank line immediately after a heading line.
-  normalized = normalized.replace(/(^#{1,6} [^\n]+)\n\n/gm, "$1\n");
-  return normalized;
+  // Fenced code is content: its blank lines and `# comment` lines must not be
+  // touched.
+  return transformOutsideFencedCode(md, (segment) => {
+    let normalized = segment.replace(/\n{3,}/g, "\n\n");
+    // Remove blank line immediately before a heading.
+    normalized = normalized.replace(/\n\n(#{1,6} )/g, "\n$1");
+    // Remove blank line immediately after a heading line.
+    normalized = normalized.replace(/(^#{1,6} [^\n]+)\n\n/gm, "$1\n");
+    return normalized;
+  });
+}
+
+/**
+ * Collapses runs of blank lines outside fenced code. Used for blocks that are
+ * re-serialized on their own, where heading spacing comes from the original
+ * document instead.
+ */
+export function collapseBlankLines(md: string): string {
+  return transformOutsideFencedCode(md, (segment) =>
+    segment.replace(/\n{3,}/g, "\n\n"),
+  );
 }
 
 export function toMarkdown(html: string): string {
@@ -550,9 +661,12 @@ export function toMarkdown(html: string): string {
 }
 
 export function toHtml(markdown: string, options?: MarkdownOptions): string {
-  return marked.parse(markdown, {
+  const parser = new Marked({
     async: false,
     gfm: true,
     renderer: createMarkedRenderer(options),
-  }) as string;
+  });
+  parser.use({ tokenizer: markedTokenizer });
+
+  return parser.parse(markdown) as string;
 }
