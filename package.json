@@ -36,12 +36,14 @@
     "packages/rfm/package.json",
     "packages/server/dist",
     "packages/server/bin",
+    "packages/server/package.json",
     "packages/server/defaults.mjs",
     "packages/server/defaults.d.mts"
   ],
   "dependencies": {
     "@roughdraft/rfm": "file:packages/rfm",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.12",
