@@ -6,6 +6,7 @@ import {
   extractRoughdraftReviewIndex,
   markRoughdraftResolved,
 } from "@roughdraft/rfm";
+import { waitForReviewEvents } from "./review-watch.js";
 
 interface JsonRpcRequest {
   jsonrpc?: "2.0";
@@ -69,7 +70,7 @@ const tools: ToolDefinition[] = [
   {
     name: "roughdraft_watch_review_events",
     description:
-      "Block until Roughdraft receives Done Reviewing for a Markdown file. Overall handoff comments are persisted as document-level YAML endmatter comments before the event is emitted. Omit timeoutSeconds to wait indefinitely.",
+      "Block until Roughdraft receives Done Reviewing for a Markdown file. Overall handoff comments are persisted as document-level YAML endmatter comments before the event is emitted. Omit timeoutSeconds to wait indefinitely; long waits are split into bounded polls.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -271,37 +272,25 @@ export async function callTool(
       throw new Error("Roughdraft is not running. Start it before watching.");
     }
 
-    const body: {
-      projectPath: string;
-      path: string;
-      timeoutSeconds?: number;
-      batchWindowSeconds: number;
-      fromNow: boolean;
-    } = {
-      projectPath,
-      path: path.relative(projectPath, documentPath),
-      batchWindowSeconds:
-        typeof args.batchWindowSeconds === "number"
-          ? args.batchWindowSeconds
-          : 0.25,
-      fromNow: true,
-    };
-    if (typeof args.timeoutSeconds === "number") {
-      body.timeoutSeconds = args.timeoutSeconds;
-    }
-
-    const response = await fetchImpl(
-      new URL("/api/review-events/watch", server.url),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+    // Bounded polls, so reviews longer than five minutes do not end the
+    // call with UND_ERR_HEADERS_TIMEOUT.
+    return waitForReviewEvents({
+      fetchImpl,
+      serverUrl: server.url,
+      target: {
+        projectPath,
+        path: path.relative(projectPath, documentPath),
+        batchWindowSeconds:
+          typeof args.batchWindowSeconds === "number"
+            ? args.batchWindowSeconds
+            : 0.25,
       },
-    );
-    if (!response.ok) {
-      throw new Error(`Review watch failed: ${response.status}`);
-    }
-    return response.json();
+      timeoutSeconds:
+        typeof args.timeoutSeconds === "number"
+          ? args.timeoutSeconds
+          : undefined,
+      fromNow: true,
+    });
   }
 
   if (name === "roughdraft_reply_to_comment") {

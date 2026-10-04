@@ -28,7 +28,7 @@ describe("mcp", () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it("omits timeoutSeconds from review watch calls unless the tool caller provides one", async () => {
+  it("bounds each review watch poll and forwards a caller's shorter timeout", async () => {
     const requestBodies: Array<Record<string, unknown>> = [];
     const fetchImpl: typeof fetch = async (_input, init) => {
       requestBodies.push(JSON.parse(String(init?.body ?? "{}")));
@@ -57,7 +57,9 @@ describe("mcp", () => {
       batchWindowSeconds: 0.25,
       fromNow: true,
     });
-    expect(requestBodies[0]).not.toHaveProperty("timeoutSeconds");
+    // Omitting timeoutSeconds still waits indefinitely, in bounded polls.
+    expect(requestBodies[0]?.timeoutSeconds).toBeGreaterThan(0);
+    expect(requestBodies[0]?.timeoutSeconds).toBeLessThanOrEqual(240);
     expect(requestBodies[1]).toMatchObject({
       timeoutSeconds: 5,
     });

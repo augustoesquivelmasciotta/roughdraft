@@ -1077,7 +1077,10 @@ describe("cli", () => {
     expect(watchRequestBody).toMatchObject({
       batchWindowSeconds: 0,
     });
-    expect(watchRequestBody).not.toHaveProperty("timeoutSeconds");
+    // Without --timeout the CLI still waits indefinitely, but in bounded
+    // polls that stay below undici's five-minute headers timeout.
+    expect(watchRequestBody?.timeoutSeconds).toBeGreaterThan(0);
+    expect(watchRequestBody?.timeoutSeconds).toBeLessThanOrEqual(240);
     await fetch(`http://localhost:${persisted?.port}/api/review-events`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

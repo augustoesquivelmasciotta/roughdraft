@@ -16,6 +16,7 @@ import {
   ROUGHDRAFT_PUBLIC_HOST,
 } from "./network.js";
 import { findAvailablePort } from "./ports.js";
+import { waitForReviewEvents } from "./review-watch.js";
 import { resolveUpdateStatus, type UpdateStatus } from "./update-status.js";
 
 const AGENT_SETUP_URL = "https://roughdraft.md/setup.md";
@@ -2117,43 +2118,19 @@ async function runWatch(
     serverUrl = result.server.url;
   }
   const relativePath = path.relative(target.projectDir, target.openPath);
-  const body: {
-    projectPath: string;
-    path: string;
-    timeoutSeconds?: number;
-    batchWindowSeconds: number;
-    fromNow: boolean;
-  } = {
-    projectPath: target.projectDir,
-    path: relativePath,
-    batchWindowSeconds: options.batchWindowSeconds,
-    fromNow: !options.replay,
-  };
-  if (options.timeoutSeconds !== undefined) {
-    body.timeoutSeconds = options.timeoutSeconds;
-  }
-
-  const response = await deps.fetchImpl(
-    new URL("/api/review-events/watch", serverUrl),
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      ...(options.timeoutSeconds !== undefined
-        ? { signal: AbortSignal.timeout((options.timeoutSeconds + 5) * 1000) }
-        : {}),
+  // Bounded polls: a single request would die after five minutes
+  // (UND_ERR_HEADERS_TIMEOUT), and reviews can take much longer.
+  const payload = await waitForReviewEvents({
+    fetchImpl: deps.fetchImpl,
+    serverUrl,
+    target: {
+      projectPath: target.projectDir,
+      path: relativePath,
+      batchWindowSeconds: options.batchWindowSeconds,
     },
-  );
-
-  if (!response.ok) {
-    throw new Error(`Failed to watch review events: ${response.status}`);
-  }
-
-  const payload = (await response.json()) as {
-    events?: unknown[];
-    timedOut?: boolean;
-    nextSequence?: number;
-  };
+    timeoutSeconds: options.timeoutSeconds,
+    fromNow: !options.replay,
+  });
 
   if (json) {
     emitJson(deps.log, payload);
