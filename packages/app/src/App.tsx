@@ -24,6 +24,7 @@ import {
 import {
   buildLocationForDocumentEditorViewMode,
   type DocumentEditorViewMode,
+  formatDocumentTitle,
   formatWorkspacePathForDisplay,
   getDocumentEditorViewModeFromLocation,
   getPathLeaf,
@@ -1661,7 +1662,9 @@ export function App() {
       ? "Roughdraft Preview"
       : isRoughdraftFlavoredMarkdownRoute
         ? "Roughdraft Flavored Markdown"
-        : (workspaceTitlePath ?? "Roughdraft");
+        : workspaceTitlePath
+          ? formatDocumentTitle(workspaceTitlePath)
+          : "Roughdraft";
   }, [
     activeDocumentPath,
     backend,

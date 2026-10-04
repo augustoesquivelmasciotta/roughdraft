@@ -3,6 +3,7 @@ import {
   PREVIEW_PATH,
   ROUGHDRAFT_FLAVORED_MARKDOWN_PATH,
   buildLocationForLinkedMarkdownDocument,
+  formatDocumentTitle,
   getRequestedPathState,
   syncRequestedPathInUrl,
 } from "./app-navigation";
@@ -10,6 +11,15 @@ import {
 describe("app navigation", () => {
   afterEach(() => {
     window.history.replaceState(null, "", "/");
+  });
+
+  it("titles a document with its file name first so cut-off tab titles stay readable", () => {
+    expect(formatDocumentTitle("~/orca/workspaces/app/.context/plan.md")).toBe(
+      "plan.md · ~/orca/workspaces/app/.context",
+    );
+    expect(formatDocumentTitle("C:\\docs\\plan.md")).toBe("plan.md · C:\\docs");
+    expect(formatDocumentTitle("/plan.md")).toBe("plan.md");
+    expect(formatDocumentTitle("plan.md")).toBe("plan.md");
   });
 
   it("reads absolute markdown paths from the path query parameter", () => {

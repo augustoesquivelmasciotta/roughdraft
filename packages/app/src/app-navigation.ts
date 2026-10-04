@@ -93,6 +93,20 @@ export function getPathLeaf(path?: string | null) {
   return segments.at(-1) || value;
 }
 
+/**
+ * Window and tab title for a document: the file name first, so it stays
+ * readable when a tab strip (an Orca tab, a phone's tab list) cuts it short.
+ */
+export function formatDocumentTitle(displayPath: string) {
+  const leaf = getPathLeaf(displayPath);
+  if (!leaf) return displayPath;
+
+  const parent = displayPath
+    .slice(0, displayPath.lastIndexOf(leaf))
+    .replace(/[\\/]+$/, "");
+  return parent ? `${leaf} · ${parent}` : leaf;
+}
+
 export function joinPath(basePath: string, relativePath: string) {
   const separator = basePath.includes("\\") ? "\\" : "/";
   const normalizedBasePath = basePath.endsWith(separator)
