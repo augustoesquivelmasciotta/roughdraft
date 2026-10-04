@@ -123,6 +123,104 @@
     letter-spacing: -0.01em;
   }
 
+  .tiptap h4,
+  .tiptap h5,
+  .tiptap h6 {
+    @apply mt-[1.3em] mb-[0.3em] font-semibold text-slate-950 dark:text-slate-50;
+    font-size: 1.05em;
+    line-height: 1.3;
+  }
+
+  .tiptap h5,
+  .tiptap h6 {
+    @apply text-slate-700 dark:text-slate-300;
+    font-size: 0.95em;
+  }
+
+  /* Folding: the section under a heading, and long code blocks. */
+  .tiptap h1,
+  .tiptap h2,
+  .tiptap h3,
+  .tiptap h4,
+  .tiptap h5,
+  .tiptap h6 {
+    position: relative;
+  }
+
+  .tiptap .rd-heading-fold-toggle {
+    @apply absolute flex size-5 items-center justify-center rounded text-stone-400 opacity-0 transition hover:bg-stone-100 hover:text-stone-700 focus-visible:opacity-100 dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-slate-200;
+    left: -1.6rem;
+    top: 50%;
+    translate: 0 -50%;
+    font-size: 0.75rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .tiptap .rd-heading-fold-toggle::before {
+    content: "▾";
+  }
+
+  .tiptap .rd-heading-fold-toggle.rd-fold-toggle--folded::before {
+    content: "▸";
+  }
+
+  .tiptap :is(h1, h2, h3, h4, h5, h6):hover > .rd-heading-fold-toggle,
+  .tiptap .rd-heading-fold-toggle.rd-fold-toggle--folded {
+    opacity: 1;
+  }
+
+  .tiptap .rd-heading-folded::after {
+    @apply ml-2 rounded-full bg-stone-100 px-2 align-middle text-[0.6em] font-medium text-stone-500 dark:bg-slate-800 dark:text-slate-400;
+    content: "folded";
+  }
+
+  .tiptap .rd-folded-away {
+    /* biome-ignore lint/complexity/noImportantStyles: hide folded sections regardless of block styles */
+    display: none !important;
+  }
+
+  .tiptap pre.rd-code-folded {
+    max-height: 15.5em;
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, black 70%, transparent);
+    mask-image: linear-gradient(to bottom, black 70%, transparent);
+  }
+
+  .tiptap .rd-code-fold-bar {
+    @apply -mt-4 mb-5 flex justify-center;
+  }
+
+  .tiptap .rd-code-fold-toggle {
+    @apply rounded-full border border-[#E2DDD5] bg-white px-3 py-1 text-xs font-medium text-stone-600 shadow-sm transition hover:bg-[#F5F2ED] hover:text-stone-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800;
+    cursor: pointer;
+  }
+
+  /* Read-only previews of raw markdown blocks, such as <details> sections. */
+  .tiptap .rd-raw-block {
+    @apply my-4;
+  }
+
+  .tiptap .rd-raw-block--hidden {
+    display: none;
+  }
+
+  .tiptap .rd-raw-block details {
+    @apply rounded-xl border border-[#E9E5DE] px-4 py-2 dark:border-slate-700;
+  }
+
+  .tiptap .rd-raw-block summary {
+    @apply cursor-pointer font-medium text-slate-900 select-none dark:text-slate-100;
+  }
+
+  .tiptap .rd-raw-block details[open] > summary {
+    @apply mb-2;
+  }
+
+  .tiptap .rd-raw-block details > :last-child {
+    margin-bottom: 0.5em;
+  }
+
   .tiptap p {
     margin: 0 0 1.05em;
   }

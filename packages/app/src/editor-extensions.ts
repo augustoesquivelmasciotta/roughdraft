@@ -17,7 +17,13 @@ import type {
 import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
-import { rawMarkdownBlockAttribute } from "./markdown";
+import DOMPurify from "dompurify";
+import { SectionFolding } from "./editor-folding";
+import {
+  decodeRawMarkdownBlock,
+  rawMarkdownBlockAttribute,
+  toHtml,
+} from "./markdown";
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
@@ -759,11 +765,62 @@ const MarkdownImage = Image.extend({
   },
 });
 
+/**
+ * Shows a raw markdown block (a `<details>` section, an indented code block
+ * after a list, a table with escaped pipes) as a sanitized, read-only
+ * preview. `<details>` blocks become real collapsible sections. HTML
+ * comments are source-only notes and stay hidden.
+ */
+function renderRawMarkdownPreview(dom: HTMLElement, encoded: string) {
+  const markdown = decodeRawMarkdownBlock(encoded);
+  dom.setAttribute(rawMarkdownBlockAttribute, encoded);
+
+  if (/^\s*<!--[\s\S]*-->\s*$/.test(markdown)) {
+    dom.className = "rd-raw-block rd-raw-block--hidden";
+    dom.replaceChildren();
+    return;
+  }
+
+  dom.className = "rd-raw-block";
+  dom.innerHTML = DOMPurify.sanitize(toHtml(markdown));
+  for (const link of dom.querySelectorAll("a[href]")) {
+    link.setAttribute("target", "_blank");
+    link.setAttribute("rel", "noreferrer noopener");
+  }
+}
+
 const RawMarkdownBlock = Node.create({
   name: "rawMarkdownBlock",
   group: "block",
   atom: true,
   selectable: true,
+
+  addNodeView() {
+    return ({ node }) => {
+      const dom = document.createElement("div");
+      dom.contentEditable = "false";
+      dom.dataset.testid = "raw-markdown-block";
+      let currentMarkdown = String(node.attrs.rawMarkdown ?? "");
+      renderRawMarkdownPreview(dom, currentMarkdown);
+
+      return {
+        dom,
+        update: (updatedNode) => {
+          if (updatedNode.type.name !== "rawMarkdownBlock") return false;
+          const nextMarkdown = String(updatedNode.attrs.rawMarkdown ?? "");
+          if (nextMarkdown !== currentMarkdown) {
+            currentMarkdown = nextMarkdown;
+            renderRawMarkdownPreview(dom, nextMarkdown);
+          }
+          return true;
+        },
+        // The preview is read-only: let the reader open <details> and follow
+        // links without the editor treating it as an edit.
+        stopEvent: () => true,
+        ignoreMutation: () => true,
+      };
+    };
+  },
 
   addAttributes() {
     return {
@@ -791,7 +848,7 @@ export function createEditorExtensions(placeholder: string) {
   return [
     StarterKit.configure({
       heading: {
-        levels: [1, 2, 3],
+        levels: [1, 2, 3, 4, 5, 6],
       },
       code: false,
       codeBlock: false,
@@ -822,6 +879,7 @@ export function createEditorExtensions(placeholder: string) {
     MarkdownCodeBlock,
     CommentHighlight,
     CriticChangeHighlight,
+    SectionFolding,
     MarkdownImage.configure({
       allowBase64: true,
       inline: false,
