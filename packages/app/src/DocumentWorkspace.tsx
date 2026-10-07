@@ -12,7 +12,7 @@ import {
   RefreshCcw,
   Upload,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DocumentEditorViewMode } from "./app-navigation";
 import { getNavigatorPlatform, isApplePlatform } from "./comment-shortcuts";
 import { RemoteSessionBanner } from "./components/RemoteSessionBanner";
@@ -50,6 +50,7 @@ import { readLastHandoffAt, writeLastHandoffAt } from "./review-navigation";
 import { RobotsHighFiveToy } from "./RobotsHighFiveToy";
 import type { CompleteReviewOptions, Page, StorageBackend } from "./storage";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
+import { markdownHasTable } from "./wide-layout";
 
 type DiskChangeState = "clean" | "changed" | "conflict" | "paused";
 type ReviewHandoffState =
@@ -499,6 +500,10 @@ export function DocumentWorkspace({
     () =>
       !!documentPage?.content &&
       criticMarkdownHasReviewRail(documentPage.content),
+  );
+  const documentHasTable = useMemo(
+    () => !!documentPage?.content && markdownHasTable(documentPage.content),
+    [documentPage?.content],
   );
   const documentHeaderRef =
     useReviewLayoutShiftAnimation<HTMLDivElement>(documentHasComments);
@@ -1115,7 +1120,12 @@ export function DocumentWorkspace({
           </div>
         </div>
       ) : null}
-      <div className="mx-auto min-h-full max-w-[1080px]">
+      <div
+        className={cn(
+          "mx-auto min-h-full max-w-[1080px]",
+          documentHasTable && "document-wide",
+        )}
+      >
         {documentPage ? (
           <div
             ref={documentHeaderRef}
