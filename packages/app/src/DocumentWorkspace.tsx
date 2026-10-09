@@ -48,7 +48,12 @@ import {
 } from "./PageCard";
 import { readLastHandoffAt, writeLastHandoffAt } from "./review-navigation";
 import { RobotsHighFiveToy } from "./RobotsHighFiveToy";
-import type { CompleteReviewOptions, Page, StorageBackend } from "./storage";
+import {
+  type CompleteReviewOptions,
+  type Page,
+  REVIEW_HANDOFF_TIMEOUT_MS,
+  type StorageBackend,
+} from "./storage";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
 import { markdownHasTable } from "./wide-layout";
 
@@ -657,15 +662,27 @@ export function DocumentWorkspace({
       if (!activeDocumentPath || reviewHandoffState === "notifying") return;
 
       setReviewHandoffState("notifying");
+      const handoff = new AbortController();
+      let deadline: ReturnType<typeof setTimeout> | undefined;
       try {
-        // The button stays enabled while autosave is still pending, so make
-        // sure any debounced edits are persisted before handing off.
-        const flushResult = await saveControllerRef.current?.flushSave();
-        if (flushResult && flushResult.status === "error") {
-          throw flushResult.error;
-        }
+        const timedOut = new Promise<never>((_, reject) => {
+          deadline = setTimeout(() => {
+            handoff.abort();
+            reject(new Error("Review handoff timed out"));
+          }, REVIEW_HANDOFF_TIMEOUT_MS);
+        });
+        const send = async () => {
+          // The button stays enabled while autosave is still pending, so make
+          // sure any debounced edits are persisted before handing off.
+          const flushResult = await saveControllerRef.current?.flushSave();
+          if (flushResult && flushResult.status === "error") {
+            throw flushResult.error;
+          }
+          if (handoff.signal.aborted) return { delivered: false };
+          return onCompleteReview({ ...options, signal: handoff.signal });
+        };
 
-        const result = await onCompleteReview(options);
+        const result = await Promise.race([send(), timedOut]);
         if (result.delivered) {
           // Comments the agent adds after this point show up as "New".
           const handoffAt = new Date().toISOString();
@@ -684,6 +701,8 @@ export function DocumentWorkspace({
         console.error("Failed to complete review:", error);
         setReviewHandoffState("error");
         setReviewHandoffPopoverOpen(true);
+      } finally {
+        clearTimeout(deadline);
       }
     },
     [

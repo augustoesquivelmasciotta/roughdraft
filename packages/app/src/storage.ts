@@ -33,7 +33,14 @@ export interface CompleteReviewResult {
 
 export interface CompleteReviewOptions {
   overallComment?: string;
+  // Aborted when the handoff gives up, so a late request is never delivered.
+  signal?: AbortSignal;
 }
+
+// Why: a request queued behind a full browser connection pool never settles,
+// and "I'm done" then showed "Sending" forever. Past this, the handoff fails
+// visibly instead.
+export const REVIEW_HANDOFF_TIMEOUT_MS = 10_000;
 
 export interface ReviewWatchStatus {
   watching: boolean;

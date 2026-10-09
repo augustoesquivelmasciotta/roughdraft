@@ -864,7 +864,9 @@ describe("review handoff watcher affordance", () => {
     await click(doneReviewingButton);
 
     expect(onCompleteReview).toHaveBeenCalledOnce();
-    expect(onCompleteReview).toHaveBeenCalledWith(undefined);
+    expect(onCompleteReview).toHaveBeenCalledWith(
+      expect.not.objectContaining({ overallComment: expect.anything() }),
+    );
     expect(container.textContent).toContain("Sent");
     expect(queryByTestId(container, "review-handoff-status")).toBeNull();
     expect(container.textContent).not.toContain("Agent notified");
@@ -962,9 +964,11 @@ describe("review handoff watcher affordance", () => {
     }
     await click(submitButton);
 
-    expect(onCompleteReview).toHaveBeenCalledWith({
-      overallComment: "Please prioritize the CLI contract.",
-    });
+    expect(onCompleteReview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        overallComment: "Please prioritize the CLI contract.",
+      }),
+    );
     expect(document.body.textContent).not.toContain(
       "Please prioritize the CLI contract.",
     );
@@ -1006,9 +1010,11 @@ describe("review handoff watcher affordance", () => {
     }
     await click(doneReviewingButton);
 
-    expect(onCompleteReview).toHaveBeenCalledWith({
-      overallComment: "Please prioritize the CLI contract.",
-    });
+    expect(onCompleteReview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        overallComment: "Please prioritize the CLI contract.",
+      }),
+    );
   });
 
   it("keeps visible sent feedback after the watcher receives the event", async () => {
@@ -1220,5 +1226,37 @@ describe("review handoff watcher affordance", () => {
       getByTestId(document.body, "review-handoff-close-window-hint")
         .textContent,
     ).toBe("Close this tab from the tab bar.");
+  });
+
+  // Why: when the browser queued the handoff request forever (its 6
+  // connections per server were all taken), the button said "Sending" with no
+  // end and the user never learned the agent was not told. A handoff that has
+  // not settled within its deadline must show that it was not sent.
+  it("shows the handoff as not sent when it never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const onCompleteReview = vi
+        .fn<() => Promise<CompleteReviewResult>>()
+        .mockReturnValue(new Promise<CompleteReviewResult>(() => {}));
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
+      await click(getByTestId(container, "review-handoff-button"));
+
+      expect(getByTestId(container, "review-handoff-button").textContent).toBe(
+        "Sending",
+      );
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+
+      const button = getByTestId(container, "review-handoff-button");
+      expect(button.textContent).not.toContain("Sending");
+      expect(button.textContent).toContain("Not sent");
+      expect(document.body.textContent).toContain("Could not notify agent");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

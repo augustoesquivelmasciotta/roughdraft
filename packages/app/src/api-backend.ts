@@ -5,6 +5,7 @@ import {
   type MarkdownFileChangeEvent,
   MarkdownFileConflictError,
   type Page,
+  REVIEW_HANDOFF_TIMEOUT_MS,
   type ReviewWatchStatus,
   type StorageBackend,
   type StoredAsset,
@@ -134,18 +135,30 @@ export class ApiBackend implements StorageBackend {
     options: CompleteReviewOptions = {},
   ): Promise<CompleteReviewResult> {
     const overallComment = options.overallComment?.trim();
-    const res = await fetch(
-      this.buildUrl("/api/review-events", { path: relativePath }),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          projectPath: this.info.projectPath,
-          path: relativePath,
-          ...(overallComment ? { overallComment } : {}),
-        }),
-      },
-    );
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    options.signal?.addEventListener("abort", abort);
+    if (options.signal?.aborted) abort();
+    const timer = setTimeout(abort, REVIEW_HANDOFF_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(
+        this.buildUrl("/api/review-events", { path: relativePath }),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            projectPath: this.info.projectPath,
+            path: relativePath,
+            ...(overallComment ? { overallComment } : {}),
+          }),
+          signal: controller.signal,
+        },
+      );
+    } finally {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+    }
 
     if (!res.ok) {
       throw new Error(
