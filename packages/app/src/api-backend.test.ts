@@ -101,3 +101,58 @@ describe("ApiBackend.watchMarkdownFile", () => {
     stop();
   });
 });
+
+// Why: the browser can queue a request forever when its 6 connections per
+// server are taken (see above). The review handoff then never settled and the
+// "I'm done" button said "Sending" forever. The handoff must give up after a
+// deadline and cancel the request, so it cannot reach the agent later behind
+// the user's back.
+describe("ApiBackend.completeReview", () => {
+  const originalFetch = global.fetch;
+  let requestSignals: Array<AbortSignal | undefined>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    requestSignals = [];
+    // A server that never answers: the request only ends if it is aborted.
+    global.fetch = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          requestSignals.push(init?.signal ?? undefined);
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The request was aborted", "AbortError"));
+          });
+        }),
+    ) as typeof fetch;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    global.fetch = originalFetch;
+  });
+
+  it("gives up and cancels the request when the server never answers", async () => {
+    const backend = new ApiBackend({
+      kind: "api",
+      label: "Local files",
+      detail: "/work",
+      projectPath: "/work",
+    } as ConstructorParameters<typeof ApiBackend>[0]);
+
+    let outcome: "pending" | "resolved" | "rejected" = "pending";
+    backend.completeReview("draft.md").then(
+      () => {
+        outcome = "resolved";
+      },
+      () => {
+        outcome = "rejected";
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(outcome).toBe("rejected");
+    expect(requestSignals).toHaveLength(1);
+    expect(requestSignals[0]?.aborted).toBe(true);
+  });
+});
