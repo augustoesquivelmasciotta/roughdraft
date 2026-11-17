@@ -510,8 +510,12 @@ export function EditorContextMenu({
     };
 
     const handleEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
-      if (event.key === "Escape") closeLinkPopover();
+      if (event.key !== "Escape") return;
+      // Mark it handled so a panel behind the menu stays open until the next
+      // Escape.
+      event.preventDefault();
+      close();
+      closeLinkPopover();
     };
 
     document.addEventListener("mousedown", handleMouseDown, true);
