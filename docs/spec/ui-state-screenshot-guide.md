@@ -131,6 +131,9 @@ suggestions:
 | Document | Close window not possible | Successful handoff in a regular browser tab (not an app window, not Orca), then click Close window | `review-handoff-close-window-hint` | Hint: `Close this tab from the tab bar.` |
 | Document | Review handoff undelivered | Watcher disconnects before handoff | `review-handoff-status` | Popover title: `No agent is watching now`. |
 | Document | Review handoff error | Force handoff API error | `review-handoff-status` | Popover title: `Could not notify agent`. |
+| Document | Discard changes | Edit a local file, open the file menu (filename in the header) | `document-file-menu`, `document-file-menu-discard-changes` | Last item, below a divider: `Descartar cambios`; hidden while the document equals how it was when the round started. Tooltip: `...también se pierden las respuestas de Claude de esta ronda`. |
+| Document | Discard changes, armed | Click `Descartar cambios` once | `document-file-menu-discard-changes` | Label turns red: `¿Descartar todo? Tocá de nuevo`; reverts after 4 seconds, and a second click within that time restores the document. No browser confirm dialog. |
+| Review rail | Escape closes the open thread | Open a thread (rail or phone sheet), press Escape with no field focused | `document-review-sheet` | Closes the sheet or deselects the thread. A handoff popover, file menu or context menu on top closes first; Escape inside a comment field cancels that field only. |
 | Remote | Connected banner | Open with `?session=<id>&token=<token>` and remote capability enabled | `role=status`, `aria-label="Remote session connected"` | Requires remote backend support in `/api/status`. |
 | Remote | Disconnected banner | Drop remote session connection | `role=alert`, `aria-label="Remote session disconnected"` | Best captured with backend mocking. |
 | Editor | Selection menu | Select text in rich editor | `selection-menu` | Capture formatting buttons and comment/suggestion actions. |

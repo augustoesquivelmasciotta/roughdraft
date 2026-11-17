@@ -21,12 +21,19 @@ import type {
   StorageBackend,
 } from "../src/storage";
 
+type ReviewRoundBackend = Pick<
+  StorageBackend,
+  "getReviewRoundChanged" | "restoreReviewRound"
+>;
+
 function createBackend({
   watcherCount,
   closeOrcaTab,
+  reviewRound,
 }: {
   watcherCount?: number;
   closeOrcaTab?: StorageBackend["closeOrcaTab"];
+  reviewRound?: ReviewRoundBackend;
 } = {}): StorageBackend {
   const backend: StorageBackend = {
     info: {
@@ -63,6 +70,10 @@ function createBackend({
 
   if (closeOrcaTab) {
     backend.closeOrcaTab = closeOrcaTab;
+  }
+
+  if (reviewRound) {
+    Object.assign(backend, reviewRound);
   }
 
   return backend;
@@ -299,12 +310,16 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     documentCopyPath = "test.md",
     watcherCount = 0,
     onSaveDocument = async () => {},
+    reviewRound,
+    onDiscardReviewChanges,
   }: {
     documentDiskChangeState?: "clean" | "changed" | "conflict" | "paused";
     documentContent?: string;
     documentCopyPath?: string | null;
     watcherCount?: number;
     onSaveDocument?: (id: string, content: string) => Promise<void>;
+    reviewRound?: ReviewRoundBackend;
+    onDiscardReviewChanges?: () => void | Promise<void>;
   } = {}) {
     (
       globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -329,7 +344,8 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
           onKeepEditingWithoutAutosave={() => {}}
           onOverwriteDocumentOnDisk={() => {}}
           onCompleteReview={async () => ({ delivered: false })}
-          backend={createBackend({ watcherCount })}
+          onDiscardReviewChanges={onDiscardReviewChanges}
+          backend={createBackend({ watcherCount, reviewRound })}
         />,
       );
       await Promise.resolve();
@@ -340,6 +356,54 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     await click(getByTestId(container, "document-file-menu-trigger"));
     return getByTestId(document.body, "document-file-menu");
   }
+
+  describe("Descartar cambios", () => {
+    const discardButton = () =>
+      document.body.querySelector<HTMLElement>(
+        '[data-testid="document-file-menu-discard-changes"]',
+      );
+
+    it("is hidden while the document equals the round snapshot", async () => {
+      await renderWorkspace({
+        reviewRound: {
+          getReviewRoundChanged: async () => false,
+          restoreReviewRound: async () => createPage(),
+        },
+        onDiscardReviewChanges: async () => {},
+      });
+      await openFileMenu();
+      expect(discardButton()).toBeNull();
+    });
+
+    it("needs a second click within 4 seconds, and a lapsed first click does not restore", async () => {
+      const onDiscard = vi.fn(async () => {});
+      await renderWorkspace({
+        reviewRound: {
+          getReviewRoundChanged: async () => true,
+          restoreReviewRound: async () => createPage(),
+        },
+        onDiscardReviewChanges: onDiscard,
+      });
+      await openFileMenu();
+
+      expect(discardButton()?.textContent).toBe("Descartar cambios");
+      vi.useFakeTimers();
+      await click(discardButton() as HTMLElement);
+      expect(discardButton()?.textContent).toBe(
+        "¿Descartar todo? Tocá de nuevo",
+      );
+      expect(onDiscard).not.toHaveBeenCalled();
+
+      await act(async () => {
+        vi.advanceTimersByTime(4100);
+      });
+      expect(discardButton()?.textContent).toBe("Descartar cambios");
+
+      await click(discardButton() as HTMLElement);
+      await click(discardButton() as HTMLElement);
+      expect(onDiscard).toHaveBeenCalledTimes(1);
+    });
+  });
 
   it.each([
     ["saved", "Saved", "document-save-status-saved"],

@@ -20,6 +20,47 @@ test.describe("CriticMarkup review flows", () => {
     removeMarkdownProject(projectDir);
   });
 
+  test("Escape closes the review sheet and the file menu, innermost first", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 600, height: 800 });
+    const filePath = writeProjectFile(
+      projectDir,
+      "escape.md",
+      [
+        "# Escape",
+        "",
+        'This paragraph has {==target text==}{>>Needs detail<<}{id="c1" by="user" at="2026-04-23T18:00:00.000Z"}.',
+        "",
+      ].join("\n"),
+    );
+
+    await openMarkdownFile(page, filePath);
+    await page.locator(".comment-anchor[data-comment-ids]").first().click();
+    const sheet = page.getByTestId("document-review-sheet");
+    await expect(sheet).toBeVisible();
+
+    // Open the menu from the keyboard: a mouse click outside the thread
+    // would already deselect it.
+    await page.getByTestId("document-file-menu-trigger").focus();
+    await page.keyboard.press("Enter");
+    const fileMenu = page.getByTestId("document-file-menu");
+    await expect(fileMenu).toBeVisible();
+
+    // First Escape closes the menu on top, the sheet stays.
+    await page.keyboard.press("Escape");
+    await expect(fileMenu).toBeHidden();
+    await expect(sheet).toBeVisible();
+
+    // Second Escape closes the sheet.
+    await page.keyboard.press("Escape");
+    await expect(sheet).toBeHidden();
+
+    // Nothing open: Escape is harmless.
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("rich-text-editor")).toBeVisible();
+  });
+
   test("renders a comment thread and saves a reply @smoke", async ({
     page,
   }) => {

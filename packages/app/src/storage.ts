@@ -74,6 +74,10 @@ export interface StorageBackend {
     options?: CompleteReviewOptions,
   ): Promise<CompleteReviewResult>;
   getReviewWatchStatus?(relativePath: string): Promise<ReviewWatchStatus>;
+  /** Whether the document differs from how it was when this review round started. */
+  getReviewRoundChanged?(relativePath: string): Promise<boolean>;
+  /** Puts the document back to how it was when this review round started. */
+  restoreReviewRound?(relativePath: string): Promise<Page>;
   /**
    * Closes the Orca browser tab showing `pageUrl`. Orca tabs ignore
    * `window.close()`, so the page asks the local server to do it. Resolves

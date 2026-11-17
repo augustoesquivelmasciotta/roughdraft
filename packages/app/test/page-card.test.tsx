@@ -1600,6 +1600,55 @@ describe("PageCard editor integration", () => {
     ).not.toBeNull();
   });
 
+  it("Escape closes the open review sheet, and only once something is open", async () => {
+    stubNarrowViewport();
+    const rendered = await renderPageCard({
+      page: {
+        id: "doc-escape-1",
+        title: "Doc Escape 1",
+        content: "{==alpha==}{>>Comment body<<}\n\nParagraph",
+      },
+      selected: true,
+    });
+    const pressEscape = async (target: Element = document.body) => {
+      await act(async () => {
+        target.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "Escape",
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      });
+    };
+
+    // Nothing open: Escape does nothing.
+    await pressEscape();
+    expect(queryByTestId(rendered.container, "document-review-sheet")).toBe(
+      null,
+    );
+
+    await selectText(rendered.getEditor(), "alpha");
+    await flushAnimationFrame();
+    expect(
+      queryByTestId(rendered.container, "document-review-sheet"),
+    ).not.toBeNull();
+
+    // From a text field Escape belongs to the field, so the sheet stays.
+    const field = document.createElement("textarea");
+    document.body.append(field);
+    await pressEscape(field);
+    field.remove();
+    expect(
+      queryByTestId(rendered.container, "document-review-sheet"),
+    ).not.toBeNull();
+
+    await pressEscape();
+    expect(queryByTestId(rendered.container, "document-review-sheet")).toBe(
+      null,
+    );
+  });
+
   it("does not autosave a newly-created empty comment before it is submitted", async () => {
     stubNarrowViewport();
     const rendered = await renderPageCard({

@@ -23,6 +23,12 @@ import {
   runOrcaCommand,
 } from "./orca.js";
 import { ReviewEventQueue } from "./review-events.js";
+import { ReviewRoundStore } from "./review-round.js";
+import {
+  reviewFailureStatus,
+  reviewSuccessStatus,
+  writeReviewStatus,
+} from "./review-status.js";
 import { resolveUpdateStatus } from "./update-status.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -69,6 +75,8 @@ interface CreateAppOptions {
   projectDir?: string;
   serverRoot?: string;
   homeDir?: string;
+  /** Where the server keeps its state between runs. Defaults under homeDir. */
+  stateDir?: string;
   staticDirPath?: string;
   packageJsonPath?: string;
   fetchImpl?: typeof fetch;
@@ -437,6 +445,11 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const openRequestClients = new Set<OpenRequestClient>();
   const openRequestPollers = new Map<string, OpenRequestPoller>();
   const reviewEvents = new ReviewEventQueue();
+  const stateDir =
+    options.stateDir ?? path.join(homeDir, ".roughdraft", "state");
+  const reviewRounds = new ReviewRoundStore(
+    path.join(stateDir, "review-rounds"),
+  );
   const remoteSessions = new Map<string, RemoteSession>();
 
   function isAuthorizedRemoteDocumentRequest(req: Request): boolean {
@@ -596,7 +609,10 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
-    res.json(markdownPageFromFile(relativePath, absolutePath));
+    const page = markdownPageFromFile(relativePath, absolutePath);
+    // Opening the document starts its review round, unless one is running.
+    reviewRounds.ensure(absolutePath, page.content);
+    res.json(page);
   });
 
   app.get("/api/markdown-file/version", (req, res) => {
@@ -703,28 +719,75 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
-    const markdown = fs.readFileSync(target.absolutePath, "utf-8");
-    const persistedMarkdown = overallComment
-      ? appendRoughdraftDocumentComment(markdown, {
-          message: overallComment,
-          author: "user",
-        })
-      : markdown;
-    if (persistedMarkdown !== markdown) {
-      fs.writeFileSync(target.absolutePath, persistedMarkdown);
+    let stage = "read-document";
+    try {
+      const markdown = fs.readFileSync(target.absolutePath, "utf-8");
+      const persistedMarkdown = overallComment
+        ? appendRoughdraftDocumentComment(markdown, {
+            message: overallComment,
+            author: "user",
+          })
+        : markdown;
+      if (persistedMarkdown !== markdown) {
+        stage = "save-document";
+        fs.writeFileSync(target.absolutePath, persistedMarkdown);
+      }
+
+      stage = "emit-event";
+      const index = extractRoughdraftReviewIndex(persistedMarkdown);
+      const result = reviewEvents.emit({
+        documentPath: target.absolutePath,
+        projectPath: target.projectDir,
+        relativePath: target.relativePath,
+        version: fileVersionFromFile(target.absolutePath),
+        summary: index.summary,
+        overallComment,
+      });
+
+      reviewRounds.reset(target.absolutePath, persistedMarkdown);
+      writeReviewStatus(target.absolutePath, reviewSuccessStatus());
+      res.status(201).json(result);
+    } catch (error) {
+      writeReviewStatus(target.absolutePath, reviewFailureStatus(stage, error));
+      res.status(500).json({
+        error: `Could not record the review completion (${stage})`,
+      });
+    }
+  });
+
+  app.get("/api/review-round", (req, res) => {
+    const target = markdownPathFromRequest(req, res);
+    if (!target) return;
+
+    const current = fs.readFileSync(target.absolutePath, "utf-8");
+    const snapshot = reviewRounds.ensure(target.absolutePath, current);
+    res.json({
+      hasSnapshot: true,
+      changed: snapshot.content !== current,
+      startedAt: snapshot.startedAt,
+    });
+  });
+
+  app.post("/api/review-round/restore", (req, res) => {
+    const target = markdownPathFromRequest(req, res);
+    if (!target) return;
+
+    const snapshot = reviewRounds.get(target.absolutePath);
+    if (!snapshot) {
+      res.status(404).json({ error: "No review round snapshot for this file" });
+      return;
     }
 
-    const index = extractRoughdraftReviewIndex(persistedMarkdown);
-    const result = reviewEvents.emit({
-      documentPath: target.absolutePath,
-      projectPath: target.projectDir,
-      relativePath: target.relativePath,
-      version: fileVersionFromFile(target.absolutePath),
-      summary: index.summary,
-      overallComment,
-    });
-
-    res.status(201).json(result);
+    try {
+      // The same write as a normal save, so watchers and the live view update.
+      fs.writeFileSync(target.absolutePath, snapshot.content);
+    } catch (error) {
+      res.status(500).json({
+        error: `Could not restore the document: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
+    }
+    res.json(markdownPageFromFile(target.relativePath, target.absolutePath));
   });
 
   app.post("/api/review-events/watch", async (req, res) => {

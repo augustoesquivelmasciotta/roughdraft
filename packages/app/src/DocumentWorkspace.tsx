@@ -10,6 +10,7 @@ import {
   MessageSquarePlus,
   PencilLine,
   RefreshCcw,
+  Undo2,
   Upload,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -441,8 +442,12 @@ interface DocumentWorkspaceProps {
   onCompleteReview: (
     options?: CompleteReviewOptions,
   ) => Promise<{ delivered: boolean }>;
+  /** Throws the reviewer's changes of this round away. Absent in the preview. */
+  onDiscardReviewChanges?: () => void | Promise<void>;
   backend: StorageBackend | null;
 }
+
+const DISCARD_CONFIRM_MS = 4000;
 
 export function DocumentWorkspace({
   documentPage,
@@ -461,6 +466,7 @@ export function DocumentWorkspace({
   onKeepEditingWithoutAutosave,
   onOverwriteDocumentOnDisk,
   onCompleteReview,
+  onDiscardReviewChanges,
   backend,
 }: DocumentWorkspaceProps) {
   const [documentInteractionMode, setDocumentInteractionMode] =
@@ -477,6 +483,8 @@ export function DocumentWorkspace({
   const [fileCopyMenuOpen, setFileCopyMenuOpen] = useState(false);
   const [copiedFileAction, setCopiedFileAction] =
     useState<FileCopyAction | null>(null);
+  const [reviewRoundChanged, setReviewRoundChanged] = useState(false);
+  const [discardArmed, setDiscardArmed] = useState(false);
   const [overallComment, setOverallComment] = useState("");
   const [closeWindowFailed, setCloseWindowFailed] = useState(false);
   const [documentChangedSinceOpen, setDocumentChangedSinceOpen] =
@@ -739,6 +747,48 @@ export function DocumentWorkspace({
     },
     [onDocumentDirtyStateChange],
   );
+
+  useEffect(() => {
+    if (!fileCopyMenuOpen) {
+      setDiscardArmed(false);
+      return;
+    }
+    if (!backend?.getReviewRoundChanged || !activeDocumentPath) return;
+
+    let cancelled = false;
+    void backend
+      .getReviewRoundChanged(activeDocumentPath)
+      .then((changed) => {
+        if (!cancelled) setReviewRoundChanged(changed);
+      })
+      .catch(() => {
+        if (!cancelled) setReviewRoundChanged(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeDocumentPath, backend, fileCopyMenuOpen]);
+
+  useEffect(() => {
+    if (!discardArmed) return;
+    const timer = window.setTimeout(
+      () => setDiscardArmed(false),
+      DISCARD_CONFIRM_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [discardArmed]);
+
+  const handleDiscardClick = useCallback(async () => {
+    if (!discardArmed) {
+      setDiscardArmed(true);
+      return;
+    }
+
+    setDiscardArmed(false);
+    setFileCopyMenuOpen(false);
+    await onDiscardReviewChanges?.();
+    setReviewRoundChanged(false);
+  }, [discardArmed, onDiscardReviewChanges]);
 
   const handleCopyFileMenuAction = useCallback(
     async (action: FileCopyAction) => {
@@ -1252,6 +1302,45 @@ export function DocumentWorkspace({
                           ) : null}
                         </button>
                       ))}
+                      {onDiscardReviewChanges &&
+                      backend?.restoreReviewRound &&
+                      reviewRoundChanged ? (
+                        <>
+                          <hr className="my-1 border-0 border-t border-stone-200 dark:border-slate-700" />
+                          <Tooltip>
+                            <TooltipTrigger
+                              render={
+                                <button
+                                  type="button"
+                                  data-testid="document-file-menu-discard-changes"
+                                  className={cn(
+                                    "flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-[0.72rem] leading-none outline-none transition hover:bg-[#EEE9E1] focus-visible:bg-[#EEE9E1] dark:hover:bg-slate-700 dark:focus-visible:bg-slate-700",
+                                    discardArmed
+                                      ? "font-medium text-red-700 dark:text-red-400"
+                                      : "text-stone-600 dark:text-stone-400",
+                                  )}
+                                  onClick={() => void handleDiscardClick()}
+                                >
+                                  <Undo2
+                                    className="size-4 shrink-0"
+                                    aria-hidden="true"
+                                  />
+                                  <span className="truncate">
+                                    {discardArmed
+                                      ? "¿Descartar todo? Tocá de nuevo"
+                                      : "Descartar cambios"}
+                                  </span>
+                                </button>
+                              }
+                            />
+                            <TooltipContent side="right">
+                              Vuelve el documento a como estaba al empezar esta
+                              ronda; también se pierden las respuestas de Claude
+                              de esta ronda
+                            </TooltipContent>
+                          </Tooltip>
+                        </>
+                      ) : null}
                     </div>
                   </PopoverContent>
                 </Popover>

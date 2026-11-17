@@ -50,6 +50,7 @@ import {
   type ReviewNavigationFilter,
   type ReviewNavigationItem,
 } from "./review-navigation";
+import { shouldEscapeCloseReviewPanel } from "./escape-close";
 import { ReviewNavigator } from "./ReviewNavigator";
 import { getNavigatorPlatform } from "./comment-shortcuts";
 import type { Page, StorageBackend } from "./storage";
@@ -2281,6 +2282,36 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     setDraftSuggestion(null);
     setPendingFocusCommentId(null);
   }, []);
+
+  const reviewPanelOpen = Boolean(
+    selectedCommentId || selectedChangeId || draftSuggestion,
+  );
+  const draftSuggestionHasText = Boolean(draftSuggestion?.text);
+
+  useEffect(() => {
+    if (layout === "embedded-demo" || !selected || !reviewPanelOpen) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!shouldEscapeCloseReviewPanel(event)) return;
+      // A suggestion with text typed in is a draft: only its own cancel
+      // button (or Escape inside its field) discards it.
+      if (draftSuggestionHasText) return;
+
+      event.preventDefault();
+      closeReviewSheet();
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [
+    closeReviewSheet,
+    draftSuggestionHasText,
+    layout,
+    reviewPanelOpen,
+    selected,
+  ]);
 
   useEffect(() => {
     if (layout === "embedded-demo") return;
