@@ -23,6 +23,11 @@ import {
   runOrcaCommand,
 } from "./orca.js";
 import { ReviewEventQueue } from "./review-events.js";
+import {
+  reviewFailureStatus,
+  reviewSuccessStatus,
+  writeReviewStatus,
+} from "./review-status.js";
 import { resolveUpdateStatus } from "./update-status.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -703,28 +708,39 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
-    const markdown = fs.readFileSync(target.absolutePath, "utf-8");
-    const persistedMarkdown = overallComment
-      ? appendRoughdraftDocumentComment(markdown, {
-          message: overallComment,
-          author: "user",
-        })
-      : markdown;
-    if (persistedMarkdown !== markdown) {
-      fs.writeFileSync(target.absolutePath, persistedMarkdown);
+    let stage = "read-document";
+    try {
+      const markdown = fs.readFileSync(target.absolutePath, "utf-8");
+      const persistedMarkdown = overallComment
+        ? appendRoughdraftDocumentComment(markdown, {
+            message: overallComment,
+            author: "user",
+          })
+        : markdown;
+      if (persistedMarkdown !== markdown) {
+        stage = "save-document";
+        fs.writeFileSync(target.absolutePath, persistedMarkdown);
+      }
+
+      stage = "emit-event";
+      const index = extractRoughdraftReviewIndex(persistedMarkdown);
+      const result = reviewEvents.emit({
+        documentPath: target.absolutePath,
+        projectPath: target.projectDir,
+        relativePath: target.relativePath,
+        version: fileVersionFromFile(target.absolutePath),
+        summary: index.summary,
+        overallComment,
+      });
+
+      writeReviewStatus(target.absolutePath, reviewSuccessStatus());
+      res.status(201).json(result);
+    } catch (error) {
+      writeReviewStatus(target.absolutePath, reviewFailureStatus(stage, error));
+      res.status(500).json({
+        error: `Could not record the review completion (${stage})`,
+      });
     }
-
-    const index = extractRoughdraftReviewIndex(persistedMarkdown);
-    const result = reviewEvents.emit({
-      documentPath: target.absolutePath,
-      projectPath: target.projectDir,
-      relativePath: target.relativePath,
-      version: fileVersionFromFile(target.absolutePath),
-      summary: index.summary,
-      overallComment,
-    });
-
-    res.status(201).json(result);
   });
 
   app.post("/api/review-events/watch", async (req, res) => {

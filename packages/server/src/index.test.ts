@@ -376,6 +376,66 @@ describe("createApp", () => {
     });
   });
 
+  it("writes an ok status file next to the document when a review completes", async () => {
+    fs.mkdirSync(path.join(projectDir, "revisiones"));
+    fs.writeFileSync(path.join(projectDir, "revisiones", "foo.md"), "# Foo\n");
+    const { app } = createApp({ homeDir, staticDirPath: projectDir });
+
+    const response = await request(app)
+      .post("/api/review-events")
+      .send({ projectPath: projectDir, path: "revisiones/foo.md" });
+
+    expect(response.status).toBe(201);
+    const statusPath = path.join(projectDir, "revisiones", "foo-status.json");
+    const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+    expect(status).toEqual({
+      ok: true,
+      at: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+      event: "review.completed",
+    });
+    expect(fs.readdirSync(path.join(projectDir, "revisiones"))).toEqual([
+      "foo-status.json",
+      "foo.md",
+    ]);
+  });
+
+  it("does not list or serve the status file as a markdown document", async () => {
+    fs.writeFileSync(path.join(projectDir, "foo.md"), "# Foo\n");
+    const { app } = createApp({ homeDir, staticDirPath: projectDir });
+    await request(app)
+      .post("/api/review-events")
+      .send({ projectPath: projectDir, path: "foo.md" });
+
+    const response = await request(app)
+      .get("/api/markdown-file")
+      .query({ projectPath: projectDir, path: "foo-status.json" });
+    expect(response.status).toBe(404);
+  });
+
+  it("writes an error status file when the document cannot be saved", async () => {
+    const filePath = path.join(projectDir, "foo.md");
+    fs.writeFileSync(filePath, "# Foo\n");
+    fs.chmodSync(filePath, 0o444);
+    const { app } = createApp({ homeDir, staticDirPath: projectDir });
+
+    const response = await request(app).post("/api/review-events").send({
+      projectPath: projectDir,
+      path: "foo.md",
+      overallComment: "Please fix.",
+    });
+
+    expect(response.status).toBe(500);
+    const status = JSON.parse(
+      fs.readFileSync(path.join(projectDir, "foo-status.json"), "utf-8"),
+    );
+    expect(status).toEqual({
+      ok: false,
+      stage: "save-document",
+      cause: expect.stringContaining("EACCES"),
+      at: expect.any(String),
+    });
+  });
+
   it("rejects review events without a projectPath", async () => {
     const { app } = createApp({
       homeDir,
