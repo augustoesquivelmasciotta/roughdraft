@@ -23,6 +23,7 @@ import {
   runOrcaCommand,
 } from "./orca.js";
 import { ReviewEventQueue } from "./review-events.js";
+import { ReviewRoundStore } from "./review-round.js";
 import {
   reviewFailureStatus,
   reviewSuccessStatus,
@@ -74,6 +75,8 @@ interface CreateAppOptions {
   projectDir?: string;
   serverRoot?: string;
   homeDir?: string;
+  /** Where the server keeps its state between runs. Defaults under homeDir. */
+  stateDir?: string;
   staticDirPath?: string;
   packageJsonPath?: string;
   fetchImpl?: typeof fetch;
@@ -442,6 +445,11 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const openRequestClients = new Set<OpenRequestClient>();
   const openRequestPollers = new Map<string, OpenRequestPoller>();
   const reviewEvents = new ReviewEventQueue();
+  const stateDir =
+    options.stateDir ?? path.join(homeDir, ".roughdraft", "state");
+  const reviewRounds = new ReviewRoundStore(
+    path.join(stateDir, "review-rounds"),
+  );
   const remoteSessions = new Map<string, RemoteSession>();
 
   function isAuthorizedRemoteDocumentRequest(req: Request): boolean {
@@ -601,7 +609,10 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
-    res.json(markdownPageFromFile(relativePath, absolutePath));
+    const page = markdownPageFromFile(relativePath, absolutePath);
+    // Opening the document starts its review round, unless one is running.
+    reviewRounds.ensure(absolutePath, page.content);
+    res.json(page);
   });
 
   app.get("/api/markdown-file/version", (req, res) => {
@@ -733,6 +744,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         overallComment,
       });
 
+      reviewRounds.reset(target.absolutePath, persistedMarkdown);
       writeReviewStatus(target.absolutePath, reviewSuccessStatus());
       res.status(201).json(result);
     } catch (error) {
@@ -741,6 +753,41 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         error: `Could not record the review completion (${stage})`,
       });
     }
+  });
+
+  app.get("/api/review-round", (req, res) => {
+    const target = markdownPathFromRequest(req, res);
+    if (!target) return;
+
+    const current = fs.readFileSync(target.absolutePath, "utf-8");
+    const snapshot = reviewRounds.ensure(target.absolutePath, current);
+    res.json({
+      hasSnapshot: true,
+      changed: snapshot.content !== current,
+      startedAt: snapshot.startedAt,
+    });
+  });
+
+  app.post("/api/review-round/restore", (req, res) => {
+    const target = markdownPathFromRequest(req, res);
+    if (!target) return;
+
+    const snapshot = reviewRounds.get(target.absolutePath);
+    if (!snapshot) {
+      res.status(404).json({ error: "No review round snapshot for this file" });
+      return;
+    }
+
+    try {
+      // The same write as a normal save, so watchers and the live view update.
+      fs.writeFileSync(target.absolutePath, snapshot.content);
+    } catch (error) {
+      res.status(500).json({
+        error: `Could not restore the document: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
+    }
+    res.json(markdownPageFromFile(target.relativePath, target.absolutePath));
   });
 
   app.post("/api/review-events/watch", async (req, res) => {

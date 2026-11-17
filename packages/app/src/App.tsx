@@ -1781,6 +1781,22 @@ export function App() {
     );
   }, [applyDocumentPage, handleDocumentSaveStateChange]);
 
+  const handleDiscardReviewChanges = useCallback(async () => {
+    const currentBackend = backendRef.current;
+    const currentPath = activeDocumentPathRef.current;
+    if (!currentBackend?.restoreReviewRound || !currentPath) return;
+
+    const restored = await currentBackend.restoreReviewRound(currentPath);
+    applyDocumentPage(restored);
+    documentDirtyRef.current = false;
+    handleDocumentSaveStateChange("saved");
+    setDocumentDiskChangeState("clean");
+    // Remounts the editor on the restored text, dropping any pending edit.
+    setDocumentForceResetKey(
+      `${currentPath}:${restored.version ?? Date.now()}:discard`,
+    );
+  }, [applyDocumentPage, handleDocumentSaveStateChange]);
+
   const handleCompleteReview = useCallback(
     async (options?: CompleteReviewOptions) => {
       const currentBackend = backendRef.current;
@@ -1945,6 +1961,7 @@ export function App() {
         onKeepEditingWithoutAutosave={handleKeepEditingWithoutAutosave}
         onOverwriteDocumentOnDisk={handleOverwriteDocumentOnDisk}
         onCompleteReview={handleCompleteReview}
+        onDiscardReviewChanges={handleDiscardReviewChanges}
         backend={backend}
       />
     </main>

@@ -436,6 +436,88 @@ describe("createApp", () => {
     });
   });
 
+  describe("review round snapshot", () => {
+    const open = (app: ReturnType<typeof createApp>["app"]) =>
+      request(app)
+        .get("/api/markdown-file")
+        .query({ projectPath: projectDir, path: "draft.md" });
+    const save = (app: ReturnType<typeof createApp>["app"], content: string) =>
+      request(app)
+        .put("/api/markdown-file")
+        .query({ projectPath: projectDir, path: "draft.md" })
+        .send({ content });
+    const round = (app: ReturnType<typeof createApp>["app"]) =>
+      request(app)
+        .get("/api/review-round")
+        .query({ projectPath: projectDir, path: "draft.md" });
+    const restore = (app: ReturnType<typeof createApp>["app"]) =>
+      request(app)
+        .post("/api/review-round/restore")
+        .send({ projectPath: projectDir, path: "draft.md" });
+
+    it("restores the document as it was when it was opened, through a real save and load", async () => {
+      const filePath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(filePath, "# Draft\n\nOriginal.\n");
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+
+      await open(app);
+      expect((await round(app)).body.changed).toBe(false);
+
+      await save(app, "# Draft\n\nEdited by the reviewer.\n");
+      expect((await round(app)).body.changed).toBe(true);
+
+      const restored = await restore(app);
+      expect(restored.status).toBe(200);
+      expect(restored.body.content).toBe("# Draft\n\nOriginal.\n");
+      expect(fs.readFileSync(filePath, "utf-8")).toBe("# Draft\n\nOriginal.\n");
+      expect((await round(app)).body.changed).toBe(false);
+
+      // The live view reloads from what is on disk now.
+      const reopened = await open(app);
+      expect(reopened.body.content).toBe("# Draft\n\nOriginal.\n");
+    });
+
+    it("keeps the snapshot across a server restart", async () => {
+      const filePath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(filePath, "# Draft\n\nOriginal.\n");
+      const first = createApp({ homeDir, staticDirPath: projectDir });
+      await open(first.app);
+      await save(first.app, "# Draft\n\nEdited.\n");
+
+      const second = createApp({ homeDir, staticDirPath: projectDir });
+      // Opening again must not take the edited text as the round start.
+      await open(second.app);
+      expect((await round(second.app)).body.changed).toBe(true);
+      await restore(second.app);
+      expect(fs.readFileSync(filePath, "utf-8")).toBe("# Draft\n\nOriginal.\n");
+    });
+
+    it("starts a new round after a review completes", async () => {
+      const filePath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(filePath, "# Draft\n\nOriginal.\n");
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      await open(app);
+      await save(app, "# Draft\n\nRound one edit.\n");
+
+      await request(app)
+        .post("/api/review-events")
+        .send({ projectPath: projectDir, path: "draft.md" });
+      expect((await round(app)).body.changed).toBe(false);
+
+      await save(app, "# Draft\n\nRound two edit.\n");
+      await restore(app);
+      expect(fs.readFileSync(filePath, "utf-8")).toBe(
+        "# Draft\n\nRound one edit.\n",
+      );
+    });
+
+    it("answers 404 when restoring a file that was never opened", async () => {
+      fs.writeFileSync(path.join(projectDir, "draft.md"), "# Draft\n");
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      expect((await restore(app)).status).toBe(404);
+    });
+  });
+
   it("rejects review events without a projectPath", async () => {
     const { app } = createApp({
       homeDir,

@@ -192,6 +192,39 @@ export class ApiBackend implements StorageBackend {
     };
   }
 
+  async getReviewRoundChanged(relativePath: string): Promise<boolean> {
+    const res = await fetch(
+      this.buildUrl("/api/review-round", { path: relativePath }),
+    );
+    if (!res.ok) {
+      throw new Error(
+        `Failed to read review round ${relativePath}: ${res.status}`,
+      );
+    }
+    const payload = (await res.json()) as { changed?: unknown };
+    return payload.changed === true;
+  }
+
+  async restoreReviewRound(relativePath: string): Promise<Page> {
+    const res = await fetch(
+      this.buildUrl("/api/review-round/restore", { path: relativePath }),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectPath: this.info.projectPath,
+          path: relativePath,
+        }),
+      },
+    );
+    if (!res.ok) {
+      throw new Error(
+        `Failed to restore review round ${relativePath}: ${res.status}`,
+      );
+    }
+    return (await res.json()) as Page;
+  }
+
   async closeOrcaTab(pageUrl: string): Promise<boolean> {
     const res = await fetch("/api/orca/close-tab", {
       method: "POST",
