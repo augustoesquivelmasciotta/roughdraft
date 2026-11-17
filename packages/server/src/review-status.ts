@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export type ReviewStatus =
+type ReviewStatus =
   | { ok: true; at: string; event: "review.completed" }
   | { ok: false; stage: string; cause: string; at: string };
 
 /** `revisiones/foo.md` -> `revisiones/foo-status.json`. */
-export function reviewStatusPath(documentPath: string): string {
+function reviewStatusPath(documentPath: string): string {
   const parsed = path.parse(documentPath);
   return path.join(parsed.dir, `${parsed.name}-status.json`);
 }
