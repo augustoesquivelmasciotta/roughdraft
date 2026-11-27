@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { MAX_REVIEW_POLL_SECONDS, waitForReviewEvents } from "./review-watch";
+import {
+  MAX_REVIEW_POLL_SECONDS,
+  ReviewWatchConnectionLostError,
+  waitForReviewEvents,
+} from "./review-watch";
 
 const target = {
   projectPath: "/project",
@@ -140,5 +144,51 @@ describe("waitForReviewEvents", () => {
     ).rejects.toThrow("fetch failed");
     expect(server.bodies.length).toBeGreaterThan(1);
     expect(server.bodies.length).toBeLessThan(50);
+  });
+});
+
+describe("waitForReviewEvents connection loss", () => {
+  it("reports a lost server as ReviewWatchConnectionLostError after the failure window", async () => {
+    const server = scriptedServer(Array.from({ length: 50 }, () => "reset"));
+    const lost: string[] = [];
+
+    const failure = waitForReviewEvents({
+      fetchImpl: server.fetchImpl,
+      serverUrl: "http://localhost:7480",
+      target,
+      failureWindowMs: 5_000,
+      onConnectionLost: () => lost.push("lost"),
+      now: server.now,
+      sleep: server.sleep,
+    });
+
+    await expect(failure).rejects.toBeInstanceOf(
+      ReviewWatchConnectionLostError,
+    );
+    expect(lost).toEqual(["lost"]);
+    // 1 s + 2 s + 4 s of backoff passes a 5 s window after four polls.
+    expect(server.bodies).toHaveLength(4);
+  });
+
+  it("tells the caller when the server answers again", async () => {
+    const server = scriptedServer([
+      { timedOut: true, nextSequence: 1 },
+      "reset",
+      "reset",
+      { events: [{ sequence: 1 }], nextSequence: 2 },
+    ]);
+    const calls: string[] = [];
+
+    await waitForReviewEvents({
+      fetchImpl: server.fetchImpl,
+      serverUrl: "http://localhost:7480",
+      target,
+      onConnectionLost: () => calls.push("lost"),
+      onReconnected: () => calls.push("back"),
+      now: server.now,
+      sleep: server.sleep,
+    });
+
+    expect(calls).toEqual(["lost", "back"]);
   });
 });

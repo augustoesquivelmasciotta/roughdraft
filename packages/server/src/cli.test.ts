@@ -1349,6 +1349,311 @@ describe("cli", () => {
     });
   });
 
+  // Resolves once the CLI's watch is registered on the server, not merely once
+  // the server is up: a Done Reviewing posted before the priming watch poll is
+  // excluded by its fromNow cursor, and the open would then wait forever.
+  async function waitForPersistedPort(
+    env: NodeJS.ProcessEnv,
+    documentName = "draft.md",
+  ): Promise<number> {
+    let port: number | null = null;
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      const stateFile = getServerStateFilePath(env);
+      if (port === null && fs.existsSync(stateFile)) {
+        port = (
+          JSON.parse(fs.readFileSync(stateFile, "utf8")) as { port: number }
+        ).port;
+      }
+      if (port !== null) {
+        const params = new URLSearchParams({
+          projectPath: projectDir,
+          path: documentName,
+        });
+        const status = (await (
+          await fetch(
+            `http://localhost:${port}/api/review-events/status?${params.toString()}`,
+          )
+        ).json()) as { watching?: boolean };
+        if (status.watching) return port;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error("the CLI never registered a review watcher");
+  }
+
+  async function submitDoneReviewing(
+    port: number,
+    body: { overallComment?: string },
+  ) {
+    const response = await fetch(`http://localhost:${port}/api/review-events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectPath: projectDir,
+        path: "draft.md",
+        ...body,
+      }),
+    });
+    expect(response.status).toBe(201);
+  }
+
+  interface LoopPayload {
+    timedOut: boolean;
+    done: boolean;
+    doneReason: string | null;
+    events: Array<{ done: boolean; doneReason: string | null }>;
+  }
+
+  const OPEN_THREAD_DRAFT = [
+    "# Draft",
+    "",
+    'Needs {==support==}{>>Add a source<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.',
+    "",
+  ].join("\n");
+
+  describe("open --loop", () => {
+    it("reports done when the overall comment says done", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, OPEN_THREAD_DRAFT);
+
+      const openPromise = runCli(
+        ["open", documentPath, "--loop", "--json", "--batch-window", "0"],
+        test.deps,
+      );
+      const port = await waitForPersistedPort(test.deps.env);
+      await submitDoneReviewing(port, { overallComment: "Done, thanks!" });
+
+      const exitCode = await openPromise;
+      const payload = parseOnlyJsonLog<LoopPayload>(test.logs);
+
+      expect(exitCode).toBe(0);
+      expect(payload).toMatchObject({
+        timedOut: false,
+        done: true,
+        doneReason: "overall-comment",
+        events: [{ done: true, doneReason: "overall-comment" }],
+      });
+    });
+
+    it("reports done when every thread is cleared", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n\nClean prose.\n");
+
+      const openPromise = runCli(
+        ["open", documentPath, "--loop", "--json", "--batch-window", "0"],
+        test.deps,
+      );
+      const port = await waitForPersistedPort(test.deps.env);
+      await submitDoneReviewing(port, {});
+
+      const exitCode = await openPromise;
+      const payload = parseOnlyJsonLog<LoopPayload>(test.logs);
+
+      expect(exitCode).toBe(0);
+      expect(payload).toMatchObject({
+        timedOut: false,
+        done: true,
+        doneReason: "threads-cleared",
+      });
+    });
+
+    it("reports the loop continuing when threads stay open", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, OPEN_THREAD_DRAFT);
+
+      const openPromise = runCli(
+        ["open", documentPath, "--loop", "--json", "--batch-window", "0"],
+        test.deps,
+      );
+      const port = await waitForPersistedPort(test.deps.env);
+      await submitDoneReviewing(port, {
+        overallComment: "Please prioritize the CLI contract.",
+      });
+
+      const exitCode = await openPromise;
+      const payload = parseOnlyJsonLog<LoopPayload>(test.logs);
+
+      expect(exitCode).toBe(0);
+      expect(payload).toMatchObject({
+        timedOut: false,
+        done: false,
+        doneReason: null,
+        events: [{ done: false, doneReason: null }],
+      });
+    });
+
+    it("does not add done fields to open --json output without --loop", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+
+      const openPromise = runCli(
+        ["open", documentPath, "--json", "--batch-window", "0"],
+        test.deps,
+      );
+      const port = await waitForPersistedPort(test.deps.env);
+      await submitDoneReviewing(port, {});
+
+      await openPromise;
+      const payload = parseOnlyJsonLog<Record<string, unknown>>(test.logs);
+
+      expect(payload).not.toHaveProperty("done");
+      expect(payload).not.toHaveProperty("doneReason");
+    });
+
+    it("prints the done-signal in human output", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, OPEN_THREAD_DRAFT);
+
+      const openPromise = runCli(
+        ["open", documentPath, "--loop", "--batch-window", "0"],
+        test.deps,
+      );
+      const port = await waitForPersistedPort(test.deps.env);
+      await submitDoneReviewing(port, { overallComment: "lgtm" });
+
+      const exitCode = await openPromise;
+
+      expect(exitCode).toBe(0);
+      expect(test.logs).toContain(`Review completed for ${documentPath}.`);
+      expect(test.logs).toContain(
+        "Reviewer signaled done: the overall comment says the review is done.",
+      );
+    });
+
+    it("prints the open thread count in human output when the loop continues", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, OPEN_THREAD_DRAFT);
+
+      const openPromise = runCli(
+        ["open", documentPath, "--loop", "--batch-window", "0"],
+        test.deps,
+      );
+      const port = await waitForPersistedPort(test.deps.env);
+      await submitDoneReviewing(port, {});
+
+      const exitCode = await openPromise;
+
+      expect(exitCode).toBe(0);
+      expect(test.logs).toContain(
+        "Review continues: 1 item(s) still open and no done-signal. Act on the feedback and reopen the document.",
+      );
+    });
+
+    it("reports the loop continuing when the watch times out", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+
+      const exitCode = await runCli(
+        [
+          "open",
+          documentPath,
+          "--loop",
+          "--json",
+          "--timeout",
+          "0.2",
+          "--batch-window",
+          "0",
+        ],
+        test.deps,
+      );
+      const payload = parseOnlyJsonLog<LoopPayload>(test.logs);
+
+      expect(exitCode).toBe(1);
+      expect(payload).toMatchObject({
+        timedOut: true,
+        done: false,
+        doneReason: null,
+      });
+    });
+
+    it("reports disconnected and exits 1 when the server dies mid-round and stays down", async () => {
+      const test = createTestDependencies();
+      const deps = {
+        ...test.deps,
+        env: { ...test.deps.env, ROUGHDRAFT_WATCH_RECONNECT_SECONDS: "1" },
+      };
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, OPEN_THREAD_DRAFT);
+
+      const openPromise = runCli(
+        ["open", documentPath, "--loop", "--json", "--batch-window", "0"],
+        deps,
+      );
+      await waitForPersistedPort(test.deps.env);
+      for (const pid of [...serverByPid.keys()]) {
+        await test.deps.stopProcess(pid);
+      }
+
+      const exitCode = await openPromise;
+      const payload = parseOnlyJsonLog<
+        LoopPayload & { disconnected: boolean; error: string }
+      >(test.logs);
+
+      expect(exitCode).toBe(1);
+      expect(payload).toMatchObject({
+        disconnected: true,
+        done: false,
+        doneReason: null,
+      });
+      expect(payload.error).toContain("did not come back within 1 s");
+      expect(payload.error).toContain("roughdraft open draft.md");
+      expect(test.errors.join("\n")).toContain("stopped during the review");
+    });
+
+    it("rejects --loop together with --no-watch or --print-url", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+
+      expect(
+        await runCli(["open", documentPath, "--loop", "--no-watch"], test.deps),
+      ).toBe(2);
+      expect(
+        await runCli(
+          ["open", documentPath, "--loop", "--print-url"],
+          test.deps,
+        ),
+      ).toBe(2);
+      expect(test.errors).toEqual([
+        "Use either --loop or --no-watch, not both.",
+        "Use either --loop or --print-url, not both.",
+      ]);
+    });
+
+    it("rejects --loop on the watch command", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+
+      const exitCode = await runCli(
+        ["watch", documentPath, "--loop"],
+        test.deps,
+      );
+
+      expect(exitCode).toBe(2);
+      expect(test.errors).toEqual(["Unknown flag: --loop"]);
+    });
+
+    it("documents --loop in open help", async () => {
+      const test = createTestDependencies();
+
+      const exitCode = await runCli(["open", "--help"], test.deps);
+
+      expect(exitCode).toBe(0);
+      expect(test.logs).toContain(
+        "  roughdraft open <path> [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
+      );
+      expect(test.logs.join("\n")).toContain("  --loop ");
+    });
+  });
+
   it("cleans stale state during status checks", async () => {
     const test = createTestDependencies();
     const stateFilePath = getServerStateFilePath(test.deps.env);
@@ -1717,7 +2022,7 @@ describe("cli", () => {
 
     expect(exitCode).toBe(0);
     expect(test.logs).toContain(
-      "  roughdraft open <path> [--no-open] [--no-watch] [--print-url] [--port <port>]",
+      "  roughdraft open <path> [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
     );
     expect(test.logs).toContain(
       "  --no-watch           Open the file without waiting",

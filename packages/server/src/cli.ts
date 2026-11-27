@@ -22,7 +22,11 @@ import {
   runOrcaCommand,
 } from "./orca.js";
 import { findAvailablePort } from "./ports.js";
-import { waitForReviewEvents } from "./review-watch.js";
+import type { ReviewDoneReason } from "./review-events.js";
+import {
+  ReviewWatchConnectionLostError,
+  waitForReviewEvents,
+} from "./review-watch.js";
 import { resolveUpdateStatus, type UpdateStatus } from "./update-status.js";
 
 const AGENT_SETUP_URL = "https://roughdraft.md/setup.md";
@@ -156,6 +160,7 @@ interface ParsedCommandOptions {
   batchWindowSeconds: number;
   help: boolean;
   json: boolean;
+  loop: boolean;
   noOpen: boolean;
   noWatch: boolean;
   printUrl: boolean;
@@ -172,6 +177,7 @@ interface ParsedWatchOptions {
   batchWindowSeconds: number;
   help: boolean;
   json: boolean;
+  loop?: boolean;
   positionals: string[];
   replay: boolean;
   serverUrl?: string;
@@ -284,6 +290,7 @@ function parseCommandOptions(
     batchWindowSeconds: 0.25,
     help: false,
     json: false,
+    loop: false,
     noOpen: false,
     noWatch: false,
     positionals: [],
@@ -338,6 +345,12 @@ function parseCommandOptions(
     if (arg === "--no-watch") {
       if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
       parsed.noWatch = true;
+      continue;
+    }
+
+    if (arg === "--loop") {
+      if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
+      parsed.loop = true;
       continue;
     }
 
@@ -881,6 +894,7 @@ function printHelp(log: (message: string) => void) {
   log("  roughdraft open ./draft.md --print-url");
   log("  roughdraft open ./draft.md --json");
   log("  roughdraft open ./draft.md --no-watch");
+  log("  roughdraft open ./draft.md --loop --json");
   log("  roughdraft watch ./draft.md --json");
   log("  roughdraft status --json");
   log("");
@@ -895,12 +909,27 @@ function printCommandHelp(
   if (command === "open") {
     log("Usage:");
     log(
-      "  roughdraft open <path> [--no-open] [--no-watch] [--print-url] [--port <port>]",
+      "  roughdraft open <path> [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
     );
     log("");
     log(
       "Opens one Markdown file and waits for Done Reviewing. Starts Roughdraft if needed.",
     );
+    log("");
+    log(
+      "Loop mode (--loop) returns after each round like the default, and also",
+    );
+    log(
+      "reports whether the reviewer signaled done: an overall comment that says",
+    );
+    log(
+      'the review is done ("done", "lgtm", "looks good", "listo" and the like,',
+    );
+    log("as the whole comment) or a submission with every thread cleared.");
+    log("Anything else means act on the feedback and reopen the document. The");
+    log('--json output carries `done` and `doneReason` ("overall-comment",');
+    log('"threads-cleared" or null); <name>-status.json next to the document');
+    log("carries the same two fields.");
     log("");
     log("Flags:");
     log(
@@ -910,12 +939,25 @@ function printCommandHelp(
       "  --print-url          Print only the document URL and do not open it",
     );
     log("  --no-watch           Open the file without waiting");
+    log(
+      "  --loop               Report whether the round ended with a done-signal",
+    );
     log("  --timeout <seconds>  Maximum watch time; omitted means no timeout");
     log("  --replay             Allow watch to return retained older events");
     log("  --json               Print machine-readable output");
     log("  --port <port>        Preferred server port");
     log("  --state-file <path>  Server state file");
     log("  --state-dir <dir>    Directory containing server.json");
+    log("");
+    log("If the server stops while waiting (roughdraft stop, an upgrade), the");
+    log(
+      "wait survives a restart: the command reconnects and keeps waiting for",
+    );
+    log("Done Reviewing. When the server does not come back within the");
+    log(
+      "reconnect window (default 120 s) the command exits 1 and says so; the",
+    );
+    log("--json output then carries `disconnected: true`.");
     log("");
     log("Environment variables:");
     log(
@@ -931,6 +973,9 @@ function printCommandHelp(
     log("                        non-loopback host. Must match the value the");
     log("                        hosted server was started with.");
     log("  ROUGHDRAFT_NO_OPEN    Set to 1 to suppress browser launch.");
+    log("  ROUGHDRAFT_WATCH_RECONNECT_SECONDS");
+    log("                        Seconds to wait for a stopped server to come");
+    log("                        back before giving up (default: 120).");
     log("  ROUGHDRAFT_ORCA       Inside an Orca terminal, documents open as a");
     log(
       "                        tab of that worktree in Orca's browser, which",
@@ -2212,22 +2257,69 @@ async function runWatch(
     serverUrl = result.server.url;
   }
   const relativePath = path.relative(target.projectDir, target.openPath);
+  const reconnectSeconds = readReconnectWindowSeconds(deps.env);
   // Bounded polls: a single request would die after five minutes
   // (UND_ERR_HEADERS_TIMEOUT), and reviews can take much longer.
-  const payload = await waitForReviewEvents({
-    fetchImpl: deps.fetchImpl,
-    serverUrl,
-    target: {
-      projectPath: target.projectDir,
-      path: relativePath,
-      batchWindowSeconds: options.batchWindowSeconds,
-    },
-    timeoutSeconds: options.timeoutSeconds,
-    fromNow: !options.replay,
-  });
+  let payload: Awaited<ReturnType<typeof waitForReviewEvents>>;
+  try {
+    payload = await waitForReviewEvents({
+      fetchImpl: deps.fetchImpl,
+      serverUrl,
+      target: {
+        projectPath: target.projectDir,
+        path: relativePath,
+        batchWindowSeconds: options.batchWindowSeconds,
+      },
+      timeoutSeconds: options.timeoutSeconds,
+      fromNow: !options.replay,
+      failureWindowMs: reconnectSeconds * 1000,
+      onConnectionLost: () => {
+        deps.error(
+          `Roughdraft server at ${serverUrl} stopped during the review; waiting up to ${reconnectSeconds} s for it to come back.`,
+        );
+      },
+      onReconnected: () => {
+        deps.error(
+          "Reconnected to the Roughdraft server; waiting for Done Reviewing again.",
+        );
+      },
+    });
+  } catch (error) {
+    if (!(error instanceof ReviewWatchConnectionLostError)) throw error;
+    // The server died mid-round and never came back: say so instead of
+    // throwing, so an agent in the loop knows to reopen rather than guess.
+    const message = `Roughdraft server at ${serverUrl} did not come back within ${reconnectSeconds} s. This command cannot receive Done Reviewing for ${target.openPath}; run \`roughdraft open ${relativeDisplayPath(deps.cwd, target.openPath)}\` again to resume the review.`;
+    if (json) {
+      emitJson(deps.log, {
+        disconnected: true,
+        error: message,
+        timedOut: false,
+        events: [],
+        ...(options.loop ? { done: false, doneReason: null } : {}),
+      });
+    } else {
+      deps.error(message);
+    }
+    return 1;
+  }
+
+  // A batch window can deliver several events in one round; the newest one
+  // reflects the document's latest state, so it decides the done-signal.
+  const latestEvent = (payload.events ?? []).at(-1) as
+    | {
+        doneReason?: ReviewDoneReason | null;
+        summary?: { unresolved?: number };
+      }
+    | undefined;
+  const doneReason = latestEvent?.doneReason ?? null;
 
   if (json) {
-    emitJson(deps.log, payload);
+    emitJson(
+      deps.log,
+      options.loop
+        ? { ...payload, done: doneReason !== null, doneReason }
+        : payload,
+    );
     return payload.timedOut ? 1 : 0;
   }
 
@@ -2238,7 +2330,33 @@ async function runWatch(
 
   deps.log(`Review completed for ${target.openPath}.`);
   deps.log(`Received ${(payload.events ?? []).length} event(s).`);
+  if (options.loop) {
+    deps.log(describeDoneSignal(doneReason, latestEvent?.summary?.unresolved));
+  }
   return 0;
+}
+
+const DEFAULT_RECONNECT_SECONDS = 120;
+
+function readReconnectWindowSeconds(env: NodeJS.ProcessEnv): number {
+  const configured = Number(env.ROUGHDRAFT_WATCH_RECONNECT_SECONDS);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_RECONNECT_SECONDS;
+}
+
+function describeDoneSignal(
+  doneReason: ReviewDoneReason | null,
+  unresolved: number | undefined,
+): string {
+  if (doneReason === "overall-comment") {
+    return "Reviewer signaled done: the overall comment says the review is done.";
+  }
+  if (doneReason === "threads-cleared") {
+    return "Reviewer signaled done: every thread is cleared.";
+  }
+  const openCount = typeof unresolved === "number" ? `${unresolved} ` : "";
+  return `Review continues: ${openCount}item(s) still open and no done-signal. Act on the feedback and reopen the document.`;
 }
 
 function isMarkdownPath(targetPath: string): boolean {
@@ -2767,6 +2885,16 @@ export async function runCli(
         return USAGE_ERROR;
       }
 
+      if (options.loop && options.noWatch) {
+        deps.error("Use either --loop or --no-watch, not both.");
+        return USAGE_ERROR;
+      }
+
+      if (options.loop && options.printUrl) {
+        deps.error("Use either --loop or --print-url, not both.");
+        return USAGE_ERROR;
+      }
+
       deps = applyCliEnvOverrides(deps, options);
       const json = parsed.global.json || options.json;
       let resolvedTarget: ResolvedTargetPath;
@@ -2784,6 +2912,12 @@ export async function runCli(
           ? deps.env.ROUGHDRAFT_HOST.trim()
           : "";
       if (remoteHost.length > 0) {
+        if (options.loop) {
+          deps.error(
+            "--loop is not supported with ROUGHDRAFT_HOST: a remote session never receives Done Reviewing.",
+          );
+          return USAGE_ERROR;
+        }
         return runRemoteOpen(deps, {
           host: remoteHost,
           openPath,
@@ -2856,6 +2990,7 @@ export async function runCli(
           batchWindowSeconds: options.batchWindowSeconds,
           help: false,
           json,
+          loop: options.loop,
           positionals: [target],
           replay: options.replay,
           serverUrl: liveDevFrontend?.apiUrl ?? undefined,

@@ -19,8 +19,8 @@ const POLL_GRACE_SECONDS = 30;
 /** Backoff between retries after a failed poll; the last delay repeats. */
 const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
 
-/** Give up after this long without a successful poll. */
-const MAX_FAILURE_WINDOW_MS = 120_000;
+/** Give up after this long without a successful poll, unless told otherwise. */
+const DEFAULT_FAILURE_WINDOW_MS = 120_000;
 
 export interface ReviewWatchTarget {
   projectPath: string;
@@ -46,6 +46,12 @@ export interface WaitForReviewEventsOptions {
   /** Ignore events that happened before the wait started (default). */
   fromNow?: boolean;
   headers?: Record<string, string>;
+  /** How long the server may stay unreachable before the wait gives up. */
+  failureWindowMs?: number;
+  /** Called once when a poll first fails to reach the server. */
+  onConnectionLost?: () => void;
+  /** Called when a poll succeeds again after a lost connection. */
+  onReconnected?: () => void;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
 }
@@ -57,6 +63,17 @@ function defaultSleep(milliseconds: number) {
 }
 
 class ReviewWatchHttpError extends Error {}
+
+/**
+ * The server stopped answering mid-wait and did not come back within the
+ * failure window. Callers report it as `disconnected` instead of crashing.
+ */
+export class ReviewWatchConnectionLostError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "ReviewWatchConnectionLostError";
+  }
+}
 
 export async function waitForReviewEvents(
   options: WaitForReviewEventsOptions,
@@ -71,6 +88,7 @@ export async function waitForReviewEvents(
   let afterSequence = options.afterSequence ?? 0;
   let failingSince: number | null = null;
   let failures = 0;
+  const failureWindowMs = options.failureWindowMs ?? DEFAULT_FAILURE_WINDOW_MS;
 
   while (true) {
     const remainingSeconds =
@@ -109,10 +127,13 @@ export async function waitForReviewEvents(
       // connection: report it instead of retrying.
       if (error instanceof ReviewWatchHttpError) throw error;
 
-      failingSince ??= now();
+      if (failingSince === null) {
+        failingSince = now();
+        options.onConnectionLost?.();
+      }
       const deadlinePassed = deadline !== null && now() >= deadline;
-      if (deadlinePassed || now() - failingSince >= MAX_FAILURE_WINDOW_MS) {
-        throw error;
+      if (deadlinePassed || now() - failingSince >= failureWindowMs) {
+        throw new ReviewWatchConnectionLostError(error);
       }
 
       const delay =
@@ -123,6 +144,7 @@ export async function waitForReviewEvents(
       continue;
     }
 
+    if (failingSince !== null) options.onReconnected?.();
     failingSince = null;
     failures = 0;
 

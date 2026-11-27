@@ -1,6 +1,6 @@
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { ReviewEventQueue } from "./review-events";
+import { isDoneSignalComment, ReviewEventQueue } from "./review-events";
 
 function eventInput(documentPath = "/tmp/project/draft.md") {
   return {
@@ -204,5 +204,116 @@ describe("ReviewEventQueue", () => {
     expect(result.events).toHaveLength(100);
     expect(result.events[0]?.sequence).toBe(6);
     expect(result.events.at(-1)?.sequence).toBe(105);
+  });
+});
+
+describe("isDoneSignalComment", () => {
+  it.each([
+    "done",
+    "Done.",
+    "DONE!",
+    "all done",
+    "I'm done",
+    "we're done",
+    "done reviewing",
+    "review done",
+    "review complete",
+    "the review is done",
+    "finished",
+    "finished reviewing",
+    "lgtm",
+    "looks good",
+    "Looks good to me",
+    "no further comments",
+    "no more comments",
+    "nothing further",
+    "ok, done",
+    "okay done",
+    "done, thanks!",
+    "Done. Thank you",
+    "  done  ",
+    "Listo",
+    "listo, gracias",
+    "Terminé",
+    "Ya está",
+    "Sin más comentarios",
+  ])("reads %j as the reviewer signaling done", (text) => {
+    expect(isDoneSignalComment(text)).toBe(true);
+  });
+
+  it.each([
+    "",
+    "   ",
+    "not done",
+    "not done yet",
+    "I'm not done",
+    "done with section 2, but section 3 needs work",
+    "Done. Now please add a section on risks.",
+    "Please prioritize the CLI contract.",
+    "almost done",
+    "is this done?",
+    "Done?",
+    "done ?",
+    "Finished?",
+    "lgtm?",
+    "looks good but tighten the intro",
+    "undone",
+    "approved",
+    "Approved!",
+    "ship it",
+    "okay approved",
+    "¿Listo?",
+    "listo el punto 2, falta el 3",
+  ])("reads %j as feedback that continues the loop", (text) => {
+    expect(isDoneSignalComment(text)).toBe(false);
+  });
+});
+
+describe("ReviewEventQueue done-signal", () => {
+  it("marks an event done when the overall comment says done, even with open threads", () => {
+    const queue = new ReviewEventQueue();
+
+    const emitted = queue.emit({
+      ...eventInput("/tmp/project/draft.md"),
+      overallComment: "Done, thanks!",
+    });
+
+    expect(emitted.event).toMatchObject({
+      done: true,
+      doneReason: "overall-comment",
+    });
+  });
+
+  it("marks an event done when every thread is cleared and there is no overall comment", () => {
+    const queue = new ReviewEventQueue();
+
+    const emitted = queue.emit({
+      ...eventInput("/tmp/project/draft.md"),
+      summary: { comments: 0, replies: 0, suggestions: 0, unresolved: 0 },
+    });
+
+    expect(emitted.event).toMatchObject({
+      done: true,
+      doneReason: "threads-cleared",
+    });
+  });
+
+  it("keeps the loop going when threads remain open and the overall comment is feedback", () => {
+    const queue = new ReviewEventQueue();
+
+    const emitted = queue.emit({
+      ...eventInput("/tmp/project/draft.md"),
+      overallComment: "Please prioritize the CLI contract.",
+    });
+
+    expect(emitted.event).toMatchObject({ done: false, doneReason: null });
+  });
+
+  it("keeps the loop going when threads remain open and nothing was said", () => {
+    const queue = new ReviewEventQueue();
+
+    const emitted = queue.emit(eventInput("/tmp/project/draft.md"));
+
+    expect(emitted.event).toMatchObject({ done: false, doneReason: null });
   });
 });

@@ -745,7 +745,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       });
 
       reviewRounds.reset(target.absolutePath, persistedMarkdown);
-      writeReviewStatus(target.absolutePath, reviewSuccessStatus());
+      writeReviewStatus(target.absolutePath, reviewSuccessStatus(result.event));
       res.status(201).json(result);
     } catch (error) {
       writeReviewStatus(target.absolutePath, reviewFailureStatus(stage, error));

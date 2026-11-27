@@ -126,6 +126,8 @@ After `roughdraft open` opens the document, leave the command running. Do not in
 
 After the user finishes reviewing in Roughdraft, read the Markdown file from disk and respond to any CriticMarkup comments or suggested changes. If the user left questions or comments in the document, reply inline in the Markdown file using Roughdraft-flavored CriticMarkup, save it, and open the file in Roughdraft again so the user can continue reviewing.
 
+To know when the review is over, add `--loop` to `roughdraft open`. After each round it reports whether the user signaled done: an overall comment such as "done", "lgtm" or "listo", or a round with every thread cleared (`done` and `doneReason` in the `--json` output, and in the `<name>-status.json` file Roughdraft writes next to the document). On `done: false`, act on the feedback and open the file again; on `done: true`, stop reopening. If the output says `disconnected: true`, the Roughdraft server stopped during the round and did not come back; open the file again to resume.
+
 Use Roughdraft-flavored CriticMarkup when reading or writing inline review feedback in Markdown. The base markers are:
 
 Comment: `{>>comment<<}`

@@ -274,7 +274,7 @@ export async function callTool(
 
     // Bounded polls, so reviews longer than five minutes do not end the
     // call with UND_ERR_HEADERS_TIMEOUT.
-    return waitForReviewEvents({
+    const payload = await waitForReviewEvents({
       fetchImpl,
       serverUrl: server.url,
       target: {
@@ -291,6 +291,13 @@ export async function callTool(
           : undefined,
       fromNow: true,
     });
+    // Same done-signal `roughdraft open --loop` reports: the newest event
+    // of the round decides it.
+    const latest = (payload.events ?? []).at(-1) as
+      | { doneReason?: string | null }
+      | undefined;
+    const doneReason = latest?.doneReason ?? null;
+    return { ...payload, done: doneReason !== null, doneReason };
   }
 
   if (name === "roughdraft_reply_to_comment") {

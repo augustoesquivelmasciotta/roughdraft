@@ -1,8 +1,20 @@
 import fs from "node:fs";
 import path from "node:path";
+import type {
+  ReviewCompletedEvent,
+  ReviewDoneReason,
+} from "./review-events.js";
 
 type ReviewStatus =
-  | { ok: true; at: string; event: "review.completed" }
+  | {
+      ok: true;
+      at: string;
+      event: "review.completed";
+      // Same decision `roughdraft open --loop` reports, taken from the one
+      // event, so a reader of this file and the CLI never disagree.
+      done: boolean;
+      doneReason: ReviewDoneReason | null;
+    }
   | { ok: false; stage: string; cause: string; at: string };
 
 /** `revisiones/foo.md` -> `revisiones/foo-status.json`. */
@@ -29,11 +41,15 @@ export function writeReviewStatus(
   }
 }
 
-export function reviewSuccessStatus(): ReviewStatus {
+export function reviewSuccessStatus(
+  event: Pick<ReviewCompletedEvent, "done" | "doneReason">,
+): ReviewStatus {
   return {
     ok: true,
     at: new Date().toISOString(),
     event: "review.completed",
+    done: event.done,
+    doneReason: event.doneReason,
   };
 }
 
