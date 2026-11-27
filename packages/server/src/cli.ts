@@ -186,6 +186,7 @@ interface ParsedCommandOptions {
   batchWindowSeconds: number;
   help: boolean;
   json: boolean;
+  label?: string;
   loop: boolean;
   noOpen: boolean;
   noWatch: boolean;
@@ -359,6 +360,20 @@ function parseCommandOptions(
       if (!options.allowOpen) throw new Error(`Unknown flag: ${arg}`);
       parsed.printUrl = true;
       parsed.noOpen = true;
+      continue;
+    }
+
+    if (arg === "--label") {
+      if (!options.allowOpen) throw new Error(`Unknown flag: ${arg}`);
+      const next = takeFlagValue(args, index, arg);
+      parsed.label = next.value;
+      index = next.nextIndex;
+      continue;
+    }
+
+    if (arg.startsWith("--label=")) {
+      if (!options.allowOpen) throw new Error(`Unknown flag: --label`);
+      parsed.label = arg.slice("--label=".length);
       continue;
     }
 
@@ -936,7 +951,7 @@ function printCommandHelp(
   if (command === "open") {
     log("Usage:");
     log(
-      "  roughdraft open <path> [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
+      "  roughdraft open <path> [--label <text>] [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
     );
     log("");
     log(
@@ -968,6 +983,9 @@ function printCommandHelp(
     log("  --no-watch           Open the file without waiting");
     log(
       "  --loop               Report whether the round ended with a done-signal",
+    );
+    log(
+      "  --label <text>       Name this session; the document header shows who opened it",
     );
     log("  --timeout <seconds>  Maximum watch time; omitted means no timeout");
     log("  --replay             Allow watch to return retained older events");
@@ -1247,11 +1265,16 @@ function buildLoopbackUrl(host: string, port: number, pathname = "/"): URL {
   return new URL(`http://${baseHost}:${port}${pathname}`);
 }
 
-function buildTargetUrl(baseUrl: string, openPath: string): string {
+function buildTargetUrl(
+  baseUrl: string,
+  openPath: string,
+  sessionLabel: string | null = null,
+): string {
   const url = new URL(baseUrl);
 
   url.pathname = "/";
   url.searchParams.set("path", openPath);
+  if (sessionLabel) url.searchParams.set("label", sessionLabel);
   return url.toString();
 }
 
@@ -1549,6 +1572,32 @@ async function openInOrcaTab(
   return null;
 }
 
+// A second `open` of a document that a tab already shows reuses that tab
+// (each document has its own tab, so a tab is never pointed at another
+// document). When the tab belongs to another session, say so before taking
+// it over: that session's reviewer is in the middle of it, and Done
+// Reviewing there now reaches both sessions.
+function warnBeforeReusingAnotherSessionsTab(
+  deps: CliDependencies,
+  documents: StatusDocument[],
+  openPath: string,
+  sessionLabel: string | null,
+) {
+  const wanted = openPath.normalize("NFC");
+  const tabs = documents.filter(
+    (entry) => path.resolve(entry.path).normalize("NFC") === wanted,
+  );
+  const owner = tabs.at(-1);
+  // Same label (or neither labeled): the same session reopening for its
+  // next round, which is the normal review loop.
+  if (!owner || owner.sessionLabel === sessionLabel) return;
+
+  const ownerName = owner.sessionLabel ?? "a session with no label";
+  deps.error(
+    `${openPath} is already open in a tab opened by ${ownerName}. This open reuses that tab; Done Reviewing there reaches every session waiting on the file.`,
+  );
+}
+
 function describeOpenedDocument(openMode: OpenMode, url: string): string {
   switch (openMode) {
     case "chrome-app":
@@ -1571,13 +1620,18 @@ async function sendOpenRequestToExistingWindow(
   baseUrl: string,
   targetUrl: string,
   openPath: string,
+  sessionLabel: string | null,
 ): Promise<boolean> {
   try {
     const requestUrl = new URL("/api/open-request", baseUrl);
     const response = await deps.fetchImpl(requestUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: openPath, url: targetUrl }),
+      body: JSON.stringify({
+        path: openPath,
+        url: targetUrl,
+        ...(sessionLabel ? { label: sessionLabel } : {}),
+      }),
       signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
     });
 
@@ -3089,6 +3143,7 @@ export async function runCli(
       }
 
       const { projectDir, openPath } = resolvedTarget;
+      const sessionLabel = options.label?.trim() || null;
 
       const remoteHost =
         typeof deps.env.ROUGHDRAFT_HOST === "string"
@@ -3121,7 +3176,13 @@ export async function runCli(
         baseUrl = buildPublicBaseUrl(result.server.port);
       }
 
-      const targetUrl = buildTargetUrl(baseUrl, openPath);
+      const targetUrl = buildTargetUrl(baseUrl, openPath, sessionLabel);
+      warnBeforeReusingAnotherSessionsTab(
+        deps,
+        result?.server.documents ?? [],
+        openPath,
+        sessionLabel,
+      );
       let openMode: OpenMode = "disabled";
       if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
         // Why: inside Orca the tab in the agent's worktree wins over reusing a
@@ -3135,6 +3196,17 @@ export async function runCli(
           deps.error(error.message);
           return 1;
         }
+        if (orcaOpenMode === "existing-orca-tab") {
+          // Orca only brings the reused tab forward; the open request is
+          // what tells the page about the new session label.
+          await sendOpenRequestToExistingWindow(
+            deps,
+            baseUrl,
+            targetUrl,
+            openPath,
+            sessionLabel,
+          );
+        }
         openMode =
           orcaOpenMode ??
           ((await sendOpenRequestToExistingWindow(
@@ -3142,6 +3214,7 @@ export async function runCli(
             baseUrl,
             targetUrl,
             openPath,
+            sessionLabel,
           ))
             ? "existing-window"
             : deps.openUrl(targetUrl));

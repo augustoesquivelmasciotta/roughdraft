@@ -116,6 +116,8 @@ When you write or modify a Markdown file and want the user to review or comment 
 roughdraft open "/absolute/path/to/file.md"
 ```
 
+Pass `--label "<short session name>"` on every `roughdraft open`, such as `--label "plan-review"`. The document header shows the label as the session that opened the document, so the user can tell reviews apart when several agent sessions use Roughdraft at once. Use a short name for the work of this session, never a machine username or anything else that identifies a person.
+
 Roughdraft is currently a single-file Markdown viewer/editor. Open one `.md` file at a time.
 
 If Roughdraft is not running, `roughdraft open` will start it automatically.

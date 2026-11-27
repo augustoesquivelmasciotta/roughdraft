@@ -552,6 +552,53 @@ describe("cli", () => {
       );
     });
 
+    it("tells a reused Orca tab about the new session label without navigating it", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      await ensureServerRunning(test.deps, { projectDir });
+      const port = readPersistedPort(test.deps.env);
+      const pageUrl = expectedOpenUrl(`http://localhost:${port}`, documentPath);
+      const orca = fakeOrca(() => [
+        { browserPageId: "page-draft", url: `${pageUrl}&label=plan-review` },
+      ]);
+      // The tab that Orca shows polls for open requests.
+      const poll = () =>
+        fetch(
+          `http://127.0.0.1:${port}/api/open-requests/poll?${new URLSearchParams(
+            { clientId: "orca-tab", path: documentPath, label: "plan-review" },
+          )}`,
+        ).then((response) => response.json() as Promise<{ requests: unknown }>);
+      await poll();
+
+      const exitCode = await runCli(
+        ["open", documentPath, "--no-watch", "--label", "spec-edit"],
+        {
+          ...test.deps,
+          env: { ...test.deps.env, ORCA_WORKTREE_ID: worktreeId },
+          runOrcaCommand: orca.runOrcaCommand,
+        },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(orca.calls.map((args) => args.slice(0, 2).join(" "))).toEqual([
+        "tab list",
+        "tab switch",
+      ]);
+      expect(await poll()).toEqual({
+        requests: [
+          {
+            path: documentPath,
+            url: `${pageUrl}&label=spec-edit`,
+            label: "spec-edit",
+          },
+        ],
+      });
+      expect(test.errors).toContain(
+        `${documentPath} is already open in a tab opened by plan-review. This open reuses that tab; Done Reviewing there reaches every session waiting on the file.`,
+      );
+    });
+
     it("falls back to the browser and says why when Orca cannot open a tab", async () => {
       const test = createTestDependencies();
       const documentPath = path.join(projectDir, "draft.md");
@@ -782,6 +829,120 @@ describe("cli", () => {
         args: ["http://localhost:4020/?file=draft.md"],
       },
     ]);
+  });
+
+  describe("open --label", () => {
+    it("carries the label in the document URL", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+
+      const exitCode = await runCli(
+        ["open", documentPath, "--print-url", "--label", "plan-review"],
+        test.deps,
+      );
+
+      expect(exitCode).toBe(0);
+      const printed = new URL(test.logs.at(-1) ?? "");
+      expect(printed.searchParams.get("path")).toBe(documentPath);
+      expect(printed.searchParams.get("label")).toBe("plan-review");
+    });
+
+    it("accepts --label=<text> and leaves the URL without a label when blank", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+
+      await runCli(
+        ["open", documentPath, "--print-url", "--label=spec-edit"],
+        test.deps,
+      );
+      await runCli(
+        ["open", documentPath, "--print-url", "--label", "  "],
+        test.deps,
+      );
+
+      expect(new URL(test.logs.at(-2) ?? "").searchParams.get("label")).toBe(
+        "spec-edit",
+      );
+      expect(new URL(test.logs.at(-1) ?? "").searchParams.has("label")).toBe(
+        false,
+      );
+    });
+
+    it("sends the label with the open request to a tab showing the document", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const result = await ensureServerRunning(test.deps, { projectDir });
+      const poll = (label: string) =>
+        fetch(
+          `http://127.0.0.1:${result.server.port}/api/open-requests/poll?${new URLSearchParams(
+            { clientId: "tab-1", path: documentPath, label },
+          )}`,
+        ).then((response) => response.json() as Promise<{ requests: unknown }>);
+      await poll("plan-review");
+
+      const exitCode = await runCli(
+        ["open", documentPath, "--no-watch", "--label", "plan-review"],
+        test.deps,
+      );
+
+      expect(exitCode).toBe(0);
+      expect(test.getLastOpenedUrl()).toBeNull();
+      expect(await poll("plan-review")).toEqual({
+        requests: [
+          {
+            path: documentPath,
+            url: `${expectedOpenUrl(result.server.url, documentPath)}&label=plan-review`,
+            label: "plan-review",
+          },
+        ],
+      });
+      // The same session reopening for its next round is not a takeover.
+      expect(test.errors).toEqual([]);
+    });
+
+    it("warns before reusing a tab another session opened", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const result = await ensureServerRunning(test.deps, { projectDir });
+      await fetch(
+        `http://127.0.0.1:${result.server.port}/api/open-requests/poll?${new URLSearchParams(
+          { clientId: "tab-1", path: documentPath, label: "plan-review" },
+        )}`,
+      );
+
+      await runCli(["open", documentPath, "--no-watch"], test.deps);
+
+      expect(test.errors).toEqual([
+        `${documentPath} is already open in a tab opened by plan-review. This open reuses that tab; Done Reviewing there reaches every session waiting on the file.`,
+      ]);
+    });
+
+    it("names the label in status once the tab reports it", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const result = await ensureServerRunning(test.deps, { projectDir });
+      await fetch(
+        `http://127.0.0.1:${result.server.port}/api/open-requests/poll?${new URLSearchParams(
+          { clientId: "tab-1", path: documentPath, label: "plan-review" },
+        )}`,
+      );
+
+      await runCli(["status"], test.deps);
+
+      expect(test.logs).toContain("Session: plan-review");
+    });
+
+    it("rejects --label outside open", async () => {
+      const test = createTestDependencies();
+
+      expect(await runCli(["status", "--label", "x"], test.deps)).toBe(2);
+      expect(test.errors).toEqual(["Unknown flag: --label"]);
+    });
   });
 
   it("prints only the document URL from open --print-url", async () => {
@@ -1882,7 +2043,7 @@ describe("cli", () => {
 
       expect(exitCode).toBe(0);
       expect(test.logs).toContain(
-        "  roughdraft open <path> [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
+        "  roughdraft open <path> [--label <text>] [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
       );
       expect(test.logs.join("\n")).toContain("  --loop ");
     });
@@ -2256,7 +2417,7 @@ describe("cli", () => {
 
     expect(exitCode).toBe(0);
     expect(test.logs).toContain(
-      "  roughdraft open <path> [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
+      "  roughdraft open <path> [--label <text>] [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
     );
     expect(test.logs).toContain(
       "  --no-watch           Open the file without waiting",

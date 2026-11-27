@@ -1013,7 +1013,9 @@ describe("createApp", () => {
       const polled = await request(app)
         .get("/api/open-requests/poll")
         .query({ path: target, clientId: "tab-1" });
-      expect(polled.body).toEqual({ requests: [{ path: target, url }] });
+      expect(polled.body).toEqual({
+        requests: [{ path: target, url, label: null }],
+      });
 
       const drained = await request(app)
         .get("/api/open-requests/poll")
@@ -1116,6 +1118,43 @@ describe("createApp", () => {
         before - 1000,
       );
       expect(other?.lastSavedAt).toBeNull();
+    });
+
+    it("keeps the label a tab polls with and takes the label of a delivered open request", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const documentPath = path.join(projectDir, "draft.md");
+      const poll = (label?: string) =>
+        request(app)
+          .get("/api/open-requests/poll")
+          .query({
+            path: documentPath,
+            clientId: "tab-1",
+            ...(label ? { label } : {}),
+          });
+      await poll("plan-review");
+      const labels = async () =>
+        (await request(app).get("/api/status")).body.documents.map(
+          (entry: { sessionLabel: string | null }) => entry.sessionLabel,
+        );
+      expect(await labels()).toEqual(["plan-review"]);
+
+      const sent = await request(app).post("/api/open-request").send({
+        path: documentPath,
+        url: "http://localhost:4312/?label=spec-edit",
+        label: "spec-edit",
+      });
+
+      expect(sent.body).toEqual({ delivered: true });
+      expect(await labels()).toEqual(["spec-edit"]);
+      expect((await poll("spec-edit")).body).toEqual({
+        requests: [
+          {
+            path: documentPath,
+            url: "http://localhost:4312/?label=spec-edit",
+            label: "spec-edit",
+          },
+        ],
+      });
     });
 
     it("drops a tab that stopped polling from the record", async () => {

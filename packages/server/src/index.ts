@@ -120,12 +120,19 @@ export interface OpenDocumentRecord {
 interface OpenRequestPayload {
   path?: string;
   url?: string;
+  label?: string;
+}
+
+function normalizeSessionLabel(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim().slice(0, 200)
+    : null;
 }
 
 // A tab that polls for open requests instead of holding an event stream.
 interface OpenRequestPoller extends OpenDocumentTab {
   lastSeenAt: number;
-  pending: Array<{ path: string; url: string }>;
+  pending: Array<{ path: string; url: string; label: string | null }>;
 }
 
 // Why: a tab that stops polling (closed, crashed) must stop receiving
@@ -1012,7 +1019,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const client: OpenRequestClient = {
       id: nextOpenRequestClientId,
       path: requestedPath,
-      sessionLabel: null,
+      sessionLabel: normalizeSessionLabel(req.query.label),
       openedAt: new Date().toISOString(),
       lastSavedAt: null,
       response: res,
@@ -1060,7 +1067,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const existing = openRequestPollers.get(clientId);
     const poller: OpenRequestPoller = existing ?? {
       path: requestedPath,
-      sessionLabel: null,
+      sessionLabel: normalizeSessionLabel(req.query.label),
       openedAt: new Date(now).toISOString(),
       lastSavedAt: null,
       lastSeenAt: now,
@@ -1072,6 +1079,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       poller.lastSavedAt = null;
     }
     poller.path = requestedPath;
+    poller.sessionLabel = normalizeSessionLabel(req.query.label);
     poller.lastSeenAt = now;
     openRequestPollers.set(clientId, poller);
 
@@ -1095,6 +1103,8 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       res.status(400).json({ error: "path and url are required" });
       return;
     }
+    const sessionLabel = normalizeSessionLabel(payload.label);
+    const event = { path: targetPath, url: targetUrl, label: sessionLabel };
 
     const showsTarget = (candidate: string | null) =>
       candidate !== null && samePath(candidate, targetPath);
@@ -1114,7 +1124,10 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         .sort((left, right) => right.lastSeenAt - left.lastSeenAt)[0];
 
       if (matchingPoller) {
-        matchingPoller.pending.push({ path: targetPath, url: targetUrl });
+        // The tab reports the label it adopts on its next poll too; set it
+        // now so `status` names the new session right away.
+        matchingPoller.sessionLabel = sessionLabel;
+        matchingPoller.pending.push(event);
         res.json({ delivered: true });
         return;
       }
@@ -1123,11 +1136,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
+    matchingClient.sessionLabel = sessionLabel;
     matchingClient.response.write(
-      `event: open-request\ndata: ${JSON.stringify({
-        path: targetPath,
-        url: targetUrl,
-      })}\n\n`,
+      `event: open-request\ndata: ${JSON.stringify(event)}\n\n`,
     );
     res.json({ delivered: true });
   });

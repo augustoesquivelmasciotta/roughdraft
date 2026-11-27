@@ -54,6 +54,30 @@ describe("watchOpenRequests", () => {
     stop();
   });
 
+  it("reports the session label the tab holds at each poll", async () => {
+    let label: string | null = "plan-review";
+    const stop = watchOpenRequests(
+      "/work/draft.md",
+      () => {},
+      () => label,
+    );
+    await vi.advanceTimersByTimeAsync(100);
+    label = "spec-edit";
+    await vi.advanceTimersByTimeAsync(2_100);
+
+    const labels = fetchedUrls.map((entry) =>
+      new URL(entry, "http://localhost").searchParams.get("label"),
+    );
+    expect(labels.slice(0, 2)).toEqual(["plan-review", "spec-edit"]);
+    const clientIds = new Set(
+      fetchedUrls.map((entry) =>
+        new URL(entry, "http://localhost").searchParams.get("clientId"),
+      ),
+    );
+    expect(clientIds.size).toBe(1);
+    stop();
+  });
+
   it("stops polling once stopped", async () => {
     const stop = watchOpenRequests("/work/draft.md", () => {});
     await vi.advanceTimersByTimeAsync(2_500);
