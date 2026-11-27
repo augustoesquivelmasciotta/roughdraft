@@ -782,6 +782,7 @@ describe("createApp", () => {
       pid: process.pid,
       port: 4312,
       serverRoot,
+      instanceId: expect.any(String),
       stateless: true,
       documents: [],
       capabilities: {

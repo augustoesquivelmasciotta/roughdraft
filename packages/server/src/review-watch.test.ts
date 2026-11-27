@@ -30,8 +30,8 @@ function connectionReset(): TypeError {
  */
 function scriptedServer(
   answers: Array<
-    | { timedOut: true; nextSequence: number }
-    | { events: unknown[]; nextSequence: number }
+    | { timedOut: true; nextSequence: number; instanceId?: string }
+    | { events: unknown[]; nextSequence: number; instanceId?: string }
     | "reset"
     | number
   >,
@@ -166,7 +166,7 @@ describe("waitForReviewEvents connection loss", () => {
       ReviewWatchConnectionLostError,
     );
     expect(lost).toEqual(["lost"]);
-    // 1 s + 2 s + 4 s of backoff passes a 5 s window after four polls.
+    // 1 s + 2 s + 3 s of backoff passes a 5 s window after four polls.
     expect(server.bodies).toHaveLength(4);
   });
 
@@ -190,5 +190,110 @@ describe("waitForReviewEvents connection loss", () => {
     });
 
     expect(calls).toEqual(["lost", "back"]);
+  });
+});
+
+describe("waitForReviewEvents across a server restart", () => {
+  it("asks the restarted server at once and replays everything it has seen", async () => {
+    const server = scriptedServer([
+      { timedOut: true, nextSequence: 6, instanceId: "first" },
+      "reset",
+      // The quick poll after the reconnect, answered by the new server.
+      { timedOut: true, nextSequence: 1, instanceId: "second" },
+      { events: [{ sequence: 1 }], nextSequence: 2, instanceId: "second" },
+    ]);
+
+    const payload = await waitForReviewEvents({
+      fetchImpl: server.fetchImpl,
+      serverUrl: "http://localhost:7480",
+      target,
+      now: server.now,
+      sleep: server.sleep,
+    });
+
+    expect(payload.events).toEqual([{ sequence: 1 }]);
+    expect(server.bodies.map((body) => body.afterSequence)).toEqual([
+      undefined,
+      5,
+      5,
+      0,
+    ]);
+    expect(server.bodies[2]?.timeoutSeconds).toBe(0);
+  });
+
+  it("does not return events the stale cursor let through on the new server", async () => {
+    const server = scriptedServer([
+      { timedOut: true, nextSequence: 2, instanceId: "first" },
+      "reset",
+      { events: [{ sequence: 3 }], nextSequence: 4, instanceId: "second" },
+      {
+        events: [{ sequence: 1 }, { sequence: 2 }, { sequence: 3 }],
+        nextSequence: 4,
+        instanceId: "second",
+      },
+    ]);
+
+    const payload = await waitForReviewEvents({
+      fetchImpl: server.fetchImpl,
+      serverUrl: "http://localhost:7480",
+      target,
+      now: server.now,
+      sleep: server.sleep,
+    });
+
+    expect(payload.events).toEqual([
+      { sequence: 1 },
+      { sequence: 2 },
+      { sequence: 3 },
+    ]);
+  });
+
+  it("keeps its cursor when the same server answers again", async () => {
+    const server = scriptedServer([
+      { timedOut: true, nextSequence: 4, instanceId: "same" },
+      "reset",
+      { timedOut: true, nextSequence: 4, instanceId: "same" },
+      { events: [{ sequence: 4 }], nextSequence: 5, instanceId: "same" },
+    ]);
+
+    const payload = await waitForReviewEvents({
+      fetchImpl: server.fetchImpl,
+      serverUrl: "http://localhost:7480",
+      target,
+      now: server.now,
+      sleep: server.sleep,
+    });
+
+    expect(payload.events).toEqual([{ sequence: 4 }]);
+    expect(server.bodies.map((body) => body.afterSequence)).toEqual([
+      undefined,
+      3,
+      3,
+      3,
+    ]);
+    expect(server.bodies[2]?.timeoutSeconds).toBe(0);
+    expect(Number(server.bodies[3]?.timeoutSeconds)).toBeGreaterThan(0);
+  });
+
+  it("retries a lost server at least every three seconds", async () => {
+    const server = scriptedServer([
+      { timedOut: true, nextSequence: 1 },
+      ...Array.from({ length: 8 }, () => "reset" as const),
+      { events: [{ sequence: 1 }], nextSequence: 2 },
+    ]);
+    const delays: number[] = [];
+
+    await waitForReviewEvents({
+      fetchImpl: server.fetchImpl,
+      serverUrl: "http://localhost:7480",
+      target,
+      now: server.now,
+      sleep: async (milliseconds) => {
+        delays.push(milliseconds);
+        await server.sleep(milliseconds);
+      },
+    });
+
+    expect(Math.max(...delays)).toBeLessThanOrEqual(3_000);
   });
 });

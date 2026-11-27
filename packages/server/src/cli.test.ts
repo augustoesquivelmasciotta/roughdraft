@@ -2002,6 +2002,48 @@ describe("cli", () => {
       expect(test.errors.join("\n")).toContain("stopped during the review");
     });
 
+    it("completes the blocking open when the server restarts on the same port mid-round", async () => {
+      const test = createTestDependencies();
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, OPEN_THREAD_DRAFT);
+      fs.writeFileSync(path.join(projectDir, "earlier.md"), "# Earlier\n");
+      // Earlier rounds on the first server move its event sequence past
+      // where the restarted server starts counting.
+      const first = await ensureServerRunning(test.deps, { projectDir });
+      for (let round = 0; round < 3; round += 1) {
+        await fetch(`${first.server.url}/api/review-events`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectPath: projectDir, path: "earlier.md" }),
+        });
+      }
+
+      const openPromise = runCli(
+        ["open", documentPath, "--loop", "--json", "--batch-window", "0"],
+        test.deps,
+      );
+      const port = await waitForPersistedPort(test.deps.env);
+      for (const pid of [...serverByPid.keys()]) {
+        await test.deps.stopProcess(pid);
+      }
+      // `roughdraft start` (or an upgrade) brings a new server up on the
+      // same port; its event queue starts over.
+      await test.deps.spawnServerProcess({ port, projectDir });
+      await waitForPersistedPort(test.deps.env);
+      await submitDoneReviewing(port, { overallComment: "lgtm" });
+
+      const exitCode = await openPromise;
+      const payload = parseOnlyJsonLog<LoopPayload>(test.logs);
+
+      expect(exitCode).toBe(0);
+      expect(payload).toMatchObject({
+        timedOut: false,
+        done: true,
+        doneReason: "overall-comment",
+      });
+      expect(test.errors.join("\n")).toContain("Reconnected");
+    }, 15_000);
+
     it("rejects --loop together with --no-watch or --print-url", async () => {
       const test = createTestDependencies();
       const documentPath = path.join(projectDir, "draft.md");

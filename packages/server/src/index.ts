@@ -467,6 +467,10 @@ function listProjectTree(projectDir: string): ProjectTreeListing {
 
 export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const port = options.port ?? ROUGHDRAFT_DEFAULT_PORT;
+  // Names this server process. A watcher that reconnects after a restart
+  // compares it to tell a new server (whose event sequence starts over) from
+  // a dropped connection.
+  const instanceId = crypto.randomUUID();
   const homeDir = options.homeDir ?? os.homedir();
   const serverRoot = path.resolve(options.serverRoot ?? defaultServerRoot);
   const staticDirPath = options.staticDirPath ?? staticDir;
@@ -855,7 +859,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       batchWindowMs: batchWindowSeconds * 1000,
     });
 
-    res.json(result);
+    res.json({ ...result, instanceId });
   });
 
   app.get("/api/review-events/status", (req, res) => {
@@ -871,6 +875,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       relativePath: target.relativePath,
       watching: watcherCount > 0,
       watcherCount,
+      instanceId,
     });
   });
 
@@ -1000,6 +1005,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         ? path.resolve(options.projectDir)
         : undefined,
       serverRoot,
+      instanceId,
       stateless: true,
       documents: openDocuments(),
       capabilities: {
