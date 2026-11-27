@@ -1528,6 +1528,10 @@ export function App() {
 
   const applyDocumentPage = useCallback((nextDocument: Page) => {
     setDocumentPage(nextDocument);
+    // Callbacks that run before the next render (a handoff right after a
+    // flushed save) must see the saved version, or they re-save with a stale
+    // one and the server answers 409.
+    documentPageRef.current = nextDocument;
     documentDraftContentRef.current = nextDocument.content;
   }, []);
 

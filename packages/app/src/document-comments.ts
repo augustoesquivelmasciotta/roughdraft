@@ -1,9 +1,15 @@
 import {
   buildCommentThreads,
   type CriticComment,
+  type CriticCommentThread,
   flattenCommentThreads,
   getCommentDescendantIds,
 } from "./critic-markup";
+
+export interface CollapsedCommentThread {
+  thread: CriticCommentThread;
+  hiddenReplyCount: number;
+}
 
 interface CommentAnchorMeasurement {
   commentIds: string[];
@@ -132,6 +138,42 @@ export function getRootThreadIdForCommentId(
   }
 
   return comments.has(commentId) ? commentId : null;
+}
+
+export function getCommentThreadReplies(
+  thread: CriticCommentThread,
+): CriticComment[] {
+  return flattenCommentThreads([thread]).slice(1);
+}
+
+function getCommentTimestamp(comment: CriticComment): number {
+  const timestamp = Date.parse(comment.createdAt);
+  return Number.isNaN(timestamp) ? Number.NEGATIVE_INFINITY : timestamp;
+}
+
+export function collapseCommentThread(
+  thread: CriticCommentThread,
+): CollapsedCommentThread {
+  const replies = getCommentThreadReplies(thread);
+
+  if (replies.length <= 1) {
+    return { thread, hiddenReplyCount: 0 };
+  }
+
+  let newestReply = replies[0] as CriticComment;
+  for (const reply of replies) {
+    if (getCommentTimestamp(reply) >= getCommentTimestamp(newestReply)) {
+      newestReply = reply;
+    }
+  }
+
+  return {
+    thread: {
+      comment: thread.comment,
+      replies: [{ comment: newestReply, replies: [] }],
+    },
+    hiddenReplyCount: replies.length - 1,
+  };
 }
 
 export function getCommentAnchorMeasurements(

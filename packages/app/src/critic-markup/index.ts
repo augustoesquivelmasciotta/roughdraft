@@ -18,10 +18,13 @@ import {
   type TokenizerThis,
   type Tokens,
 } from "marked";
+import { Transform } from "@tiptap/pm/transform";
 import type TurndownService from "turndown";
 import {
+  applyCriticChangeDecision,
   createEditorExtensions,
   type CriticChangeAttrs,
+  type CriticChangeDecision,
   type CriticChangeKind,
 } from "../editor-extensions";
 import {
@@ -89,7 +92,12 @@ export interface CriticCommentThread {
   replies: CriticCommentThread[];
 }
 
-export type { CriticChangeAttrs, CriticChangeKind, DeletedCommentRecord };
+export type {
+  CriticChangeAttrs,
+  CriticChangeDecision,
+  CriticChangeKind,
+  DeletedCommentRecord,
+};
 
 type ChangeMetadataFormat = "attributes" | "reference";
 
@@ -140,12 +148,68 @@ function getEditorSchema(): Schema {
   return cachedSchema;
 }
 
-const criticCommentAnchorPattern = /^\{==([\s\S]+?)==\}/;
-const criticCommentBlockPattern =
-  /^\{>>([\s\S]*?)<<\}(?:(\{@([\s\S]+?)@\})|(\{(?:\s*[A-Za-z][A-Za-z0-9_-]*="(?:\\[\s\S]|[^"\\])*")+\s*\})|(\{#[A-Za-z][A-Za-z0-9_-]*\}))?/;
-const criticAdditionPattern = /^\{\+\+([\s\S]+?)\+\+\}/;
-const criticDeletionPattern = /^\{--([\s\S]+?)--\}/;
-const criticSubstitutionPattern = /^\{~~([\s\S]+?)~>([\s\S]+?)~~\}/;
+// Text written between review delimiters would otherwise reopen or close the
+// marker holding it, so every delimiter is written with a leading backslash and
+// read back without it. A comment body is a plain string and unescapes through
+// `unescapeCriticMarkupText`. Marker text is Markdown and stays escaped through
+// the lexer, which both consumes the escapes and keeps a typed delimiter from
+// becoming a marker. The lexer consumes those escapes, but not all of them:
+// `unescapeInertMarkerTokens` strips the ones that survive it, without which
+// the next save escaped them again and the backslashes doubled on every save.
+const criticDelimiterEscapePattern =
+  /\\|\{==|==\}|\{>>|<<\}|\{\+\+|\+\+\}|\{--|--\}|\{~~|~~\}|~>/g;
+const criticDelimiterUnescapePattern =
+  /\\(\\|\{==|==\}|\{>>|<<\}|\{\+\+|\+\+\}|\{--|--\}|\{~~|~~\}|~>)/g;
+// Scanning for a marker's closing delimiter treats a backslash as covering the
+// character after it, which is what makes an escaped delimiter literal. A
+// document written before escaping existed can end a marker's text with a bare
+// backslash, and that scan reads it as escaping the close. Each marker
+// therefore has a legacy form as well, which reads every backslash as ordinary
+// text, tried when the escape-aware form does not match. Both forms come from
+// one shape so they cannot drift.
+//
+// What bounds the escape-aware form is that a marker's text cannot contain an
+// unescaped opening delimiter: an unescaped opener is another marker starting,
+// so the text ended before it. Without that bound the scan ran on to a later
+// marker's closing delimiter and the first marker swallowed everything between,
+// taking the marker in between with it. The bound never fires on a document
+// this format wrote, because every opener in its marker text is escaped.
+const markerOpenerAlternatives = String.raw`\{==|\{>>|\{\+\+|\{--|\{~~`;
+const markerTextAtom = String.raw`(?:\\[\s\S]|(?!${markerOpenerAlternatives})[^\\])`;
+const legacyMarkerTextAtom = String.raw`[\s\S]`;
+
+interface MarkerPattern {
+  escaped: RegExp;
+  legacy: RegExp;
+}
+
+function markerPattern(build: (textAtom: string) => string): MarkerPattern {
+  return {
+    escaped: new RegExp(build(markerTextAtom)),
+    legacy: new RegExp(build(legacyMarkerTextAtom)),
+  };
+}
+
+function matchMarker(src: string, pattern: MarkerPattern) {
+  return src.match(pattern.escaped) ?? src.match(pattern.legacy);
+}
+
+const criticCommentAnchorPattern = markerPattern(
+  (text) => String.raw`^\{==(${text}+?)==\}`,
+);
+const criticCommentBlockPattern = markerPattern(
+  (text) =>
+    String.raw`^\{>>(${text}*?)<<\}(?:(\{@([\s\S]+?)@\})|(\{(?:\s*[A-Za-z][A-Za-z0-9_-]*="(?:\\[\s\S]|[^"\\])*")+\s*\})|(\{#[A-Za-z][A-Za-z0-9_-]*\}))?`,
+);
+const criticAdditionPattern = markerPattern(
+  (text) => String.raw`^\{\+\+(${text}+?)\+\+\}`,
+);
+const criticDeletionPattern = markerPattern(
+  (text) => String.raw`^\{--(${text}+?)--\}`,
+);
+const criticSubstitutionPattern = markerPattern(
+  (text) => String.raw`^\{~~(${text}+?)~>(${text}+?)~~\}`,
+);
 const attributeMetadataBlockPattern =
   /^\{(?:\s*[A-Za-z][A-Za-z0-9_-]*="(?:\\[\s\S]|[^"\\])*")+\s*\}/;
 const metadataAttributePattern =
@@ -182,6 +246,94 @@ function createEndmatterContext(
     comments: firstEntries(parsed.commentEntries),
     suggestions: firstEntries(parsed.suggestionEntries),
   };
+}
+
+export function escapeCriticMarkupText(text: string): string {
+  return text.replace(criticDelimiterEscapePattern, "\\$&");
+}
+
+export function unescapeCriticMarkupText(text: string): string {
+  return text.replace(criticDelimiterUnescapePattern, "$1");
+}
+
+function isAutolinkToken(token: Tokens.Link): boolean {
+  return token.raw.startsWith("<") && token.raw.endsWith(">");
+}
+
+// Marker text is lexed while still escaped, which is what keeps a delimiter the
+// reviewer typed from becoming a marker, and the lexer consumes the escapes as
+// it goes. It does not consume all of them, and the ones that survive have two
+// separate causes, so a reader that enumerates only the first misses the rest:
+//
+//  - Markdown leaves a backslash alone in a code span, an autolink and raw
+//    HTML, so text taken from those still carries this format's escapes.
+//  - `createTurndownService` escapes backslashes itself when it writes a quoted
+//    link or image title, and this format's escape then escapes that. Reading
+//    peels the serializer's layer and leaves this one.
+//
+// Either way a backslash survives into the next save, which escapes it again
+// and doubles it. Both are stripped here. Every other token has already had its
+// escapes consumed, and unescaping it a second time would eat a backslash the
+// reviewer typed.
+//
+// Two of the branches below cannot be covered by a test today, for opposite
+// reasons, and the difference is why one is absent and one is present:
+//
+//  - Raw HTML is on the first list and has no branch. Its content is destroyed
+//    before it ever reaches the writer, so unescaping it could not change a
+//    byte of any output, under this editor or a later one.
+//  - An image title has a branch that no test can reach. An image title is
+//    written back intact on every save; only the image's position changes,
+//    because the editor lifts an inline image out of its paragraph and so
+//    carries it out of the marker, and marker text is the only input this walk
+//    ever sees. Fix that and an image title behaves exactly like a link title,
+//    which does double without this branch. Deleting it as dead code would
+//    reintroduce that doubling through a change that looks unrelated.
+function unescapeInertMarkerTokens(tokens: Token[]): Token[] {
+  for (const token of tokens) {
+    if (token.type === "codespan") {
+      token.text = unescapeCriticMarkupText(token.text);
+      continue;
+    }
+
+    if (token.type === "image") {
+      const image = token as Tokens.Image;
+      if (image.title) {
+        image.title = unescapeCriticMarkupText(image.title);
+      }
+      continue;
+    }
+
+    if (token.type === "link") {
+      const link = token as Tokens.Link;
+
+      if (isAutolinkToken(link)) {
+        link.href = unescapeCriticMarkupText(link.href);
+        link.text = unescapeCriticMarkupText(link.text);
+        for (const child of link.tokens ?? []) {
+          if (child.type === "text") {
+            child.text = unescapeCriticMarkupText(child.text);
+          }
+        }
+        continue;
+      }
+
+      if (link.title) {
+        link.title = unescapeCriticMarkupText(link.title);
+      }
+    }
+
+    const childTokens = (token as Tokens.Generic).tokens;
+    if (Array.isArray(childTokens)) {
+      unescapeInertMarkerTokens(childTokens);
+    }
+  }
+
+  return tokens;
+}
+
+function lexMarkerText(lexer: TokenizerThis["lexer"], text: string): Token[] {
+  return unescapeInertMarkerTokens(lexer.inlineTokens(text));
 }
 
 function escapeHtml(value: string): string {
@@ -371,12 +523,13 @@ function serializeChangeAttributeMetadata(change: CriticChangeAttrs): string {
 }
 
 /**
- * A comment body can be written inline only when it is a single line without
- * CriticMarkup delimiters. Anything else (pasted articles, lists, headings,
- * literal review syntax) would break the surrounding paragraph.
+ * A comment body can be written inline only when it is a single line.
+ * Anything longer (pasted articles, lists, headings) would break the
+ * surrounding paragraph. Literal review syntax is fine inline: the writer
+ * escapes every delimiter, so it can no longer close or reopen the marker.
  */
 export function isInlineSafeCommentBody(body: string): boolean {
-  return !/[\r\n]/.test(body) && !criticDelimiterPattern.test(body);
+  return !/[\r\n]/.test(body);
 }
 
 function inlineCommentExcerpt(body: string): string {
@@ -791,7 +944,7 @@ function parseCommentBlockMatch(
   return registerParsedComment(
     state,
     partial,
-    fullBody ?? commentText ?? "",
+    fullBody ?? unescapeCriticMarkupText(commentText ?? ""),
     block,
   );
 }
@@ -806,7 +959,10 @@ function tokenizeCommentBlocks(
   const block: CommentBlockContext = { ids: [], renames: new Map() };
 
   while (nextOffset < src.length) {
-    const nextMatch = src.slice(nextOffset).match(criticCommentBlockPattern);
+    const nextMatch = matchMarker(
+      src.slice(nextOffset),
+      criticCommentBlockPattern,
+    );
     if (!nextMatch) break;
 
     parseCommentBlockMatch(state, nextMatch, block);
@@ -822,7 +978,7 @@ function tokenizeCriticCommentAnchor(
   lexer: TokenizerThis["lexer"],
   src: string,
 ): CriticCommentToken | undefined {
-  const anchorMatch = src.match(criticCommentAnchorPattern);
+  const anchorMatch = matchMarker(src, criticCommentAnchorPattern);
   if (!anchorMatch) return undefined;
 
   const [, anchor] = anchorMatch;
@@ -833,7 +989,7 @@ function tokenizeCriticCommentAnchor(
     type: "criticCommentAnchor",
     raw: anchorMatch[0] + blocks.raw,
     commentIds: blocks.commentIds,
-    tokens: lexer.inlineTokens(anchor ?? ""),
+    tokens: lexMarkerText(lexer, anchor ?? ""),
   };
 }
 
@@ -854,12 +1010,14 @@ function tokenizeCriticChange(
   lexer: TokenizerThis["lexer"],
   src: string,
 ): CriticChangeToken | undefined {
-  const additionMatch = src.match(criticAdditionPattern);
-  const deletionMatch = additionMatch ? null : src.match(criticDeletionPattern);
+  const additionMatch = matchMarker(src, criticAdditionPattern);
+  const deletionMatch = additionMatch
+    ? null
+    : matchMarker(src, criticDeletionPattern);
   const substitutionMatch =
     additionMatch || deletionMatch
       ? null
-      : src.match(criticSubstitutionPattern);
+      : matchMarker(src, criticSubstitutionPattern);
   const match = additionMatch ?? deletionMatch ?? substitutionMatch;
   if (!match) return undefined;
 
@@ -883,8 +1041,8 @@ function tokenizeCriticChange(
       raw,
       change,
       commentIds: trailingComments.commentIds,
-      oldTokens: lexer.inlineTokens(substitutionMatch[1] ?? ""),
-      newTokens: lexer.inlineTokens(substitutionMatch[2] ?? ""),
+      oldTokens: lexMarkerText(lexer, substitutionMatch[1] ?? ""),
+      newTokens: lexMarkerText(lexer, substitutionMatch[2] ?? ""),
     };
   }
 
@@ -893,7 +1051,7 @@ function tokenizeCriticChange(
     raw,
     change,
     commentIds: trailingComments.commentIds,
-    tokens: lexer.inlineTokens(match[1] ?? ""),
+    tokens: lexMarkerText(lexer, match[1] ?? ""),
   };
 }
 
@@ -923,7 +1081,10 @@ function renderCriticCodeText(state: CriticParseState, text: string) {
   let offset = 0;
 
   while (offset < text.length) {
-    const anchorMatch = text.slice(offset).match(criticCommentAnchorPattern);
+    const anchorMatch = matchMarker(
+      text.slice(offset),
+      criticCommentAnchorPattern,
+    );
 
     if (!anchorMatch) {
       result += escapeHtml(text[offset] ?? "");
@@ -946,7 +1107,7 @@ function renderCriticCodeText(state: CriticParseState, text: string) {
 
     result += `<span data-comment-ids="${escapeHtml(
       JSON.stringify(blocks.commentIds),
-    )}">${escapeHtml(anchor ?? "")}</span>`;
+    )}">${escapeHtml(unescapeCriticMarkupText(anchor ?? ""))}</span>`;
     offset += anchorMatch[0].length + blocks.raw.length;
   }
 
@@ -1182,14 +1343,113 @@ export function criticMarkdownToRenderedHtml(
   };
 }
 
+// Ported from kudzuweb/roughdraftplus #24 (PR #97). A change mark that covers
+// only whitespace was lost on both sides of the conversion: Turndown reads an
+// inline element holding only whitespace as blank and lifts the whitespace
+// out of it, and the editor's HTML parser collapses whitespace that sits
+// between two inline elements. That whitespace is padded with a private-use
+// character on the way through and the padding taken back out. It is not a
+// zero-width space because an author can type one of those.
+const criticWhitespacePlaceholder = "";
+
+function stripCriticWhitespacePlaceholder(text: string): string {
+  return text.replaceAll(criticWhitespacePlaceholder, "");
+}
+
+function padCriticWhitespace(text: string): string {
+  return `${criticWhitespacePlaceholder}${text}${criticWhitespacePlaceholder}`;
+}
+
+/**
+ * The whitespace a marker covers, when it covers nothing else, and null when
+ * it covers anything more. Markdown cannot wrap whitespace alone in emphasis
+ * or a link, so a marker over whitespace is written as the bare whitespace and
+ * the runs on either side keep their own formatting. Turndown would write
+ * `** **` around a space, which reads back as two asterisks rather than bold.
+ */
+function whitespaceOnlyChangeText(element: HTMLElement): string | null {
+  let text = "";
+
+  const visit = (node: ChildNode): boolean => {
+    if (node.nodeType === 3) {
+      const value = stripCriticWhitespacePlaceholder(node.nodeValue ?? "");
+      if (/\S/.test(value)) return false;
+
+      text += value;
+      return true;
+    }
+
+    if (node.nodeType !== 1) return true;
+    if (node.nodeName === "BR") return false;
+
+    return [...node.childNodes].every(visit);
+  };
+
+  if (![...element.childNodes].every(visit)) return null;
+
+  return text.length > 0 ? text : null;
+}
+
+/**
+ * A change span holding only whitespace, padded so the editor's HTML parser
+ * keeps it. A span whose content is only whitespace holds no tags, so this
+ * reaches its own closing tag without balancing anything.
+ */
+const whitespaceOnlyChangeSpan =
+  /(<span data-critic-change-kind="[^"]*"[^>]*>)(\s+)(<\/span>)/g;
+
+function padWhitespaceChangeSpans(html: string): string {
+  return html.replace(
+    whitespaceOnlyChangeSpan,
+    (_match, open: string, whitespace: string, close: string) =>
+      `${open}${padCriticWhitespace(whitespace)}${close}`,
+  );
+}
+
+/** Takes that padding back out of a change's own text in parsed nodes. */
+function stripWhitespaceChangePadding(node: JSONContent): JSONContent {
+  if (
+    node.type === "text" &&
+    typeof node.text === "string" &&
+    (node.marks ?? []).some((mark) => mark.type === "criticChange")
+  ) {
+    return { ...node, text: stripCriticWhitespacePlaceholder(node.text) };
+  }
+
+  if (!node.content) return node;
+
+  return { ...node, content: node.content.map(stripWhitespaceChangePadding) };
+}
+
+/**
+ * Pads whitespace-only change text before Turndown sees it, which makes the
+ * element ordinary text; `serializeCriticChangeElement` takes the padding
+ * back out of every text it writes.
+ */
+function padWhitespaceChangeText(node: JSONContent): JSONContent {
+  if (
+    node.type === "text" &&
+    typeof node.text === "string" &&
+    node.text.length > 0 &&
+    node.text.trim() === "" &&
+    (node.marks ?? []).some((mark) => mark.type === "criticChange")
+  ) {
+    return { ...node, text: padCriticWhitespace(node.text) };
+  }
+
+  if (!node.content) return node;
+
+  return { ...node, content: node.content.map(padWhitespaceChangeText) };
+}
+
 function htmlToTopLevelNodes(html: string): JSONContent[] {
   if (!html.trim()) return [];
 
   const schema = getEditorSchema();
   const parsed = ProseMirrorDOMParser.fromSchema(schema)
-    .parse(elementFromString(html))
+    .parse(elementFromString(padWhitespaceChangeSpans(html)))
     .toJSON() as JSONContent;
-  const nodes = parsed.content ?? [];
+  const nodes = (parsed.content ?? []).map(stripWhitespaceChangePadding);
   const isOnlyAnEmptyParagraph =
     nodes.length === 1 &&
     nodes[0]?.type === "paragraph" &&
@@ -1410,11 +1670,11 @@ function serializeCommentBlocks(
     context.emittedCommentIds.add(comment.id);
     result +=
       placement === "attributes"
-        ? `{>>${comment.content}<<}${serializeAttributeMetadata(comment)}`
+        ? `{>>${escapeCriticMarkupText(comment.content)}<<}${serializeAttributeMetadata(comment)}`
         : `{>>${
             isInlineSafeCommentBody(comment.content)
-              ? comment.content
-              : inlineCommentExcerpt(comment.content)
+              ? escapeCriticMarkupText(comment.content)
+              : escapeCriticMarkupText(inlineCommentExcerpt(comment.content))
           }<<}{#${comment.id}}`;
   }
 
@@ -1509,15 +1769,27 @@ function changeMetadata(
     : serializeChangeAttributeMetadata(change);
 }
 
+/**
+ * `readPairedText` reads the other half of a substitution. It defaults to the
+ * turndown pass a substitution in prose needs; a fence passes the code
+ * element's own text instead, since turndown would collapse the replacement's
+ * newlines to spaces.
+ */
 function serializeCriticChangeElement(
   service: TurndownService,
   element: HTMLElement,
   content: string,
   context: CriticSerializeContext,
   extraCommentIds: string[] = [],
+  readPairedText: (paired: HTMLElement) => string = (paired) =>
+    service.turndown(paired.innerHTML).trim(),
 ) {
   const change = getElementChangeAttrs(element);
-  if (!change) return content;
+  // Every text this marker writes passes through here, so this is where the
+  // whitespace padding comes back out. One mark can cover a padded space and
+  // formatted text at once, and the padding has to leave with either.
+  const changeContent = stripCriticWhitespacePlaceholder(content);
+  if (!change) return changeContent;
 
   if (
     change.kind === "substitution-new" &&
@@ -1543,7 +1815,10 @@ function serializeCriticChangeElement(
       "substitution-new",
       change.changeId,
     )
-      ? service.turndown(nextElement.innerHTML).trim()
+      ? escapeCriticMarkupText(
+          whitespaceOnlyChangeText(nextElement) ??
+            stripCriticWhitespacePlaceholder(readPairedText(nextElement)),
+        )
       : null;
   const writtenKind =
     change.kind === "substitution-new"
@@ -1553,19 +1828,23 @@ function serializeCriticChangeElement(
         : change.kind;
   const claimed = claimChangeId({ ...change, kind: writtenKind }, context);
   const metadata = changeMetadata(claimed, change.changeId, context);
+  const markerText = escapeCriticMarkupText(
+    whitespaceOnlyChangeText(element) ?? changeContent,
+  );
 
   if (writtenKind === "addition") {
-    return `{++${content}++}${metadata}${commentBlocks}`;
+    return `{++${markerText}++}${metadata}${commentBlocks}`;
   }
 
   if (writtenKind === "deletion") {
-    return `{--${content}--}${metadata}${commentBlocks}`;
+    return `{--${markerText}--}${metadata}${commentBlocks}`;
   }
 
-  return `{~~${content}~>${pairedReplacement ?? ""}~~}${metadata}${commentBlocks}`;
+  return `{~~${markerText}~>${pairedReplacement ?? ""}~~}${metadata}${commentBlocks}`;
 }
 
 function serializeCodeElementContent(
+  service: TurndownService,
   node: Node,
   context: CriticSerializeContext,
 ): string {
@@ -1582,13 +1861,33 @@ function serializeCodeElementContent(
       continue;
     }
 
-    const inner = serializeCodeElementContent(child, context);
+    // A change mark inside a fence is only reachable by editing one there.
+    // Its text is source text, so it is read as-is rather than through
+    // turndown, which would collapse its newlines to spaces.
+    const changeElement = child.hasAttribute("data-critic-change-kind")
+      ? child
+      : child.querySelector("span[data-critic-change-kind]");
+    if (changeElement instanceof HTMLElement) {
+      result += serializeCriticChangeElement(
+        service,
+        changeElement,
+        changeElement.textContent ?? "",
+        context,
+        changeElement === child ? [] : getElementCommentIds(child),
+        (paired) => paired.textContent ?? "",
+      );
+      continue;
+    }
+
+    const inner = serializeCodeElementContent(service, child, context);
     if (child.hasAttribute("data-comment-ids")) {
       const commentBlocks = serializeCommentBlocks(
         getElementCommentIds(child),
         context,
       );
-      result += commentBlocks ? `{==${inner}==}${commentBlocks}` : inner;
+      result += commentBlocks
+        ? `{==${escapeCriticMarkupText(inner)}==}${commentBlocks}`
+        : inner;
       continue;
     }
 
@@ -1635,7 +1934,7 @@ function createCriticTurndownService(contextRef: {
       if (content === unanchoredCommentSentinel) return commentBlocks;
       if (!commentBlocks) return content;
 
-      return `{==${content}==}${commentBlocks}`;
+      return `{==${escapeCriticMarkupText(content)}==}${commentBlocks}`;
     },
   });
 
@@ -1672,6 +1971,7 @@ function createCriticTurndownService(contextRef: {
           ? storedInfo
           : language;
       const body = serializeCodeElementContent(
+        service,
         code,
         contextRef.current,
       ).replace(/\n$/, "");
@@ -1820,7 +2120,9 @@ export function editorStateToCriticMarkdown(
     contextRef.current = context;
     try {
       const html = getHTMLFromFragment(
-        Fragment.from(ProseMirrorNode.fromJSON(schema, node)),
+        Fragment.from(
+          ProseMirrorNode.fromJSON(schema, padWhitespaceChangeText(node)),
+        ),
         schema,
       );
       return collapseBlankLines(service.turndown(html)).trim();
@@ -1866,7 +2168,7 @@ export function editorStateToCriticMarkdown(
     });
   } else {
     const html = getHTMLFromFragment(
-      ProseMirrorNode.fromJSON(schema, doc).content,
+      ProseMirrorNode.fromJSON(schema, padWhitespaceChangeText(doc)).content,
       schema,
     );
     body = normalizeBlockSpacing(`${service.turndown(html).trimEnd()}\n`);
@@ -1916,6 +2218,155 @@ export function editorStateToCriticMarkdown(
   return prependYamlFrontmatter(markdown, frontmatter);
 }
 
+/**
+ * Review decisions the reviewer made in the rail that wait for "I'm done".
+ * `approvedCommentIds` are agent replies the reviewer approved: approving one
+ * resolves the thread it belongs to, which is this fork's Resolve applied at
+ * the handoff (ported from kudzuweb/roughdraftplus #9). `changeDecisions`
+ * accept, reject or edit a suggestion mark, which leaves plain prose and
+ * takes the mark's reply thread with it (roughdraftplus #12).
+ */
+export interface PendingReviewDecisions {
+  approvedCommentIds?: readonly string[];
+  changeDecisions?: readonly CriticChangeDecision[];
+}
+
+/**
+ * Every comment in a suggestion's own thread: replies to the mark and their
+ * descendants. They leave with the mark when it is decided.
+ */
+export function getSuggestionThreadCommentIds(
+  changeId: string,
+  comments: ReadonlyMap<string, CriticComment>,
+): string[] {
+  const replyIds = [...comments.values()]
+    .filter((comment) => comment.parentCommentId === changeId)
+    .map((comment) => comment.id);
+
+  return [
+    ...replyIds,
+    ...replyIds.flatMap((commentId) =>
+      getCommentDescendantIds(commentId, comments),
+    ),
+  ];
+}
+
+/** Drops these comment ids from every comment highlight in a document. */
+function removeCommentIdsFromDoc(
+  node: JSONContent,
+  commentIds: ReadonlySet<string>,
+): JSONContent {
+  const marks = node.marks?.flatMap((mark) => {
+    if (mark.type !== "commentRef") return [mark];
+
+    const currentIds = Array.isArray(mark.attrs?.commentIds)
+      ? (mark.attrs.commentIds as string[])
+      : [];
+    const nextIds = currentIds.filter((id) => !commentIds.has(id));
+
+    if (nextIds.length === currentIds.length) return [mark];
+    if (nextIds.length === 0) return [];
+    return [{ ...mark, attrs: { ...mark.attrs, commentIds: nextIds } }];
+  });
+  const content = node.content?.map((child) =>
+    removeCommentIdsFromDoc(child, commentIds),
+  );
+
+  return {
+    ...node,
+    ...(marks ? { marks } : {}),
+    ...(content ? { content } : {}),
+  };
+}
+
+/** The root comment of the thread a comment belongs to. */
+function getThreadRootCommentId(
+  commentId: string,
+  comments: ReadonlyMap<string, CriticComment>,
+): string | null {
+  const visited = new Set<string>();
+  let current = comments.get(commentId);
+
+  while (current?.parentCommentId && !visited.has(current.id)) {
+    visited.add(current.id);
+    const parent = comments.get(current.parentCommentId);
+    if (!parent) break;
+    current = parent;
+  }
+
+  return current?.id ?? null;
+}
+
+/** The thread roots that approving these agent replies resolves. */
+export function getApprovedThreadRootIds(
+  approvedCommentIds: Iterable<string>,
+  comments: ReadonlyMap<string, CriticComment>,
+): string[] {
+  const rootIds = new Set<string>();
+
+  for (const commentId of approvedCommentIds) {
+    const rootId = getThreadRootCommentId(commentId, comments);
+    const root = rootId ? comments.get(rootId) : undefined;
+    if (root && root.status !== "resolved") rootIds.add(root.id);
+  }
+
+  return [...rootIds];
+}
+
+/**
+ * Applies pending review decisions to a Markdown document without a mounted
+ * editor, which is what "I'm done" does from code view. Blocks nobody decided
+ * on keep their bytes. Returns the input untouched when nothing applies.
+ */
+export function applyPendingReviewDecisionsToCriticMarkdown(
+  markdown: string,
+  decisions: PendingReviewDecisions,
+  options?: MarkdownOptions,
+): string {
+  const { doc, comments } = criticMarkdownToEditorState(markdown, options);
+  const resolvedRootIds = getApprovedThreadRootIds(
+    decisions.approvedCommentIds ?? [],
+    comments,
+  );
+  const transform = new Transform(getEditorSchema().nodeFromJSON(doc));
+  const removedCommentIds = new Set<string>();
+  let appliedDecisions = 0;
+
+  for (const decision of decisions.changeDecisions ?? []) {
+    if (!applyCriticChangeDecision(transform, decision)) continue;
+
+    appliedDecisions += 1;
+    for (const commentId of getSuggestionThreadCommentIds(
+      decision.changeId,
+      comments,
+    )) {
+      removedCommentIds.add(commentId);
+    }
+  }
+
+  if (resolvedRootIds.length === 0 && appliedDecisions === 0) return markdown;
+
+  const nextComments = new Map(comments);
+  for (const commentId of removedCommentIds) nextComments.delete(commentId);
+  for (const rootId of resolvedRootIds) {
+    const root = nextComments.get(rootId);
+    if (root) nextComments.set(rootId, { ...root, status: "resolved" });
+  }
+
+  // The transformed document drops the parser's extras (frontmatter,
+  // endmatter, source snapshot); carry them over so untouched blocks keep
+  // their bytes.
+  const decidedDoc = {
+    ...doc,
+    ...removeCommentIdsFromDoc(
+      transform.doc.toJSON() as JSONContent,
+      removedCommentIds,
+    ),
+  };
+
+  return editorStateToCriticMarkdown(decidedDoc, nextComments);
+}
+
 export function createCriticComment(
   partial?: Partial<CriticComment>,
   options?: {
@@ -1948,6 +2399,25 @@ export function createCriticChange(
  * Builds the record kept in the endmatter `deleted` list when a comment is
  * deleted.
  */
+/**
+ * The ids among these whose comment flags its anchor text as filler written
+ * only to carry the thread (`anchor="disposable"`, ported from
+ * kudzuweb/roughdraftplus #17). Clearing such a thread removes the anchor
+ * text too. The flag is read only from an inline attribute block.
+ */
+export function disposableAnchorCommentIds(
+  commentIds: Iterable<string>,
+  comments: ReadonlyMap<string, CriticComment>,
+): string[] {
+  return [...commentIds].filter((commentId) => {
+    const comment = comments.get(commentId);
+    return (
+      comment?.metadataFormat === "attributes" &&
+      comment.extraMetadata?.anchor === "disposable"
+    );
+  });
+}
+
 export function createDeletedCommentRecord(
   comment: CriticComment,
   options?: { deletedAt?: string; anchor?: string | null },

@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { Editor } from "@tiptap/core";
+import { Editor, type JSONContent } from "@tiptap/core";
 import {
+  type CriticComment,
   createCriticChange,
   createNextChangeId,
   createNextCommentId,
@@ -1145,5 +1146,343 @@ describe("Markdown rich-text round-trip regressions", () => {
     ].join("\n");
 
     expect(richTextRoundTrip(input)).toBe(input);
+  });
+});
+
+describe("CriticMarkup delimiter escaping", () => {
+  // Every sequence that can reopen or close a review marker, plus the escape
+  // character itself, in one payload.
+  const typedText = String.raw`back\slash {==a==} {>>b<<} {++c++} {--d--} {~~e~>f~~} g~>h`;
+  const escapedText = String.raw`back\\slash \{==a\==} \{>>b\<<} \{++c\++} \{--d\--} \{~~e\~>f\~~} g\~>h`;
+  const commentMetadata = '{id="c1" by="user" at="2026-04-23T18:00:00.000Z"}';
+
+  function findFirstLinkTitle(node: JSONContent): string | undefined {
+    for (const mark of node.marks ?? []) {
+      if (mark.type === "link" && typeof mark.attrs?.title === "string") {
+        return mark.attrs.title;
+      }
+    }
+
+    for (const child of node.content ?? []) {
+      const title = findFirstLinkTitle(child);
+      if (title !== undefined) return title;
+    }
+
+    return undefined;
+  }
+
+  // A save writes an untouched block back byte for byte, so these helpers
+  // drop the parser's source snapshot to make the writer serialize the block
+  // the way it does once the reviewer has edited it.
+  function rewrite(doc: JSONContent, comments: Map<string, CriticComment>) {
+    const { roughdraftSource: _source, ...fresh } = doc as JSONContent & {
+      roughdraftSource?: unknown;
+    };
+    return editorStateToCriticMarkdown(fresh, comments);
+  }
+
+  function collectDocText(node: JSONContent): string {
+    if (typeof node.text === "string") return node.text;
+    return (node.content ?? []).map(collectDocText).join("");
+  }
+
+  it("reads an escaped comment body back as the text the reviewer typed", () => {
+    const input = `Review {==this claim==}{>>${escapedText}<<}${commentMetadata}.\n`;
+
+    const { doc, comments } = criticMarkdownToEditorState(input);
+
+    expect(comments.size).toBe(1);
+    expect(comments.get("c1")?.content).toBe(typedText);
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+  });
+
+  it("escapes a comment body so typed markup never becomes live markup", () => {
+    const input = `Review {==this claim==}{>>Needs a source.<<}${commentMetadata}.\n`;
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    const comment = comments.get("c1");
+    if (!comment) throw new Error("Expected comment c1");
+    comments.set("c1", { ...comment, content: typedText });
+
+    const saved = editorStateToCriticMarkdown(doc, comments);
+    expect(saved).toContain(`{>>${escapedText}<<}`);
+
+    const reloaded = criticMarkdownToEditorState(saved);
+    expect(reloaded.comments.size).toBe(1);
+    expect(reloaded.comments.get("c1")?.content).toBe(typedText);
+    expect(editorStateToCriticMarkdown(reloaded.doc, reloaded.comments)).toBe(
+      saved,
+    );
+  });
+
+  it("keeps a reply body literal without allocating a second thread", () => {
+    const input = `${[
+      `Review {==this claim==}{>>Needs a source.<<}${commentMetadata}`,
+      `{>>${escapedText}<<}{id="c2" by="AI" at="2026-04-23T18:05:00.000Z" re="c1"}.`,
+    ].join("")}\n`;
+
+    const { doc, comments } = criticMarkdownToEditorState(input);
+
+    expect(comments.size).toBe(2);
+    expect(comments.get("c2")).toMatchObject({
+      content: typedText,
+      parentCommentId: "c1",
+    });
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+  });
+
+  it("keeps an insertion mark's text literal", () => {
+    const input = `Add {++${escapedText}++}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} here.\n`;
+
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    const { changes } = criticMarkdownToRenderedHtml(input);
+
+    expect(collectDocText(doc)).toBe(`Add ${typedText} here.`);
+    expect([...changes.keys()]).toEqual(["s1"]);
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+  });
+
+  it("keeps a deletion mark's text literal", () => {
+    const input = `Drop {--${escapedText}--}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} here.\n`;
+
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    const { changes } = criticMarkdownToRenderedHtml(input);
+
+    expect(collectDocText(doc)).toBe(`Drop ${typedText} here.`);
+    expect([...changes.keys()]).toEqual(["s1"]);
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+  });
+
+  it("keeps both halves of a substitution literal", () => {
+    const input = `Use {~~${escapedText}~>${escapedText}~~}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} instead.\n`;
+
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    const { changes } = criticMarkdownToRenderedHtml(input);
+
+    expect(collectDocText(doc)).toBe(`Use ${typedText}${typedText} instead.`);
+    expect([...changes.keys()]).toEqual(["s1"]);
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+  });
+
+  it("keeps a comment anchor's text literal", () => {
+    const input = `Review {==${escapedText}==}{>>Needs a source.<<}${commentMetadata}.\n`;
+
+    const { doc, comments } = criticMarkdownToEditorState(input);
+
+    expect(collectDocText(doc)).toBe(`Review ${typedText}.`);
+    expect(comments.size).toBe(1);
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+  });
+
+  it("keeps an anchored comment inside a fenced code block literal", () => {
+    const input = [
+      "```md",
+      `{==${escapedText}==}{>>${escapedText}<<}${commentMetadata}`,
+      "```",
+      "",
+    ].join("\n");
+
+    const { doc, comments } = criticMarkdownToEditorState(input);
+
+    expect(comments.get("c1")?.content).toBe(typedText);
+    expect(collectDocText(doc)).toBe(typedText);
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+  });
+
+  it("keeps a backslash that does not precede a delimiter", () => {
+    // A body written before escaping existed keeps its raw backslashes on the
+    // way in, and gains their escaped form on the way out.
+    const body = String.raw`see C:\path and 50\% off`;
+    const input = `Review {==this claim==}{>>${body}<<}${commentMetadata}.\n`;
+
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    expect(comments.get("c1")?.content).toBe(body);
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+
+    const saved = rewrite(doc, comments);
+    expect(saved).toContain(String.raw`{>>see C:\\path and 50\\% off<<}`);
+
+    const reloaded = criticMarkdownToEditorState(saved);
+    expect(reloaded.comments.get("c1")?.content).toBe(body);
+    expect(editorStateToCriticMarkdown(reloaded.doc, reloaded.comments)).toBe(
+      saved,
+    );
+  });
+
+  // A backslash escape is inert inside a code span and an autolink, so a reader
+  // that leaves those to the Markdown lexer hands back text that is still
+  // escaped and escapes it again on the next save. Four consecutive saves catch
+  // that doubling, where one save cannot.
+  describe("escape-inert Markdown contexts stay byte-stable", () => {
+    const commentMetadata = '{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}';
+    const changeMetadata = '{id="s1" by="AI" at="2026-04-28T12:00:00.000Z"}';
+    // Written as they sit on disk: a Windows path and a marker, both escaped.
+    const codeSpan = "a code span `C:\\\\dir` and `x\\{++y\\++}z`";
+    const autolink = "an autolink <https://example.com/p\\{++q\\++}r>";
+    const inertText = `${codeSpan}, ${autolink}`;
+
+    const cases: Array<[string, string]> = [
+      ["an anchor", `See {==${inertText}==}{>>Note<<}${commentMetadata}.\n`],
+      [
+        "a comment body",
+        `See {==this==}{>>${inertText}<<}${commentMetadata}.\n`,
+      ],
+      ["a deletion", `Drop {--${inertText}--}${changeMetadata}.\n`],
+      [
+        "a fenced code block's anchor and comment body",
+        [
+          "```md",
+          `{==${codeSpan}==}{>>${codeSpan}<<}${commentMetadata}`,
+          "```",
+          "",
+        ].join("\n"),
+      ],
+    ];
+
+    for (const [name, input] of cases) {
+      it(`keeps escape-inert text in ${name} unchanged across four saves`, () => {
+        const saves: string[] = [];
+        let current = input;
+
+        for (let round = 0; round < 4; round += 1) {
+          const { doc, comments } = criticMarkdownToEditorState(current);
+          current = editorStateToCriticMarkdown(doc, comments);
+          saves.push(current);
+        }
+
+        expect(saves).toEqual([input, input, input, input]);
+      });
+    }
+
+    // A quoted link or image title carries a second escaping layer, added by
+    // `createTurndownService` rather than by Markdown, so reading peels the
+    // serializer's layer and leaves this format's. Inside marker text one
+    // logical backslash is therefore four on disk, and two outside.
+    const titledLink = '[text](https://example.com "a\\\\\\\\title")';
+    const singlyEscapedLink = '[text](https://example.com "a\\\\title")';
+
+    const titleCases: Array<[string, string]> = [
+      ["an anchor", `See {==${titledLink}==}{>>Note<<}${commentMetadata}.\n`],
+      [
+        "a comment body",
+        `See {==this==}{>>${singlyEscapedLink}<<}${commentMetadata}.\n`,
+      ],
+      ["an insertion", `Add {++${titledLink}++}${changeMetadata}.\n`],
+      ["a deletion", `Drop {--${titledLink}--}${changeMetadata}.\n`],
+      [
+        "a substitution's old text",
+        `Use {~~${titledLink}~>new~~}${changeMetadata}.\n`,
+      ],
+      [
+        "a substitution's new text",
+        `Use {~~old~>${titledLink}~~}${changeMetadata}.\n`,
+      ],
+      ["no marker at all", `See ${singlyEscapedLink} here.\n`],
+    ];
+
+    for (const [name, input] of titleCases) {
+      it(`keeps a link title in ${name} unchanged across four saves`, () => {
+        const saves: string[] = [];
+        let current = input;
+
+        for (let round = 0; round < 4; round += 1) {
+          const { doc, comments } = criticMarkdownToEditorState(current);
+          current = editorStateToCriticMarkdown(doc, comments);
+          saves.push(current);
+        }
+
+        expect(saves).toEqual([input, input, input, input]);
+      });
+    }
+
+    it("hands a link title back as the one backslash it stands for", () => {
+      const input = `See {==${titledLink}==}{>>Note<<}${commentMetadata}.\n`;
+
+      const { doc } = criticMarkdownToEditorState(input);
+
+      expect(findFirstLinkTitle(doc)).toBe("a\\title");
+    });
+
+    // packages/rfm/src/index.test.ts pins the same bytes against the other
+    // reader, so the two cannot drift apart on one document.
+    it("hands escape-inert text back with its escapes removed", () => {
+      const input = `See {==${inertText}==}{>>${inertText}<<}${commentMetadata}.\n`;
+
+      const { doc, comments } = criticMarkdownToEditorState(input);
+
+      const typedText =
+        "a code span `C:\\dir` and `x{++y++}z`, " +
+        "an autolink <https://example.com/p{++q++}r>";
+      expect(comments.get("c1")?.content).toBe(typedText);
+      expect(collectDocText(doc)).toContain("C:\\dir");
+      expect(collectDocText(doc)).toContain("x{++y++}z");
+      expect(collectDocText(doc)).toContain("https://example.com/p{++q++}r");
+    });
+  });
+
+  it("still reads a body that ends with a bare backslash", () => {
+    // Written before escaping existed, so the backslash is ordinary text
+    // rather than an escape of the delimiter that closes the comment.
+    const input = `Review {==this claim==}{>>ends with a backslash\\<<}${commentMetadata}.\n`;
+
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    expect(comments.get("c1")?.content).toBe("ends with a backslash\\");
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+
+    const saved = rewrite(doc, comments);
+    expect(saved).toContain(String.raw`{>>ends with a backslash\\<<}`);
+    expect(criticMarkdownToEditorState(saved).comments.get("c1")?.content).toBe(
+      "ends with a backslash\\",
+    );
+  });
+
+  it("keeps a later comment when an earlier body ends with a backslash", () => {
+    // The escape-aware scan reads that backslash as escaping the close, so
+    // without a bound it runs on to the next comment's close and swallows the
+    // comment in between.
+    const legacyBody = "ends with a backslash\\";
+    const input = [
+      `See {==first==}{>>${legacyBody}<<}${commentMetadata}`,
+      ' and {==second==}{>>second note<<}{id="c2" by="user" at="2026-04-28T12:01:00.000Z"}.\n',
+    ].join("");
+
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    expect([...comments.keys()]).toEqual(["c1", "c2"]);
+    expect(comments.get("c1")?.content).toBe(legacyBody);
+    expect(comments.get("c2")?.content).toBe("second note");
+
+    // Untouched, the block keeps its bytes. Rewritten, the lone backslash
+    // gains its escaped form once and nothing else moves.
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+    const saved = rewrite(doc, comments);
+    expect(saved).toBe(
+      input.replace(`{>>${legacyBody}<<}`, "{>>ends with a backslash\\\\<<}"),
+    );
+
+    const reloaded = criticMarkdownToEditorState(saved);
+    expect([...reloaded.comments.keys()]).toEqual(["c1", "c2"]);
+    expect(editorStateToCriticMarkdown(reloaded.doc, reloaded.comments)).toBe(
+      saved,
+    );
+  });
+
+  it("leaves a document-level comment in endmatter unescaped", () => {
+    const input = [
+      "Body text.",
+      "",
+      "---",
+      "comments:",
+      "  c1:",
+      `    body: ${typedText}`,
+      "    by: user",
+      '    at: "2026-04-28T12:00:00.000Z"',
+      "",
+    ].join("\n");
+
+    const { comments } = criticMarkdownToEditorState(input);
+
+    expect(comments.get("c1")).toMatchObject({
+      content: typedText,
+      scope: "document",
+    });
   });
 });

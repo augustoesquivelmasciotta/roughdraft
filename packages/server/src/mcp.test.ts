@@ -170,4 +170,38 @@ describe("mcp", () => {
 
     expect(fs.readFileSync(documentPath, "utf8")).toBe(original);
   });
+
+  it("accepts, rejects and edits a suggestion into plain prose", async () => {
+    fs.writeFileSync(
+      documentPath,
+      [
+        '# Draft\n\nKeep {++clear wording++}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} here.',
+        'Use {~~old~>new~~}{id="s2" by="AI" at="2026-04-23T18:01:00.000Z"} now.',
+        "",
+      ].join("\n"),
+    );
+    const env = { ROUGHDRAFT_STATE_FILE: stateFile };
+
+    await callTool(
+      "roughdraft_decide_suggestion",
+      { documentPath, targetId: "s1", action: "accept" },
+      env,
+    );
+    await callTool(
+      "roughdraft_decide_suggestion",
+      { documentPath, targetId: "s2", action: "edit", text: "newer" },
+      env,
+    );
+
+    expect(fs.readFileSync(documentPath, "utf8")).toBe(
+      "# Draft\n\nKeep clear wording here.\nUse newer now.\n",
+    );
+    await expect(
+      callTool(
+        "roughdraft_decide_suggestion",
+        { documentPath, targetId: "s1", action: "maybe" },
+        env,
+      ),
+    ).rejects.toThrow(/action must be/);
+  });
 });

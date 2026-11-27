@@ -1193,6 +1193,9 @@ function printCriticMarkupHelp(log: (message: string) => void) {
   log(
     "  Set `by` to your agent or author label and `at` to the current ISO timestamp.",
   );
+  log(
+    "  Escape a delimiter the text itself contains with a backslash, so it stays literal: {>>Write \\{>>a note\\<<} to reply.<<}.",
+  );
   log("");
   log("Anchored comment with id:");
   log("  Review {==this sentence==}{>>Needs a source<<}{#c1}.");

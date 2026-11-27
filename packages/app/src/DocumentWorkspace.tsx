@@ -758,6 +758,9 @@ export function DocumentWorkspace({
           }, REVIEW_HANDOFF_TIMEOUT_MS);
         });
         const send = async () => {
+          // Approvals wait for the handoff so the reviewer can still undo
+          // them; apply them now so the flush below writes them in one save.
+          saveControllerRef.current?.applyPendingReviewDecisions();
           // The button stays enabled while autosave is still pending, so make
           // sure any debounced edits are persisted before handing off.
           const flushResult = await saveControllerRef.current?.flushSave();
