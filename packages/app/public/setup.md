@@ -142,6 +142,8 @@ Roughdraft may already have inline attribute blocks after comments and suggestio
 
 Anchored comments usually look like `{==selected text==}{>>Comment text<<}{#c1}`. Suggested changes usually look like `{++new text++}{#s1}` or `{~~old text~>new text~~}{#s2}`. Replies live in final YAML endmatter with a `body` and `re` pointer.
 
+When nothing in the document is a natural anchor for a comment, add a sentence written only to carry it and mark the comment with `anchor="disposable"` in its inline attribute block, such as `{==Placeholder for the pricing decision.==}{>>Which tier ships first?<<}{id="c1" by="AI" at="2026-04-28T12:00:00.000Z" anchor="disposable"}`; when the reviewer deletes that thread, Roughdraft removes the sentence with it. Without the flag the anchor text stays after its thread is deleted, so never put the flag on a comment anchored to real document text.
+
 Example:
 
 ```markdown

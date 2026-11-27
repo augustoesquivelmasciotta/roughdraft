@@ -859,3 +859,21 @@ describe("decideRoughdraftSuggestion", () => {
     ).toThrow(/Suggestion not found/);
   });
 });
+
+describe("disposable anchors in the review index", () => {
+  it("reports the flag from an inline attribute block only", () => {
+    const index = extractRoughdraftReviewIndex(
+      [
+        '{==Placeholder.==}{>>Which tier?<<}{id="c1" by="AI" at="2026-04-28T12:00:00.000Z" anchor="disposable"}',
+        "",
+        '{==Real text.==}{>>Source?<<}{id="c2" by="AI" at="2026-04-28T12:01:00.000Z"}',
+        "",
+      ].join("\n"),
+    );
+
+    expect(index.items.find((item) => item.id === "c1")?.disposable).toBe(true);
+    expect(index.items.find((item) => item.id === "c2")).not.toHaveProperty(
+      "disposable",
+    );
+  });
+});

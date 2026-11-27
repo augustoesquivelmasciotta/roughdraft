@@ -77,6 +77,10 @@
         "markdown": {
           "type": "string",
           "description": "The highlighted anchor content before inline Markdown rendering, when available."
+        },
+        "disposable": {
+          "type": "boolean",
+          "description": "True when the comment carries anchor=\"disposable\": the anchor text was written only to carry the thread and is removed with the last comment on it."
         }
       }
     },

@@ -40,6 +40,11 @@ export interface RfmReviewItem {
   originalText?: string;
   replacementText?: string;
   anchorText?: string;
+  /**
+   * The comment carries `anchor="disposable"` in its inline attribute block:
+   * its anchor text is filler, removed with the last comment on it.
+   */
+  disposable?: boolean;
   offset: number;
   endOffset: number;
   line: number;
@@ -539,6 +544,10 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
       status: attrs.get("status") ?? null,
       text: fullBody ?? parsed.content,
       anchorText,
+      ...(parsed.metadata?.kind === "canonical" &&
+      parsed.metadata.attrs.get("anchor") === "disposable"
+        ? { disposable: true }
+        : {}),
       offset: parsed.offset,
       endOffset: parsed.endOffset,
       ...locationForOffset(lineStarts, parsed.offset),

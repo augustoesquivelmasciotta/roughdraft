@@ -2399,6 +2399,25 @@ export function createCriticChange(
  * Builds the record kept in the endmatter `deleted` list when a comment is
  * deleted.
  */
+/**
+ * The ids among these whose comment flags its anchor text as filler written
+ * only to carry the thread (`anchor="disposable"`, ported from
+ * kudzuweb/roughdraftplus #17). Clearing such a thread removes the anchor
+ * text too. The flag is read only from an inline attribute block.
+ */
+export function disposableAnchorCommentIds(
+  commentIds: Iterable<string>,
+  comments: ReadonlyMap<string, CriticComment>,
+): string[] {
+  return [...commentIds].filter((commentId) => {
+    const comment = comments.get(commentId);
+    return (
+      comment?.metadataFormat === "attributes" &&
+      comment.extraMetadata?.anchor === "disposable"
+    );
+  });
+}
+
 export function createDeletedCommentRecord(
   comment: CriticComment,
   options?: { deletedAt?: string; anchor?: string | null },

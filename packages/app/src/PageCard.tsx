@@ -23,6 +23,7 @@ import {
   createCriticComment,
   createDeletedCommentRecord,
   criticMarkdownHasReviewRail,
+  disposableAnchorCommentIds,
   criticMarkdownToEditorState,
   type DeletedCommentRecord,
   type CriticChangeDecision,
@@ -2159,18 +2160,25 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
           }),
         ];
       }
-      const nextComments = new Map(commentsRef.current);
+      const previousComments = commentsRef.current;
+      const nextComments = new Map(previousComments);
       for (const id of commentIdsToDelete) {
         nextComments.delete(id);
       }
       commentsRef.current = nextComments;
       setComments(nextComments);
 
-      const chain = currentEditor.chain().focus();
-      for (const id of commentIdsToDelete) {
-        chain.removeCommentId(id);
-      }
-      chain.run();
+      // Filler anchor text (`anchor="disposable"`) leaves with its thread.
+      currentEditor
+        .chain()
+        .focus()
+        .removeCommentIds(commentIdsToDelete, {
+          disposableCommentIds: disposableAnchorCommentIds(
+            commentIdsToDelete,
+            previousComments,
+          ),
+        })
+        .run();
       setSelectedCommentId((current) =>
         current && deletedIds.has(current) ? null : current,
       );

@@ -31,6 +31,16 @@ declare module "@tiptap/core" {
     commentRef: {
       setCommentRef: (attributes: { commentIds: string[] }) => ReturnType;
       removeCommentId: (commentId: string) => ReturnType;
+      /**
+       * Removes these comment ids from every highlight. Anchor text left with
+       * no comment is deleted when one of the removed ids is in
+       * `disposableCommentIds` (`anchor="disposable"`); otherwise it stays as
+       * plain prose.
+       */
+      removeCommentIds: (
+        commentIds: Iterable<string>,
+        options?: { disposableCommentIds?: Iterable<string> },
+      ) => ReturnType;
       unsetCommentRef: () => ReturnType;
     };
     criticChange: {
@@ -153,6 +163,63 @@ const CommentRef = Mark.create({
               tr.addMark(from, to, markType.create({ commentIds: nextIds }));
             }
           });
+
+          if (found && dispatch) {
+            dispatch(tr);
+          }
+
+          return found;
+        },
+      removeCommentIds:
+        (commentIds, options) =>
+        ({ tr, state, dispatch }) => {
+          const markType = state.schema.marks.commentRef;
+          if (!markType) return false;
+
+          const removedIds = new Set(commentIds);
+          if (removedIds.size === 0) return false;
+
+          // The whole set leaving the document is known here, so an anchor
+          // emptied by that set is judged once against every id it carried.
+          // Deciding per comment would spare the anchor of a flagged thread
+          // with replies, since the flagged root leaves while its replies
+          // still hold the mark.
+          const disposableIds = new Set(options?.disposableCommentIds ?? []);
+          const disposedRanges: Array<{ from: number; to: number }> = [];
+          let found = false;
+
+          state.doc.descendants((node, pos) => {
+            if (!node.isText) return;
+
+            const mark = node.marks.find(
+              (candidate) =>
+                candidate.type === markType &&
+                Array.isArray(candidate.attrs.commentIds) &&
+                (candidate.attrs.commentIds as string[]).some((id) =>
+                  removedIds.has(id),
+                ),
+            );
+            if (!mark) return;
+
+            found = true;
+            const from = pos;
+            const to = pos + node.nodeSize;
+            const currentIds = mark.attrs.commentIds as string[];
+            const nextIds = currentIds.filter((id) => !removedIds.has(id));
+
+            tr.removeMark(from, to, markType);
+
+            if (nextIds.length > 0) {
+              tr.addMark(from, to, markType.create({ commentIds: nextIds }));
+            } else if (currentIds.some((id) => disposableIds.has(id))) {
+              disposedRanges.push({ from, to });
+            }
+          });
+
+          // Marks do not move positions, deletions do: delete from the end.
+          for (const range of [...disposedRanges].reverse()) {
+            tr.delete(range.from, range.to);
+          }
 
           if (found && dispatch) {
             dispatch(tr);
