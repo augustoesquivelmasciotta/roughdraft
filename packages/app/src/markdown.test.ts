@@ -40,6 +40,22 @@ describe("splitYamlFrontmatter", () => {
 });
 
 describe("toHtml", () => {
+  // kudzuweb/roughdraftplus #38: GFM's single-tilde strikethrough turned
+  // prose like `~57% (~100h)` into `~~57% (~~100h)` on save.
+  it("keeps single tildes in prose as text", () => {
+    const markdown = "Roughly ~57% (~100h) of the work is left.\n";
+
+    expect(toHtml(markdown)).not.toContain("<del>");
+    expect(toMarkdown(toHtml(markdown))).toBe(markdown);
+  });
+
+  it("keeps strikethrough written with two tildes", () => {
+    const markdown = "Ship ~~later~~ today.\n";
+
+    expect(toHtml(markdown)).toContain("<del>later</del>");
+    expect(toMarkdown(toHtml(markdown))).toBe(markdown);
+  });
+
   it("preserves original markdown paths while resolving rendered URLs", () => {
     const html = toHtml(
       "[Draft](notes/draft.md)\n\n![Sketch](images/sketch.png)\n\n[Docs](https://example.com)",

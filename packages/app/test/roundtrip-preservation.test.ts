@@ -25,6 +25,33 @@ function roundTrip(input: string): string {
   return editorStateToCriticMarkdown(doc, comments);
 }
 
+// An untouched block is written back from its source bytes, so this drops
+// the parser's source snapshot to make the writer serialize every block, as
+// it does for a block the reviewer edited.
+function rewrite(input: string): string {
+  const { doc, comments } = criticMarkdownToEditorState(input);
+  const { roughdraftSource: _source, ...fresh } = doc as JSONContent & {
+    roughdraftSource?: unknown;
+  };
+  return editorStateToCriticMarkdown(fresh, comments);
+}
+
+describe("strikethrough takes two tildes (roughdraftplus #38)", () => {
+  it("keeps single tildes in prose as text when the block is rewritten", () => {
+    const input = "Roughly ~57% (~100h) of the work is left.\n";
+
+    expect(renderedBody(input).querySelector("del")).toBeNull();
+    expect(rewrite(input)).toBe(input);
+  });
+
+  it("keeps a doubled-tilde strikethrough when the block is rewritten", () => {
+    const input = "Ship ~~later~~ today.\n";
+
+    expect(renderedBody(input).querySelector("del")?.textContent).toBe("later");
+    expect(rewrite(input)).toBe(input);
+  });
+});
+
 function findNodes(
   root: JSONContent,
   predicate: (node: JSONContent) => boolean,
