@@ -51,7 +51,9 @@ test.describe("a raw block in editing mode", () => {
     await expect(
       editor.getByTestId("unrendered-block-deletion-refused"),
     ).toContainText("Rich text will not delete this details block");
-    await expect(editor.locator("details")).toBeVisible();
+    await expect(editor.getByTestId("raw-markdown-block")).toContainText(
+      "Changelog",
+    );
 
     await page.keyboard.type("Typed ");
     await expect(editor).toContainText("Typed After the section.");

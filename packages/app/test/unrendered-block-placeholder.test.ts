@@ -111,8 +111,10 @@ describe("unrendered block placeholder", () => {
       view.dom.querySelector('[data-testid="unrendered-block-placeholder"]'),
     ).toBeNull();
     expect(
-      view.dom.querySelector(`[${rawMarkdownBlockTypeAttribute}="table"]`),
-    ).not.toBeNull();
+      view.dom
+        .querySelector('[data-testid="raw-markdown-block"]')
+        ?.getAttribute(rawMarkdownBlockTypeAttribute),
+    ).toBe("table");
     expect(
       editorStateToCriticMarkdown(editor?.getJSON() ?? {}, parsed.comments, {
         source: parsed.source,
@@ -129,6 +131,10 @@ describe("unrendered block placeholder", () => {
     expect(
       view.dom.querySelector('[data-testid="unrendered-block-placeholder"]'),
     ).toBeNull();
-    expect(view.dom.querySelector(".rd-raw-block--hidden")).not.toBeNull();
+    expect(
+      view.dom
+        .querySelector('[data-testid="raw-markdown-block"]')
+        ?.classList.contains("rd-raw-block--hidden"),
+    ).toBe(true);
   });
 });

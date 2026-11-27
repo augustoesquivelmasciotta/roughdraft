@@ -40,8 +40,12 @@ test.describe("opening local markdown files", () => {
     await openMarkdownFile(page, filePath, "rich-text");
 
     const editor = page.getByTestId("rich-text-editor");
-    const rawTable = editor.locator('[data-markdown-raw-block-type="table"]');
+    const rawTable = editor.getByTestId("raw-markdown-block");
     await expect(rawTable).toBeVisible();
+    await expect(rawTable).toHaveAttribute(
+      "data-markdown-raw-block-type",
+      "table",
+    );
     await expect(rawTable).toContainText("either");
     await expect(
       editor.getByTestId("unrendered-block-placeholder"),
