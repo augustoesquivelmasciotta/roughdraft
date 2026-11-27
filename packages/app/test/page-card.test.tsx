@@ -1820,6 +1820,160 @@ describe("PageCard editor integration", () => {
     });
   });
 
+  // Ported from kudzuweb/roughdraftplus #9 (PR #50). Approving an agent reply
+  // is the quick path to Resolve here: it waits for "I'm done", then resolves
+  // that reply's thread in the same save.
+  const approvalDoc =
+    '{==alpha==}{>>Root comment<<}{id="root" by="user" at="2026-04-25T23:56:00.000Z"}{>>First answer<<}{id="a1" by="AI" at="2026-04-25T23:57:00.000Z" re="root"}{>>Newest answer<<}{id="a2" by="AI" at="2026-04-25T23:58:00.000Z" re="root"}\n\nParagraph';
+
+  async function approveFromRail(
+    rendered: RenderedPageCard,
+    commentId: string,
+  ) {
+    for (const action of ["approve", "approve-confirm"]) {
+      await act(async () => {
+        getByTestId(
+          rendered.container,
+          `comment-rail-${commentId}-action-${action}`,
+        ).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await Promise.resolve();
+      });
+    }
+  }
+
+  it("holds an approved agent reply until pending decisions are applied, then resolves its thread in one save", async () => {
+    stubNarrowViewport();
+    const rendered = await renderPageCard({
+      page: {
+        id: "doc-approve-reply-1",
+        title: "Doc Approve Reply 1",
+        content: approvalDoc,
+      },
+      selected: true,
+    });
+
+    await selectText(rendered.getEditor(), "alpha");
+    await flushAnimationFrame();
+
+    vi.useFakeTimers();
+    await approveFromRail(rendered, "a2");
+
+    expect(
+      queryByTestId(rendered.container, "comment-rail-a2-approval-pending"),
+    ).not.toBeNull();
+
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+
+    expect(rendered.onSave).not.toHaveBeenCalled();
+
+    let result: ManualSaveResult | undefined;
+    await act(async () => {
+      rendered.getSaveController().applyPendingReviewDecisions();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      result = await rendered.getSaveController().flushSave();
+    });
+
+    expect(result).toEqual({ status: "saved" });
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+    const savedMarkdown = rendered.onSave.mock.calls[0]?.[1];
+    expect(savedMarkdown).toContain(
+      '{>>Root comment<<}{id="root" by="user" at="2026-04-25T23:56:00.000Z" status="resolved"}',
+    );
+    expect(savedMarkdown).toContain("First answer");
+    expect(savedMarkdown).toContain("Newest answer");
+    expect(
+      queryByTestId(rendered.container, "comment-rail-a2-approval-pending"),
+    ).toBeNull();
+
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a pending approval the reviewer undid", async () => {
+    stubNarrowViewport();
+    const rendered = await renderPageCard({
+      page: {
+        id: "doc-approve-reply-undo-1",
+        title: "Doc Approve Reply Undo 1",
+        content: approvalDoc,
+      },
+      selected: true,
+    });
+
+    await selectText(rendered.getEditor(), "alpha");
+    await flushAnimationFrame();
+    await approveFromRail(rendered, "a2");
+    await act(async () => {
+      getByTestId(
+        rendered.container,
+        "comment-rail-a2-action-unapprove",
+      ).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      rendered.getSaveController().applyPendingReviewDecisions();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await rendered.getSaveController().flushSave();
+    });
+
+    expect(rendered.onSave).not.toHaveBeenCalled();
+  });
+
+  it("applies pending approvals from code view, where the rich editor is unmounted", async () => {
+    stubNarrowViewport();
+    const rendered = await renderPageCard({
+      page: {
+        id: "doc-approve-reply-code-view-1",
+        title: "Doc Approve Reply Code View 1",
+        content: approvalDoc,
+      },
+      selected: true,
+    });
+
+    await selectText(rendered.getEditor(), "alpha");
+    await flushAnimationFrame();
+    await approveFromRail(rendered, "a2");
+
+    await rendered.rerender({ editorViewMode: "code" });
+    expect(queryByTestId(rendered.container, "rich-text-editor")).toBeNull();
+
+    vi.useFakeTimers();
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+    expect(rendered.onSave).not.toHaveBeenCalled();
+
+    let result: ManualSaveResult | undefined;
+    await act(async () => {
+      rendered.getSaveController().applyPendingReviewDecisions();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      result = await rendered.getSaveController().flushSave();
+    });
+
+    expect(result).toEqual({ status: "saved" });
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+    const savedMarkdown = rendered.onSave.mock.calls[0]?.[1];
+    expect(savedMarkdown).toContain(
+      '{id="root" by="user" at="2026-04-25T23:56:00.000Z" status="resolved"}',
+    );
+    expect(savedMarkdown).toContain("Newest answer");
+  });
+
   it("renders suggestion replies only inside the suggestion card", async () => {
     const commentText = "Looks good as an inserted phrase.";
     const rendered = await renderPageCard({

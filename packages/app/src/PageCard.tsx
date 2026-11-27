@@ -3,12 +3,22 @@ import type { Mark as ProseMirrorMark } from "@tiptap/pm/model";
 import { TextSelection } from "@tiptap/pm/state";
 import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type Dispatch,
+  memo,
+  type SetStateAction,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import {
   type CriticChangeAttrs,
   type CriticComment,
   type CriticDocumentSource,
+  applyPendingReviewDecisionsToCriticMarkdown,
   createCriticChange,
   createCriticComment,
   createDeletedCommentRecord,
@@ -16,7 +26,9 @@ import {
   criticMarkdownToEditorState,
   type DeletedCommentRecord,
   editorStateToCriticMarkdown,
+  getApprovedThreadRootIds,
   getCommentDescendantIds,
+  type PendingReviewDecisions,
 } from "./critic-markup";
 import {
   type CriticChangeRailItem,
@@ -67,6 +79,20 @@ export type ManualSaveResult =
 
 export interface DocumentSaveController {
   flushSave: () => Promise<ManualSaveResult>;
+  /**
+   * Applies the decisions the reviewer left pending in the rail (approved
+   * agent replies), so the flush that follows writes them in the same save.
+   * "I'm done" calls this right before it flushes.
+   */
+  applyPendingReviewDecisions: () => void;
+}
+
+const EMPTY_PENDING_REVIEW_DECISIONS: Required<PendingReviewDecisions> = {
+  approvedCommentIds: [],
+};
+
+function hasPendingReviewDecisions(decisions: PendingReviewDecisions) {
+  return (decisions.approvedCommentIds?.length ?? 0) > 0;
 }
 
 type EditorViewMode = "rich-text" | "code";
@@ -128,6 +154,12 @@ interface RichTextEditorSurfaceProps {
   onEditorReady?: (editor: Editor | null) => void;
   onCommentRailPresenceChange?: (hasCommentRailSpace: boolean) => void;
   lastHandoffAt?: string | null;
+  /** Decisions waiting for "I'm done"; kept above the editor so a view switch or reload keeps them. */
+  pendingReviewDecisions: Required<PendingReviewDecisions>;
+  onPendingReviewDecisionsChange: Dispatch<
+    SetStateAction<Required<PendingReviewDecisions>>
+  >;
+  onApplyPendingReviewDecisionsChange: (apply: (() => void) | null) => void;
 }
 
 interface CodeEditorSurfaceProps {
@@ -747,6 +779,9 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   onEditorReady,
   onCommentRailPresenceChange,
   lastHandoffAt = null,
+  pendingReviewDecisions,
+  onPendingReviewDecisionsChange,
+  onApplyPendingReviewDecisionsChange,
 }: RichTextEditorSurfaceProps) {
   const editorRef = useRef<Editor | null>(null);
   const criticChangeFrameRef = useRef<number | null>(null);
@@ -808,6 +843,18 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   // Comments deleted since the file was loaded; saved in the endmatter
   // `deleted` list so the removal stays on record.
   const deletedRecordsRef = useRef<DeletedCommentRecord[]>([]);
+
+  useEffect(() => {
+    // A pending approval whose comment left the document has nothing to do.
+    onPendingReviewDecisionsChange((current) => {
+      const approvedCommentIds = current.approvedCommentIds.filter((id) =>
+        comments.has(id),
+      );
+      return approvedCommentIds.length === current.approvedCommentIds.length
+        ? current
+        : { ...current, approvedCommentIds };
+    });
+  }, [comments, onPendingReviewDecisionsChange]);
 
   useEffect(() => {
     commentsRef.current = comments;
@@ -1845,6 +1892,61 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     [updateComment],
   );
 
+  const approveComment = useCallback(
+    (commentId: string) => {
+      onPendingReviewDecisionsChange((current) =>
+        current.approvedCommentIds.includes(commentId)
+          ? current
+          : {
+              ...current,
+              approvedCommentIds: [...current.approvedCommentIds, commentId],
+            },
+      );
+    },
+    [onPendingReviewDecisionsChange],
+  );
+
+  const revokeApproval = useCallback(
+    (commentId: string) => {
+      onPendingReviewDecisionsChange((current) => ({
+        ...current,
+        approvedCommentIds: current.approvedCommentIds.filter(
+          (id) => id !== commentId,
+        ),
+      }));
+    },
+    [onPendingReviewDecisionsChange],
+  );
+
+  const applyPendingReviewDecisions = useCallback(() => {
+    const rootIds = getApprovedThreadRootIds(
+      pendingReviewDecisions.approvedCommentIds,
+      commentsRef.current,
+    );
+    onPendingReviewDecisionsChange(EMPTY_PENDING_REVIEW_DECISIONS);
+    if (rootIds.length === 0) return;
+
+    // Approve is the quick path to Resolve: the same status, written for
+    // every approved thread in one change.
+    const nextComments = new Map(commentsRef.current);
+    for (const rootId of rootIds) {
+      const root = nextComments.get(rootId);
+      if (root) nextComments.set(rootId, { ...root, status: "resolved" });
+    }
+    commentsRef.current = nextComments;
+    setComments(nextComments);
+    emitMarkdownChange(undefined, nextComments);
+  }, [
+    emitMarkdownChange,
+    onPendingReviewDecisionsChange,
+    pendingReviewDecisions,
+  ]);
+
+  useEffect(() => {
+    onApplyPendingReviewDecisionsChange(applyPendingReviewDecisions);
+    return () => onApplyPendingReviewDecisionsChange(null);
+  }, [applyPendingReviewDecisions, onApplyPendingReviewDecisionsChange]);
+
   const reopenComment = useCallback(
     (commentId: string) => {
       updateComment(commentId, (current) => ({
@@ -2385,6 +2487,9 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     onReplyComment: replyToComment,
     onResolveComment: resolveComment,
     onReopenComment: reopenComment,
+    pendingApprovalCommentIds: pendingReviewDecisions.approvedCommentIds,
+    onApproveComment: approveComment,
+    onRevokeApproval: revokeApproval,
     newCommentIds,
     onSelectComment: selectComment,
     onFocusComment: focusComment,
@@ -2610,6 +2715,18 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
     page.content,
   );
   const [richTextSourceVersion, setRichTextSourceVersion] = useState(0);
+  const [pendingReviewDecisions, setPendingReviewDecisions] = useState<
+    Required<PendingReviewDecisions>
+  >(EMPTY_PENDING_REVIEW_DECISIONS);
+  const pendingReviewDecisionsRef = useRef(pendingReviewDecisions);
+  pendingReviewDecisionsRef.current = pendingReviewDecisions;
+  const applyRichTextDecisionsRef = useRef<(() => void) | null>(null);
+  const handleApplyPendingReviewDecisionsChange = useCallback(
+    (apply: (() => void) | null) => {
+      applyRichTextDecisionsRef.current = apply;
+    },
+    [],
+  );
 
   const reportDirtyState = useCallback(
     (isDirty: boolean) => {
@@ -2735,11 +2852,6 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
     return await performSave(pendingMarkdownRef.current);
   }, [onSaveStateChange, performSave]);
 
-  useEffect(() => {
-    onSaveControllerChange?.({ flushSave });
-    return () => onSaveControllerChange?.(null);
-  }, [flushSave, onSaveControllerChange]);
-
   const handleMarkdownChange = useCallback(
     (nextMarkdown: string) => {
       pendingMarkdownRef.current = nextMarkdown;
@@ -2765,6 +2877,31 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
     },
     [onLocalContentChange, onSaveStateChange, reportDirtyState, scheduleSave],
   );
+
+  const applyPendingReviewDecisions = useCallback(() => {
+    // The rich editor applies them through its own state while it is
+    // mounted; in code view it is not, so they are applied to the Markdown.
+    if (applyRichTextDecisionsRef.current) {
+      applyRichTextDecisionsRef.current();
+      return;
+    }
+
+    const decisions = pendingReviewDecisionsRef.current;
+    if (!hasPendingReviewDecisions(decisions)) return;
+
+    setPendingReviewDecisions(EMPTY_PENDING_REVIEW_DECISIONS);
+    const currentMarkdown = pendingMarkdownRef.current;
+    const nextMarkdown = applyPendingReviewDecisionsToCriticMarkdown(
+      currentMarkdown,
+      decisions,
+    );
+    if (nextMarkdown !== currentMarkdown) handleMarkdownChange(nextMarkdown);
+  }, [handleMarkdownChange]);
+
+  useEffect(() => {
+    onSaveControllerChange?.({ flushSave, applyPendingReviewDecisions });
+    return () => onSaveControllerChange?.(null);
+  }, [applyPendingReviewDecisions, flushSave, onSaveControllerChange]);
 
   useEffect(() => {
     const forceResetChanged = forceResetKeyRef.current !== forceResetKey;
@@ -2873,6 +3010,11 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       backend={backend}
       onEditorReady={onEditorReady}
       lastHandoffAt={lastHandoffAt}
+      pendingReviewDecisions={pendingReviewDecisions}
+      onPendingReviewDecisionsChange={setPendingReviewDecisions}
+      onApplyPendingReviewDecisionsChange={
+        handleApplyPendingReviewDecisionsChange
+      }
     />
   );
 });

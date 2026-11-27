@@ -2210,6 +2210,77 @@ export function editorStateToCriticMarkdown(
   return prependYamlFrontmatter(markdown, frontmatter);
 }
 
+/**
+ * Review decisions the reviewer made in the rail that wait for "I'm done".
+ * `approvedCommentIds` are agent replies the reviewer approved: approving one
+ * resolves the thread it belongs to, which is this fork's Resolve applied at
+ * the handoff (ported from kudzuweb/roughdraftplus #9).
+ */
+export interface PendingReviewDecisions {
+  approvedCommentIds?: readonly string[];
+}
+
+/** The root comment of the thread a comment belongs to. */
+function getThreadRootCommentId(
+  commentId: string,
+  comments: ReadonlyMap<string, CriticComment>,
+): string | null {
+  const visited = new Set<string>();
+  let current = comments.get(commentId);
+
+  while (current?.parentCommentId && !visited.has(current.id)) {
+    visited.add(current.id);
+    const parent = comments.get(current.parentCommentId);
+    if (!parent) break;
+    current = parent;
+  }
+
+  return current?.id ?? null;
+}
+
+/** The thread roots that approving these agent replies resolves. */
+export function getApprovedThreadRootIds(
+  approvedCommentIds: Iterable<string>,
+  comments: ReadonlyMap<string, CriticComment>,
+): string[] {
+  const rootIds = new Set<string>();
+
+  for (const commentId of approvedCommentIds) {
+    const rootId = getThreadRootCommentId(commentId, comments);
+    const root = rootId ? comments.get(rootId) : undefined;
+    if (root && root.status !== "resolved") rootIds.add(root.id);
+  }
+
+  return [...rootIds];
+}
+
+/**
+ * Applies pending review decisions to a Markdown document without a mounted
+ * editor, which is what "I'm done" does from code view. Blocks nobody decided
+ * on keep their bytes. Returns the input untouched when nothing applies.
+ */
+export function applyPendingReviewDecisionsToCriticMarkdown(
+  markdown: string,
+  decisions: PendingReviewDecisions,
+  options?: MarkdownOptions,
+): string {
+  const { doc, comments } = criticMarkdownToEditorState(markdown, options);
+  const resolvedRootIds = getApprovedThreadRootIds(
+    decisions.approvedCommentIds ?? [],
+    comments,
+  );
+
+  if (resolvedRootIds.length === 0) return markdown;
+
+  const nextComments = new Map(comments);
+  for (const rootId of resolvedRootIds) {
+    const root = nextComments.get(rootId);
+    if (root) nextComments.set(rootId, { ...root, status: "resolved" });
+  }
+
+  return editorStateToCriticMarkdown(doc, nextComments);
+}
+
 export function createCriticComment(
   partial?: Partial<CriticComment>,
   options?: {
