@@ -1,8 +1,11 @@
 import fs from "node:fs";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { Page } from "@playwright/test";
 import { expect } from "@playwright/test";
+import { createApp } from "../../server/src/index";
 
 export function createMarkdownProject(label: string) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `roughdraft-${label}-`));
@@ -113,4 +116,61 @@ export function logE2eEvent(event: string, data: Record<string, unknown> = {}) {
       data,
     })}\n`,
   );
+}
+
+interface ListeningApp {
+  port: number;
+  close: () => Promise<void>;
+}
+
+async function listenApp(
+  app: ReturnType<typeof createApp>["app"],
+  port: number,
+): Promise<ListeningApp> {
+  const server: Server = await new Promise((resolve, reject) => {
+    const listening = app.listen(port, "127.0.0.1", () => resolve(listening));
+    listening.on("error", reject);
+  });
+  return {
+    port: (server.address() as AddressInfo).port,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+/**
+ * A fresh server on another port stands in for a stopped server and a later
+ * `roughdraft start`: same files, a new event queue and instance.
+ */
+export async function startReplacementServer(projectDir: string) {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "roughdraft-home-"));
+  const { app } = createApp({ homeDir, staticDirPath: projectDir });
+  const listening = await listenApp(app, 0);
+  return {
+    port: listening.port,
+    close: async () => {
+      await listening.close();
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** Sends every API call the page makes from now on to another server. */
+export async function routeApiTo(page: Page, port: number) {
+  await page.route("**/api/**", async (route) => {
+    const original = new URL(route.request().url());
+    try {
+      const response = await route.fetch({
+        url: `http://127.0.0.1:${port}${original.pathname}${original.search}`,
+      });
+      await route.fulfill({ response });
+    } catch {
+      // The replacement was closed (or is not up yet): to the page that is a
+      // refused connection, not a test failure.
+      await route.abort().catch(() => undefined);
+    }
+  });
 }

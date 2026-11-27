@@ -392,11 +392,111 @@ describe("createApp", () => {
       ok: true,
       at: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
       event: "review.completed",
+      done: true,
+      doneReason: "threads-cleared",
     });
     expect(fs.readdirSync(path.join(projectDir, "revisiones"))).toEqual([
       "foo-status.json",
       "foo.md",
     ]);
+  });
+
+  const OPEN_THREAD_DRAFT = [
+    "# Draft",
+    "",
+    'Needs {==support==}{>>Add a source<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.',
+  ].join("\n");
+
+  it("reports a done-signal on the review event when the overall comment says done", async () => {
+    fs.writeFileSync(path.join(projectDir, "draft.md"), OPEN_THREAD_DRAFT);
+    const { app } = createApp({ homeDir, staticDirPath: projectDir });
+
+    const response = await request(app).post("/api/review-events").send({
+      projectPath: projectDir,
+      path: "draft.md",
+      overallComment: "Done, thanks!",
+    });
+
+    expect(response.status).toBe(201);
+    expect(response.body.event).toMatchObject({
+      overallComment: "Done, thanks!",
+      done: true,
+      doneReason: "overall-comment",
+      summary: { unresolved: 2 },
+    });
+  });
+
+  it("reports a done-signal on the review event when every thread is cleared", async () => {
+    fs.writeFileSync(
+      path.join(projectDir, "draft.md"),
+      [
+        "# Draft",
+        "",
+        'Needs {==support==}{>>Add a source<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z" status="resolved"}.',
+      ].join("\n"),
+    );
+    const { app } = createApp({ homeDir, staticDirPath: projectDir });
+
+    const response = await request(app)
+      .post("/api/review-events")
+      .send({ projectPath: projectDir, path: "draft.md" });
+
+    expect(response.status).toBe(201);
+    expect(response.body.event).toMatchObject({
+      done: true,
+      doneReason: "threads-cleared",
+      summary: { comments: 1, unresolved: 0 },
+    });
+  });
+
+  it("reports no done-signal when threads stay open and the overall comment is feedback", async () => {
+    fs.writeFileSync(path.join(projectDir, "draft.md"), OPEN_THREAD_DRAFT);
+    const { app } = createApp({ homeDir, staticDirPath: projectDir });
+
+    const response = await request(app).post("/api/review-events").send({
+      projectPath: projectDir,
+      path: "draft.md",
+      overallComment: "Please address the risk section.",
+    });
+
+    expect(response.status).toBe(201);
+    expect(response.body.event).toMatchObject({
+      done: false,
+      doneReason: null,
+    });
+  });
+
+  it("writes the same done decision into the status file as the event carries", async () => {
+    fs.writeFileSync(path.join(projectDir, "draft.md"), OPEN_THREAD_DRAFT);
+    const { app } = createApp({ homeDir, staticDirPath: projectDir });
+    const statusPath = path.join(projectDir, "draft-status.json");
+
+    const feedback = await request(app).post("/api/review-events").send({
+      projectPath: projectDir,
+      path: "draft.md",
+      overallComment: "Tighten the intro.",
+    });
+    expect(feedback.body.event).toMatchObject({ done: false });
+    expect(JSON.parse(fs.readFileSync(statusPath, "utf-8"))).toMatchObject({
+      ok: true,
+      done: false,
+      doneReason: null,
+    });
+
+    const done = await request(app).post("/api/review-events").send({
+      projectPath: projectDir,
+      path: "draft.md",
+      overallComment: "Listo",
+    });
+    expect(done.body.event).toMatchObject({
+      done: true,
+      doneReason: "overall-comment",
+    });
+    expect(JSON.parse(fs.readFileSync(statusPath, "utf-8"))).toMatchObject({
+      ok: true,
+      done: true,
+      doneReason: "overall-comment",
+    });
   });
 
   it("does not list or serve the status file as a markdown document", async () => {
@@ -682,7 +782,9 @@ describe("createApp", () => {
       pid: process.pid,
       port: 4312,
       serverRoot,
+      instanceId: expect.any(String),
       stateless: true,
+      documents: [],
       capabilities: {
         projectPathRequired: true,
         fileSystemBrowsing: true,
@@ -912,7 +1014,9 @@ describe("createApp", () => {
       const polled = await request(app)
         .get("/api/open-requests/poll")
         .query({ path: target, clientId: "tab-1" });
-      expect(polled.body).toEqual({ requests: [{ path: target, url }] });
+      expect(polled.body).toEqual({
+        requests: [{ path: target, url, label: null }],
+      });
 
       const drained = await request(app)
         .get("/api/open-requests/poll")
@@ -949,6 +1053,123 @@ describe("createApp", () => {
           .send({ path: target, url: "http://localhost:4312/" });
 
         expect(sent.body).toEqual({ delivered: false });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("open document record", () => {
+    it("lists each polling tab's document with its timestamps on /api/status", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const before = Date.now();
+
+      await request(app)
+        .get("/api/open-requests/poll")
+        .query({ path: documentPath, clientId: "tab-1" });
+      await request(app)
+        .get("/api/open-requests/poll")
+        .query({ clientId: "home-tab" });
+
+      const status = await request(app).get("/api/status");
+
+      expect(status.body.documents).toEqual([
+        {
+          path: documentPath,
+          sessionLabel: null,
+          openedAt: expect.any(String),
+          lastSavedAt: null,
+        },
+      ]);
+      expect(
+        Date.parse(status.body.documents[0].openedAt),
+      ).toBeGreaterThanOrEqual(before - 1000);
+    });
+
+    it("stamps the last save on the tab that has the saved document open", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const documentPath = path.join(projectDir, "draft.md");
+      const otherPath = path.join(projectDir, "other.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      fs.writeFileSync(otherPath, "# Other\n");
+      await request(app)
+        .get("/api/open-requests/poll")
+        .query({ path: documentPath, clientId: "tab-1" });
+      await request(app)
+        .get("/api/open-requests/poll")
+        .query({ path: otherPath, clientId: "tab-2" });
+
+      const before = Date.now();
+      const saved = await request(app)
+        .put("/api/markdown-file")
+        .query({ projectPath: projectDir, path: "draft.md" })
+        .send({ content: "# Saved\n" });
+      expect(saved.status).toBe(200);
+
+      const status = await request(app).get("/api/status");
+      const documents = status.body.documents as Array<{
+        path: string;
+        lastSavedAt: string | null;
+      }>;
+      const draft = documents.find((entry) => entry.path === documentPath);
+      const other = documents.find((entry) => entry.path === otherPath);
+      expect(Date.parse(draft?.lastSavedAt ?? "")).toBeGreaterThanOrEqual(
+        before - 1000,
+      );
+      expect(other?.lastSavedAt).toBeNull();
+    });
+
+    it("keeps the label a tab polls with and takes the label of a delivered open request", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const documentPath = path.join(projectDir, "draft.md");
+      const poll = (label?: string) =>
+        request(app)
+          .get("/api/open-requests/poll")
+          .query({
+            path: documentPath,
+            clientId: "tab-1",
+            ...(label ? { label } : {}),
+          });
+      await poll("plan-review");
+      const labels = async () =>
+        (await request(app).get("/api/status")).body.documents.map(
+          (entry: { sessionLabel: string | null }) => entry.sessionLabel,
+        );
+      expect(await labels()).toEqual(["plan-review"]);
+
+      const sent = await request(app).post("/api/open-request").send({
+        path: documentPath,
+        url: "http://localhost:4312/?label=spec-edit",
+        label: "spec-edit",
+      });
+
+      expect(sent.body).toEqual({ delivered: true });
+      expect(await labels()).toEqual(["spec-edit"]);
+      expect((await poll("spec-edit")).body).toEqual({
+        requests: [
+          {
+            path: documentPath,
+            url: "http://localhost:4312/?label=spec-edit",
+            label: "spec-edit",
+          },
+        ],
+      });
+    });
+
+    it("drops a tab that stopped polling from the record", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const { app } = createApp({ homeDir, staticDirPath: projectDir });
+        await request(app)
+          .get("/api/open-requests/poll")
+          .query({ path: path.join(projectDir, "draft.md"), clientId: "t" });
+        vi.advanceTimersByTime(60_000);
+
+        const status = await request(app).get("/api/status");
+
+        expect(status.body.documents).toEqual([]);
       } finally {
         vi.useRealTimers();
       }

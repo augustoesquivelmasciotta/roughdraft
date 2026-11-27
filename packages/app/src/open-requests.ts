@@ -1,6 +1,8 @@
 export interface OpenRequest {
   path: string;
   url: string;
+  /** The session label of the `roughdraft open` that sent it, if any. */
+  label?: string | null;
 }
 
 const POLL_INTERVAL_MS = 2_000;
@@ -15,6 +17,9 @@ const POLL_INTERVAL_MS = 2_000;
 export function watchOpenRequests(
   documentPath: string | null,
   onRequest: (request: OpenRequest) => void,
+  // Read on every poll, so a label adopted mid-review reaches the server's
+  // record without starting a new poller (which `status` would list twice).
+  getSessionLabel: () => string | null = () => null,
 ): () => void {
   const clientId =
     globalThis.crypto?.randomUUID?.() ??
@@ -28,6 +33,10 @@ export function watchOpenRequests(
       url.searchParams.set("clientId", clientId);
       if (documentPath) {
         url.searchParams.set("path", documentPath);
+      }
+      const sessionLabel = getSessionLabel();
+      if (sessionLabel) {
+        url.searchParams.set("label", sessionLabel);
       }
 
       const res = await fetch(`${url.pathname}${url.search}`);

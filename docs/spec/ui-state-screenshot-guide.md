@@ -113,7 +113,7 @@ suggestions:
 | Preview | Rich text default | `/preview?editor=rich-text` | `page-card-rich-text`, `rich-text-editor` | Uses in-memory preview backend and includes a sample anchored comment. |
 | Preview | Code editor default | `/preview?editor=code` | `page-card-code`, `markdown-code-editor` | Capture line wrapping, code editor chrome, and rail behavior. |
 | Document | Rich/code toggle | Use `document-editor-view-toggle` | `document-editor-view-toggle` | URL changes to `?editor=code` or `?editor=rich-text`. |
-| Document | Editing mode | Open mode menu and choose Editing | `document-mode-trigger` | Normal edit behavior. |
+| Document | Editing mode | Open mode menu and choose Editing | `document-mode-trigger`, `document-mode-option-editing` | Normal edit behavior. |
 | Document | Suggesting mode | Open mode menu and choose Suggesting | `document-mode-trigger` | Selection actions should create suggestions instead of direct edits. |
 | Document | Viewing mode | Open mode menu and choose Viewing | `document-mode-trigger` | Editing controls should look non-editable. |
 | Document | Save status: saved | Any clean document after autosave | `document-save-status` | Checkmark should sit fixed in the top-left corner and fade out over 2 seconds; accessible label remains `Saved`. |
@@ -123,6 +123,11 @@ suggestions:
 | Document | Disk changed | Open local file, modify file externally while browser content is clean | `file-conflict-notice`, `file-conflict-action-reload`, `file-conflict-action-overwrite` | Banner title: `File changed on disk`. |
 | Document | Save conflict | Edit in browser, then modify file externally before autosave resolves | `file-conflict-notice`, `file-conflict-action-keep-editing` | Banner title: `Save conflict`; autosave pauses. |
 | Document | Autosave paused | Keep editing after conflict | `file-conflict-notice`, `file-conflict-action-overwrite` | Banner title: `Autosave paused`; no keep-editing action. |
+| Document | Path and session label | Open a local file with `roughdraft open <path> --label "<session name>"`, or add `&label=<session name>` to the `?path=` URL | `document-location`, `document-path`, `document-session-label` | A line under the header toolbar: the absolute path in monospace, truncated with the full path in its `title`, then `Opened by <session name>`. Capture desktop and a narrow viewport. |
+| Document | No session label | Open a local file without `--label` | `document-location`, `document-session-label` | Same line; the session text reads `No session label`. |
+| Document | Opened again by another session | Open a local file with `?label=a`, then POST `/api/open-request` with the same `path`, a `url` with `label=b` and `label: "b"` while the tab polls | `document-reopened-notice`, `document-reopened-dismiss` | Sky banner: `b opened this document again`; the copy names the previous session. The tab does not reload; the header now reads `Opened by b`. A disk conflict banner wins the slot while it shows. |
+| Document | Agent disconnected | Open a local file while a watcher is connected, then let the watcher go (stop the server and start it again, or end the watch) | `review-watcher-notice`, `review-handoff-button` | The I'm done button stays; under it an amber box `Agent disconnected` saying the command reconnects on its own and otherwise to run `roughdraft open` again. Appears after about 6 s without a watcher. |
+| Document | Server unreachable | Open a local file while a watcher is connected, then make `/api/review-events/status` fail | `review-watcher-notice` | Amber box `Roughdraft server unreachable`; edits stay in the tab. |
 | Document | Review handoff idle | Open a local file while a watcher is connected | `review-handoff-button` | Header text: `Agent watching`. |
 | Document | Review handoff comment popover | Open a local file while a watcher is connected, then click the handoff dropdown trigger | `review-handoff-comment-trigger`, `review-handoff-comment-popover`, `review-handoff-overall-comment` | Capture the split handoff control and textarea with `Overall comment` placeholder before submission. `⌘Enter`/`Ctrl+Enter` submits with the comment. |
 | Document | Review handoff shortcut | Press `⌘D` (Ctrl+D elsewhere) while a watcher is connected | `review-handoff-button` | Same as clicking the button; the browser bookmark dialog never opens. The button title shows the shortcut. |
@@ -140,6 +145,8 @@ suggestions:
 | Editor | Selection menu on suggestion | Select existing suggestion text | `selection-menu-action-accept-suggestion`, `selection-menu-action-reject-suggestion` | Requires review fixture. |
 | Editor | Link popover | Click a link or choose Link from selection menu | `link-popover`, `link-url-input`, `link-action-open`, `link-action-delete` | Use the plain fixture link. |
 | Editor | Context menu | Right-click in rich editor | `editor-context-menu` | Capture comment, suggestion, paste, and paste-markdown actions. |
+| Editor | Unrendered block placeholder | A raw block (escaped-pipe table, `<details>`, indented code after a list) whose preview throws or comes out empty; reachable in tests by loading `<div data-markdown-raw-block="…" data-markdown-raw-block-type="table">` with content that sanitizes to nothing | `unrendered-block-placeholder` | A bordered note at the block's position: `<Type> not rendered`, and that the Markdown is kept and the code view shows it. `data-block-type` carries `table`, `details`, `html-comment` or `indented-code`. HTML comments stay hidden by design and never show it. |
+| Editor | Raw block deletion refused | In rich text, choose Editing, put the caret at the start of the paragraph right after a `<details>` section (or an escaped-pipe table), and press Backspace; or select across the block and press Delete, type, cut or paste | `unrendered-block-deletion-refused`, `raw-markdown-block` (`data-selected="true"` while the block is the selection) | A note under the block: `Rich text will not delete this <block type>, and will not delete a selection that includes it. Switch to code view to remove its Markdown.` The block stays in the document and on disk; the caret is already past it, so the next character lands and clears the note. A hidden HTML comment shows the note where it sits. Suggesting and Viewing modes never show it. |
 | Review rail | Comments | Open review fixture in rich mode | `document-review-rail`, `comment-thread-root` | Thread containers use `data-comment-thread-container="true"`. |
 | Review rail | Suggestions | Open review fixture in rich mode | `suggestion-thread-s1`, `suggestion-thread-s2`, `suggestion-thread-s3` | Thread containers use `data-suggestion-thread-container="true"`. |
 | Review rail | Draft suggestion | Select text and choose a suggestion action | `draft-suggestion-thread`, `draft-suggestion-editor` | Capture dismiss/cancel/apply actions. |
@@ -200,6 +207,8 @@ These are real product states, but they are awkward to capture deterministically
 - Remote connected/disconnected banners
   
 - Update notice
+  
+- Opened again by another session (needs a second open request while the tab polls)
   
 
 The most reliable long-term solution is a dedicated screenshot harness route or Playwright component harness that renders `DocumentWorkspace` with controlled backend, disk, remote, watcher, and save states. Keep the production-route screenshots for broad layout coverage and use the harness for rare operational states.

@@ -91,22 +91,48 @@ interface CreateAppResult {
   port: number;
 }
 
-interface OpenRequestClient {
-  id: number;
+// One connected tab. `path` is the document it has open (null on the
+// homepage), `sessionLabel` names the agent session that opened it,
+// `openedAt` is when the tab first checked in and `lastSavedAt` the last time
+// this server wrote the document while the tab was connected. Together the
+// tabs are the server's in-memory record of open documents; nothing of it is
+// persisted, so it is empty after a restart until the tabs check in again.
+interface OpenDocumentTab {
   path: string | null;
+  sessionLabel: string | null;
+  openedAt: string;
+  lastSavedAt: string | null;
+}
+
+interface OpenRequestClient extends OpenDocumentTab {
+  id: number;
   response: Response;
+}
+
+// What `/api/status` reports for each tab that has a document open.
+export interface OpenDocumentRecord {
+  path: string;
+  sessionLabel: string | null;
+  openedAt: string;
+  lastSavedAt: string | null;
 }
 
 interface OpenRequestPayload {
   path?: string;
   url?: string;
+  label?: string;
+}
+
+function normalizeSessionLabel(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim().slice(0, 200)
+    : null;
 }
 
 // A tab that polls for open requests instead of holding an event stream.
-interface OpenRequestPoller {
-  path: string | null;
+interface OpenRequestPoller extends OpenDocumentTab {
   lastSeenAt: number;
-  pending: Array<{ path: string; url: string }>;
+  pending: Array<{ path: string; url: string; label: string | null }>;
 }
 
 // Why: a tab that stops polling (closed, crashed) must stop receiving
@@ -140,6 +166,19 @@ const REMOTE_SESSION_KEEPALIVE_MS = 15 * 1000;
 const MAX_OVERALL_COMMENT_LENGTH = 4_000;
 
 let nextOpenRequestClientId = 1;
+
+// Why: macOS can spell the same path in NFC or NFD, and a tab may report a
+// relative or unnormalized spelling, so compare resolved, NFC paths.
+function samePath(left: string, right: string): boolean {
+  return (
+    path.resolve(left).normalize("NFC") === path.resolve(right).normalize("NFC")
+  );
+}
+
+function samePathOrBothNull(left: string | null, right: string | null) {
+  if (left === null || right === null) return left === right;
+  return samePath(left, right);
+}
 
 function isLoopbackAddress(address: string | undefined): boolean {
   if (!address) return false;
@@ -428,6 +467,10 @@ function listProjectTree(projectDir: string): ProjectTreeListing {
 
 export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const port = options.port ?? ROUGHDRAFT_DEFAULT_PORT;
+  // Names this server process. A watcher that reconnects after a restart
+  // compares it to tell a new server (whose event sequence starts over) from
+  // a dropped connection.
+  const instanceId = crypto.randomUUID();
   const homeDir = options.homeDir ?? os.homedir();
   const serverRoot = path.resolve(options.serverRoot ?? defaultServerRoot);
   const staticDirPath = options.staticDirPath ?? staticDir;
@@ -731,6 +774,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       if (persistedMarkdown !== markdown) {
         stage = "save-document";
         fs.writeFileSync(target.absolutePath, persistedMarkdown);
+        recordDocumentSave(target.absolutePath);
       }
 
       stage = "emit-event";
@@ -745,7 +789,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       });
 
       reviewRounds.reset(target.absolutePath, persistedMarkdown);
-      writeReviewStatus(target.absolutePath, reviewSuccessStatus());
+      writeReviewStatus(target.absolutePath, reviewSuccessStatus(result.event));
       res.status(201).json(result);
     } catch (error) {
       writeReviewStatus(target.absolutePath, reviewFailureStatus(stage, error));
@@ -781,6 +825,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     try {
       // The same write as a normal save, so watchers and the live view update.
       fs.writeFileSync(target.absolutePath, snapshot.content);
+      recordDocumentSave(target.absolutePath);
     } catch (error) {
       res.status(500).json({
         error: `Could not restore the document: ${error instanceof Error ? error.message : String(error)}`,
@@ -814,7 +859,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       batchWindowMs: batchWindowSeconds * 1000,
     });
 
-    res.json(result);
+    res.json({ ...result, instanceId });
   });
 
   app.get("/api/review-events/status", (req, res) => {
@@ -830,6 +875,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       relativePath: target.relativePath,
       watching: watcherCount > 0,
       watcherCount,
+      instanceId,
     });
   });
 
@@ -881,6 +927,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     }
 
     fs.writeFileSync(absolutePath, content);
+    recordDocumentSave(absolutePath);
     res.json(markdownPageFromFile(relativePath, absolutePath));
   });
 
@@ -915,6 +962,40 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.json({ ok: true });
   });
 
+  function liveTabs(): OpenDocumentTab[] {
+    const now = Date.now();
+    const pollers = Array.from(openRequestPollers.values()).filter(
+      (poller) => now - poller.lastSeenAt <= OPEN_REQUEST_POLLER_TTL_MS,
+    );
+    return [...openRequestClients, ...pollers];
+  }
+
+  // Oldest tab first, so the newest one is last, like open-request routing.
+  function openDocuments(): OpenDocumentRecord[] {
+    const documents: OpenDocumentRecord[] = [];
+    for (const tab of liveTabs()) {
+      if (tab.path === null) continue;
+      documents.push({
+        path: tab.path,
+        sessionLabel: tab.sessionLabel,
+        openedAt: tab.openedAt,
+        lastSavedAt: tab.lastSavedAt,
+      });
+    }
+    return documents.sort(
+      (left, right) => Date.parse(left.openedAt) - Date.parse(right.openedAt),
+    );
+  }
+
+  function recordDocumentSave(absolutePath: string): void {
+    const savedAt = new Date().toISOString();
+    for (const tab of liveTabs()) {
+      if (tab.path !== null && samePath(tab.path, absolutePath)) {
+        tab.lastSavedAt = savedAt;
+      }
+    }
+  }
+
   app.get("/api/status", (_req, res) => {
     res.json({
       backend: "local-files",
@@ -924,7 +1005,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         ? path.resolve(options.projectDir)
         : undefined,
       serverRoot,
+      instanceId,
       stateless: true,
+      documents: openDocuments(),
       capabilities: {
         projectPathRequired: true,
         fileSystemBrowsing: true,
@@ -942,6 +1025,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const client: OpenRequestClient = {
       id: nextOpenRequestClientId,
       path: requestedPath,
+      sessionLabel: normalizeSessionLabel(req.query.label),
+      openedAt: new Date().toISOString(),
+      lastSavedAt: null,
       response: res,
     };
     nextOpenRequestClientId += 1;
@@ -984,12 +1070,22 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       typeof req.query.path === "string" && req.query.path.trim().length > 0
         ? req.query.path.trim()
         : null;
-    const poller = openRequestPollers.get(clientId) ?? {
+    const existing = openRequestPollers.get(clientId);
+    const poller: OpenRequestPoller = existing ?? {
       path: requestedPath,
+      sessionLabel: normalizeSessionLabel(req.query.label),
+      openedAt: new Date(now).toISOString(),
+      lastSavedAt: null,
       lastSeenAt: now,
       pending: [],
     };
+    if (existing && !samePathOrBothNull(existing.path, requestedPath)) {
+      // The tab now shows another document: its open time and saves restart.
+      poller.openedAt = new Date(now).toISOString();
+      poller.lastSavedAt = null;
+    }
     poller.path = requestedPath;
+    poller.sessionLabel = normalizeSessionLabel(req.query.label);
     poller.lastSeenAt = now;
     openRequestPollers.set(clientId, poller);
 
@@ -1013,28 +1109,31 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       res.status(400).json({ error: "path and url are required" });
       return;
     }
+    const sessionLabel = normalizeSessionLabel(payload.label);
+    const event = { path: targetPath, url: targetUrl, label: sessionLabel };
 
-    // Why: macOS can spell the same path in NFC or NFD, so compare normalized.
-    const samePath = (candidate: string | null) =>
-      candidate !== null &&
-      candidate.normalize("NFC") === targetPath.normalize("NFC");
+    const showsTarget = (candidate: string | null) =>
+      candidate !== null && samePath(candidate, targetPath);
 
     const matchingClient = Array.from(openRequestClients)
       .reverse()
-      .find((client) => samePath(client.path));
+      .find((client) => showsTarget(client.path));
 
     if (!matchingClient) {
       const now = Date.now();
       const matchingPoller = Array.from(openRequestPollers.values())
         .filter(
           (poller) =>
-            samePath(poller.path) &&
+            showsTarget(poller.path) &&
             now - poller.lastSeenAt <= OPEN_REQUEST_POLLER_TTL_MS,
         )
         .sort((left, right) => right.lastSeenAt - left.lastSeenAt)[0];
 
       if (matchingPoller) {
-        matchingPoller.pending.push({ path: targetPath, url: targetUrl });
+        // The tab reports the label it adopts on its next poll too; set it
+        // now so `status` names the new session right away.
+        matchingPoller.sessionLabel = sessionLabel;
+        matchingPoller.pending.push(event);
         res.json({ delivered: true });
         return;
       }
@@ -1043,11 +1142,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
+    matchingClient.sessionLabel = sessionLabel;
     matchingClient.response.write(
-      `event: open-request\ndata: ${JSON.stringify({
-        path: targetPath,
-        url: targetUrl,
-      })}\n\n`,
+      `event: open-request\ndata: ${JSON.stringify(event)}\n\n`,
     );
     res.json({ delivered: true });
   });

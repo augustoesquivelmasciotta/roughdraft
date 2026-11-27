@@ -29,10 +29,13 @@ import {
   getDocumentEditorViewModeFromLocation,
   getPathLeaf,
   getRequestedPathState,
+  getSessionLabelFromLocation,
   joinPath,
   PREVIEW_PATH,
   ROUGHDRAFT_FLAVORED_MARKDOWN_PATH,
   syncRequestedPathInUrl,
+  syncSessionLabelInUrl,
+  withoutSessionLabel,
 } from "./app-navigation";
 import { Button } from "./components/ui/button";
 import {
@@ -44,7 +47,10 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "./components/ui/dialog";
-import { DocumentWorkspace } from "./DocumentWorkspace";
+import {
+  type DocumentReopenedNotice,
+  DocumentWorkspace,
+} from "./DocumentWorkspace";
 import { detectBackend } from "./detect-backend";
 import {
   getCommentAnchorMeasurements,
@@ -1458,6 +1464,7 @@ export function PreviewPage() {
         activeDocumentPath={PREVIEW_DOCUMENT_PATH}
         documentCopyPath={PREVIEW_DOCUMENT_PATH}
         documentFilenameLabel={PREVIEW_DOCUMENT_PATH}
+        showDocumentLocation={false}
         documentEditorViewMode={editorViewMode}
         onDocumentEditorViewModeChange={setEditorViewMode}
         onSaveDocument={handleSaveDocument}
@@ -1494,6 +1501,13 @@ export function App() {
   const [documentForceResetKey, setDocumentForceResetKey] = useState<
     string | null
   >(null);
+  const [documentSessionLabel, setDocumentSessionLabel] = useState(
+    getSessionLabelFromLocation,
+  );
+  const documentSessionLabelRef = useRef(documentSessionLabel);
+  documentSessionLabelRef.current = documentSessionLabel;
+  const [documentReopenedNotice, setDocumentReopenedNotice] =
+    useState<DocumentReopenedNotice | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
@@ -1551,20 +1565,53 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    return watchOpenRequests(requestedPathState.rawPath ?? null, (request) => {
-      if (typeof request.url !== "string" || !request.url.trim()) return;
+    return watchOpenRequests(
+      requestedPathState.rawPath ?? null,
+      (request) => {
+        if (typeof request.url !== "string" || !request.url.trim()) return;
 
-      try {
-        const nextUrl = new URL(request.url, window.location.origin);
-        window.focus();
-        if (nextUrl.href !== window.location.href) {
-          window.location.assign(nextUrl.href);
+        try {
+          const nextUrl = new URL(request.url, window.location.origin);
+          window.focus();
+          // A request only reaches the tab that already shows its document.
+          // Anything but the label changing (another server, say) still
+          // loads the new URL as before.
+          if (
+            withoutSessionLabel(nextUrl.href) !==
+            withoutSessionLabel(window.location.href)
+          ) {
+            window.location.assign(nextUrl.href);
+            return;
+          }
+
+          // Same document, maybe another session: take the new label in
+          // place, so the review in progress is not reloaded, and say so
+          // when it was another session's tab.
+          const nextLabel =
+            typeof request.label === "string" && request.label.trim()
+              ? request.label.trim()
+              : null;
+          const previousLabel = documentSessionLabelRef.current;
+          if (nextLabel !== previousLabel) {
+            setDocumentReopenedNotice({
+              previousLabel,
+              sessionLabel: nextLabel,
+            });
+            documentSessionLabelRef.current = nextLabel;
+            setDocumentSessionLabel(nextLabel);
+            syncSessionLabelInUrl(nextLabel);
+          }
+        } catch (error) {
+          console.error("Failed to handle Roughdraft open request:", error);
         }
-      } catch (error) {
-        console.error("Failed to handle Roughdraft open request:", error);
-      }
-    });
+      },
+      () => documentSessionLabelRef.current,
+    );
   }, [requestedPathState.rawPath]);
+
+  const handleDismissDocumentReopenedNotice = useCallback(() => {
+    setDocumentReopenedNotice(null);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -1953,6 +2000,9 @@ export function App() {
         activeDocumentPath={activeDocumentPath}
         documentCopyPath={documentAbsolutePath}
         documentFilenameLabel={documentFilenameLabel}
+        documentSessionLabel={documentSessionLabel}
+        documentReopenedNotice={documentReopenedNotice}
+        onDismissDocumentReopenedNotice={handleDismissDocumentReopenedNotice}
         documentEditorViewMode={documentEditorViewMode}
         onDocumentEditorViewModeChange={handleDocumentEditorViewModeChange}
         onSaveDocument={handleSaveDocument}

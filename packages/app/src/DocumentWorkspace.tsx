@@ -12,6 +12,7 @@ import {
   RefreshCcw,
   Undo2,
   Upload,
+  Users,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DocumentEditorViewMode } from "./app-navigation";
@@ -65,8 +66,27 @@ type ReviewHandoffState =
   | "notified"
   | "undelivered"
   | "error";
+type ReviewWatchLoss = "none" | "unreachable" | "no-watcher";
 type FileCopyAction = "path" | "filename" | "markdown" | "rich-text";
 const FILE_COPY_PREVIEW_MAX_LENGTH = 34;
+const REVIEW_WATCH_STATUS_INTERVAL_MS = 1500;
+// A server restart drops the watcher for the few seconds the agent's command
+// takes to reconnect; the notice waits out that gap before naming a loss.
+const REVIEW_WATCH_LOSS_POLLS = 4;
+
+const reviewWatchLossCopy: Record<
+  Exclude<ReviewWatchLoss, "none">,
+  { title: string; body: string }
+> = {
+  unreachable: {
+    title: "Roughdraft server unreachable",
+    body: "Your edits stay in this tab. It reconnects on its own once the server is back.",
+  },
+  "no-watcher": {
+    title: "Agent disconnected",
+    body: "After a server restart the agent's command reconnects on its own within seconds. If it does not, run roughdraft open on this file again.",
+  },
+};
 const reviewCompleteTitles = [
   "Great work!",
   "Nice one!",
@@ -423,11 +443,26 @@ export function shouldLatchDocumentChangedSinceOpen({
   return isDirty && documentChangeTrackingReady;
 }
 
+/**
+ * A second `roughdraft open` from another session reused this tab (it
+ * already showed the same document) and the session label changed.
+ */
+export interface DocumentReopenedNotice {
+  previousLabel: string | null;
+  sessionLabel: string | null;
+}
+
 interface DocumentWorkspaceProps {
   documentPage: Page | null;
   activeDocumentPath: string | null;
   documentCopyPath: string | null;
   documentFilenameLabel: string;
+  /** The session label of the `roughdraft open` that opened this tab. */
+  documentSessionLabel?: string | null;
+  /** The path and label line under the header; off in the preview. */
+  showDocumentLocation?: boolean;
+  documentReopenedNotice?: DocumentReopenedNotice | null;
+  onDismissDocumentReopenedNotice?: () => void;
   documentEditorViewMode: DocumentEditorViewMode;
   onDocumentEditorViewModeChange: (mode: DocumentEditorViewMode) => void;
   onSaveDocument: (id: string, content: string) => Promise<void>;
@@ -454,6 +489,10 @@ export function DocumentWorkspace({
   activeDocumentPath,
   documentCopyPath,
   documentFilenameLabel,
+  documentSessionLabel = null,
+  showDocumentLocation = true,
+  documentReopenedNotice = null,
+  onDismissDocumentReopenedNotice,
   documentEditorViewMode,
   onDocumentEditorViewModeChange,
   onSaveDocument,
@@ -472,9 +511,21 @@ export function DocumentWorkspace({
   const [documentInteractionMode, setDocumentInteractionMode] =
     useState<DocumentInteractionMode>("suggesting");
   const [saveState, setSaveState] = useState<DocumentSaveState>("saved");
+  const saveStateRef = useRef(saveState);
+  saveStateRef.current = saveState;
+  const saveRetriedRef = useRef(false);
+  // Only a save that went through allows another automatic retry: a retry
+  // that fails again passes through "saving" and must not re-arm itself.
+  if (saveState === "saved") saveRetriedRef.current = false;
   const [reviewHandoffState, setReviewHandoffState] =
     useState<ReviewHandoffState>("idle");
   const [reviewWatcherCount, setReviewWatcherCount] = useState(0);
+  // An agent watched this document at some point since it was opened: the
+  // "I'm done" button then stays through a watcher drop (a server restart,
+  // a reconnecting command) instead of vanishing mid-review.
+  const [reviewWatcherSeen, setReviewWatcherSeen] = useState(false);
+  const [reviewWatchLoss, setReviewWatchLoss] =
+    useState<ReviewWatchLoss>("none");
   const [reviewHandoffPopoverOpen, setReviewHandoffPopoverOpen] =
     useState(false);
   const [reviewCompleteTitle, setReviewCompleteTitle] = useState(() =>
@@ -534,6 +585,8 @@ export function DocumentWorkspace({
     documentChangeTrackingReadyRef.current = false;
     setReviewHandoffState("idle");
     setReviewHandoffPopoverOpen(false);
+    setReviewWatcherSeen(false);
+    setReviewWatchLoss("none");
     setCloseWindowFailed(false);
     setDocumentChangedSinceOpen(false);
     setLastHandoffAt(readLastHandoffAt(documentCopyPath ?? activeDocumentPath));
@@ -550,21 +603,46 @@ export function DocumentWorkspace({
     }
 
     let cancelled = false;
+    let lostPolls = 0;
+    const recordLoss = (loss: Exclude<ReviewWatchLoss, "none">) => {
+      lostPolls += 1;
+      if (lostPolls >= REVIEW_WATCH_LOSS_POLLS) {
+        setReviewWatchLoss(loss);
+      }
+    };
     const refreshWatchStatus = async () => {
       try {
         const status = await backend.getReviewWatchStatus?.(activeDocumentPath);
-        if (!cancelled) {
-          setReviewWatcherCount(status?.watcherCount ?? 0);
+        if (cancelled) return;
+        // The server answers: a save that failed (most likely while it was
+        // away) is retried once now instead of waiting for the next
+        // keystroke. Once per failure, so a save the server keeps refusing
+        // is not hammered.
+        if (saveStateRef.current === "error" && !saveRetriedRef.current) {
+          saveRetriedRef.current = true;
+          void saveControllerRef.current?.flushSave();
+        }
+        const watcherCount = status?.watcherCount ?? 0;
+        setReviewWatcherCount(watcherCount);
+        if (watcherCount > 0) {
+          lostPolls = 0;
+          setReviewWatcherSeen(true);
+          setReviewWatchLoss("none");
+        } else {
+          recordLoss("no-watcher");
         }
       } catch {
-        if (!cancelled) {
-          setReviewWatcherCount(0);
-        }
+        if (cancelled) return;
+        setReviewWatcherCount(0);
+        recordLoss("unreachable");
       }
     };
 
     void refreshWatchStatus();
-    const interval = window.setInterval(refreshWatchStatus, 1500);
+    const interval = window.setInterval(
+      refreshWatchStatus,
+      REVIEW_WATCH_STATUS_INTERVAL_MS,
+    );
     return () => {
       cancelled = true;
       window.clearInterval(interval);
@@ -851,9 +929,24 @@ export function DocumentWorkspace({
     documentDiskChangeState === "clean"
       ? null
       : conflictNoticeCopy[documentDiskChangeState];
+  // A disk conflict asks for a decision, so it wins the top slot.
+  const showReopenedNotice = !!documentReopenedNotice && !conflictNotice;
+  const hasTopNotice = !!conflictNotice || showReopenedNotice;
+  // Once an agent has watched this document the button stays through a
+  // watcher drop; a click with no watcher lands in the undelivered state,
+  // which says what to do.
   const showReviewHandoffButton =
     !!activeDocumentPath &&
-    (reviewWatcherCount > 0 || reviewHandoffState !== "idle");
+    (reviewWatcherCount > 0 ||
+      reviewWatcherSeen ||
+      reviewHandoffState !== "idle");
+  const reviewWatchLossNotice =
+    reviewHandoffState === "idle" &&
+    reviewWatcherSeen &&
+    reviewWatcherCount === 0 &&
+    reviewWatchLoss !== "none"
+      ? reviewWatchLossCopy[reviewWatchLoss]
+      : null;
   const reviewHandoffButtonLabel = getReviewHandoffButtonLabel({
     reviewHandoffState,
     documentChangedSinceOpen,
@@ -872,7 +965,7 @@ export function DocumentWorkspace({
         : reviewCompleteTitle;
   const reviewHandoffStatusBody =
     reviewHandoffState === "undelivered"
-      ? "The handoff was not delivered because the watcher is no longer connected."
+      ? "No agent command is waiting on this document. After a server restart the command reconnects on its own within seconds; otherwise run roughdraft open on this file again, then send the handoff once more."
       : reviewHandoffState === "error"
         ? "Roughdraft could not send the handoff. Check that the local server is still running."
         : null;
@@ -904,7 +997,7 @@ export function DocumentWorkspace({
     <div
       className={cn(
         "min-h-0 flex-1 overflow-y-auto px-3 pb-8 sm:px-12",
-        conflictNotice
+        hasTopNotice
           ? "pt-40 sm:pt-28"
           : // Without the rail beside it, the header would sit under the
             // fixed "I'm done" button.
@@ -928,7 +1021,11 @@ export function DocumentWorkspace({
       <div
         className={cn(
           "fixed right-3 z-[60] flex max-w-[min(16rem,calc(100vw-1rem))] flex-col items-end gap-1.5",
-          conflictNotice ? "top-[19rem] sm:top-[7rem]" : "top-3",
+          conflictNotice
+            ? "top-[19rem] sm:top-[7rem]"
+            : showReopenedNotice
+              ? "top-[10rem] sm:top-[6rem]"
+              : "top-3",
         )}
         data-testid="document-status-stack"
         data-document-status-stack="true"
@@ -1131,7 +1228,61 @@ export function DocumentWorkspace({
             </Popover>
           ) : null}
         </div>
+        {reviewWatchLossNotice ? (
+          <div
+            data-testid="review-watcher-notice"
+            role="status"
+            aria-label={reviewWatchLossNotice.title}
+            className="max-w-full rounded-[7px] border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-right text-xs leading-4 text-amber-950 shadow-[0_10px_28px_rgba(0,0,0,0.12)] dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
+          >
+            <div className="font-semibold">{reviewWatchLossNotice.title}</div>
+            <div className="mt-0.5 text-amber-900 dark:text-amber-200">
+              {reviewWatchLossNotice.body}
+            </div>
+          </div>
+        ) : null}
       </div>
+      {showReopenedNotice && documentReopenedNotice ? (
+        <div
+          data-testid="document-reopened-notice"
+          role="status"
+          aria-label="Document opened again by another session"
+          className="fixed top-3 left-1/2 z-50 flex w-[min(calc(100vw-1rem),52rem)] -translate-x-1/2 flex-col gap-3 rounded-[8px] border border-sky-300 dark:border-sky-700 bg-sky-50 dark:bg-sky-950 px-3 py-3 text-sky-950 dark:text-sky-100 shadow-[0_14px_40px_rgba(12,74,110,0.18)] dark:shadow-[0_14px_40px_rgba(0,0,0,0.4)] sm:flex-row sm:items-center sm:justify-between sm:px-4"
+        >
+          <div className="flex min-w-0 items-start gap-2.5">
+            <Users
+              className="mt-0.5 size-4 shrink-0 text-sky-700 dark:text-sky-400"
+              aria-hidden="true"
+            />
+            <div className="min-w-0">
+              <div className="text-sm font-semibold leading-5">
+                {documentReopenedNotice.sessionLabel
+                  ? `${documentReopenedNotice.sessionLabel} opened this document again`
+                  : "A session with no label opened this document again"}
+              </div>
+              <div className="mt-0.5 text-xs leading-5 text-sky-900 dark:text-sky-200">
+                {documentReopenedNotice.previousLabel
+                  ? `This tab was opened by ${documentReopenedNotice.previousLabel}. `
+                  : "This tab was opened with no session label. "}
+                Your edits stay. I&apos;m done now reaches every session waiting
+                on this file.
+              </div>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center sm:justify-end">
+            <Button
+              type="button"
+              data-testid="document-reopened-dismiss"
+              variant="ghost"
+              size="sm"
+              className="h-8 rounded-[7px] bg-white/55 dark:bg-white/10 px-2 text-xs text-sky-950 dark:text-sky-100 hover:bg-white dark:hover:bg-white/20"
+              onClick={onDismissDocumentReopenedNotice}
+            >
+              Dismiss
+            </Button>
+          </div>
+        </div>
+      ) : null}
       {conflictNotice ? (
         <div
           data-testid="file-conflict-notice"
@@ -1369,6 +1520,7 @@ export function DocumentWorkspace({
                         ({ value, label, Icon }) => (
                           <SelectItem
                             key={value}
+                            data-testid={`document-mode-option-${value}`}
                             value={value}
                             label={label}
                             className="text-[0.8rem]"
@@ -1384,6 +1536,31 @@ export function DocumentWorkspace({
                   </Select>
                 </div>
               </div>
+              {showDocumentLocation ? (
+                <div
+                  data-testid="document-location"
+                  className="mt-1 flex w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 px-1 text-[0.68rem] leading-4 text-stone-400 dark:text-slate-500"
+                >
+                  {documentCopyPath ? (
+                    <span
+                      data-testid="document-path"
+                      title={documentCopyPath}
+                      className="min-w-0 max-w-full truncate font-mono"
+                    >
+                      {documentCopyPath}
+                    </span>
+                  ) : null}
+                  <span
+                    data-testid="document-session-label"
+                    title={documentSessionLabel ?? undefined}
+                    className="min-w-0 max-w-full truncate"
+                  >
+                    {documentSessionLabel
+                      ? `Opened by ${documentSessionLabel}`
+                      : "No session label"}
+                  </span>
+                </div>
+              ) : null}
             </div>
           </div>
         ) : null}

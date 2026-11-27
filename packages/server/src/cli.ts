@@ -22,7 +22,11 @@ import {
   runOrcaCommand,
 } from "./orca.js";
 import { findAvailablePort } from "./ports.js";
-import { waitForReviewEvents } from "./review-watch.js";
+import type { ReviewDoneReason } from "./review-events.js";
+import {
+  ReviewWatchConnectionLostError,
+  waitForReviewEvents,
+} from "./review-watch.js";
 import { resolveUpdateStatus, type UpdateStatus } from "./update-status.js";
 
 const AGENT_SETUP_URL = "https://roughdraft.md/setup.md";
@@ -56,12 +60,43 @@ export interface RoughdraftServerState {
   url: string;
 }
 
+// One tab's open document as `/api/status` reports it.
+interface StatusDocument {
+  path: string;
+  sessionLabel: string | null;
+  openedAt: string;
+  lastSavedAt: string | null;
+}
+
 interface StatusPayload {
   backend?: string;
   pid?: number;
   projectDir?: string;
   serverRoot?: string;
   port?: number;
+  documents?: StatusDocument[];
+}
+
+interface ReviewIndexPayload {
+  items?: Array<{ id: string; kind: string; status: string | null }>;
+}
+
+// One tab holding a document, as `status <path>` reports it.
+interface OpenDocumentTab {
+  sessionLabel: string | null;
+  openedAt: string;
+}
+
+interface OpenDocumentStatus {
+  path: string;
+  open: true;
+  sessionLabel: string | null;
+  openedAt: string;
+  lastSavedAt: string | null;
+  tabs: OpenDocumentTab[];
+  // Null when the review index could not be read; `threadsError` says why.
+  openThreads: { count: number; ids: string[] } | null;
+  threadsError: string | null;
 }
 
 interface DevFrontendState {
@@ -112,13 +147,7 @@ type OpenMode =
   | "orca-tab";
 
 interface EnsureRunningResult {
-  server: {
-    port: number;
-    url: string;
-    tracked: boolean;
-    pid: number | null;
-    startedAt: string | null;
-  };
+  server: ReusableServer;
   reused: boolean;
   portChanged: boolean;
 }
@@ -134,6 +163,7 @@ interface ReusableServer {
   tracked: boolean;
   pid: number | null;
   startedAt: string | null;
+  documents: StatusDocument[];
 }
 
 type KnownCommand = (typeof KNOWN_COMMANDS)[number];
@@ -156,6 +186,8 @@ interface ParsedCommandOptions {
   batchWindowSeconds: number;
   help: boolean;
   json: boolean;
+  label?: string;
+  loop: boolean;
   noOpen: boolean;
   noWatch: boolean;
   printUrl: boolean;
@@ -172,6 +204,7 @@ interface ParsedWatchOptions {
   batchWindowSeconds: number;
   help: boolean;
   json: boolean;
+  loop?: boolean;
   positionals: string[];
   replay: boolean;
   serverUrl?: string;
@@ -284,6 +317,7 @@ function parseCommandOptions(
     batchWindowSeconds: 0.25,
     help: false,
     json: false,
+    loop: false,
     noOpen: false,
     noWatch: false,
     positionals: [],
@@ -329,6 +363,20 @@ function parseCommandOptions(
       continue;
     }
 
+    if (arg === "--label") {
+      if (!options.allowOpen) throw new Error(`Unknown flag: ${arg}`);
+      const next = takeFlagValue(args, index, arg);
+      parsed.label = next.value;
+      index = next.nextIndex;
+      continue;
+    }
+
+    if (arg.startsWith("--label=")) {
+      if (!options.allowOpen) throw new Error(`Unknown flag: --label`);
+      parsed.label = arg.slice("--label=".length);
+      continue;
+    }
+
     if (arg === "--watch") {
       if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
       parsed.watch = true;
@@ -338,6 +386,12 @@ function parseCommandOptions(
     if (arg === "--no-watch") {
       if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
       parsed.noWatch = true;
+      continue;
+    }
+
+    if (arg === "--loop") {
+      if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
+      parsed.loop = true;
       continue;
     }
 
@@ -860,7 +914,7 @@ function printHelp(log: (message: string) => void) {
   log("Commands:");
   log("  open <path>        Open a Markdown file and wait for Done Reviewing");
   log("  start              Start or reuse the background server");
-  log("  status             Show server status");
+  log("  status [<path>]    Show server status, or a document's open threads");
   log("  stop               Stop the managed background server");
   log("  watch <path>       Wait for a Done Reviewing event");
   log("  mcp                Start the experimental stdio MCP server");
@@ -881,8 +935,10 @@ function printHelp(log: (message: string) => void) {
   log("  roughdraft open ./draft.md --print-url");
   log("  roughdraft open ./draft.md --json");
   log("  roughdraft open ./draft.md --no-watch");
+  log("  roughdraft open ./draft.md --loop --json");
   log("  roughdraft watch ./draft.md --json");
   log("  roughdraft status --json");
+  log("  roughdraft status ./draft.md");
   log("");
   log(`Agent setup: ${AGENT_SETUP_URL}`);
   log("Use `roughdraft help agent` for a copyable setup prompt.");
@@ -895,12 +951,27 @@ function printCommandHelp(
   if (command === "open") {
     log("Usage:");
     log(
-      "  roughdraft open <path> [--no-open] [--no-watch] [--print-url] [--port <port>]",
+      "  roughdraft open <path> [--label <text>] [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
     );
     log("");
     log(
       "Opens one Markdown file and waits for Done Reviewing. Starts Roughdraft if needed.",
     );
+    log("");
+    log(
+      "Loop mode (--loop) returns after each round like the default, and also",
+    );
+    log(
+      "reports whether the reviewer signaled done: an overall comment that says",
+    );
+    log(
+      'the review is done ("done", "lgtm", "looks good", "listo" and the like,',
+    );
+    log("as the whole comment) or a submission with every thread cleared.");
+    log("Anything else means act on the feedback and reopen the document. The");
+    log('--json output carries `done` and `doneReason` ("overall-comment",');
+    log('"threads-cleared" or null); <name>-status.json next to the document');
+    log("carries the same two fields.");
     log("");
     log("Flags:");
     log(
@@ -910,12 +981,28 @@ function printCommandHelp(
       "  --print-url          Print only the document URL and do not open it",
     );
     log("  --no-watch           Open the file without waiting");
+    log(
+      "  --loop               Report whether the round ended with a done-signal",
+    );
+    log(
+      "  --label <text>       Name this session; the document header shows who opened it",
+    );
     log("  --timeout <seconds>  Maximum watch time; omitted means no timeout");
     log("  --replay             Allow watch to return retained older events");
     log("  --json               Print machine-readable output");
     log("  --port <port>        Preferred server port");
     log("  --state-file <path>  Server state file");
     log("  --state-dir <dir>    Directory containing server.json");
+    log("");
+    log("If the server stops while waiting (roughdraft stop, an upgrade), the");
+    log(
+      "wait survives a restart: the command reconnects and keeps waiting for",
+    );
+    log("Done Reviewing. When the server does not come back within the");
+    log(
+      "reconnect window (default 120 s) the command exits 1 and says so; the",
+    );
+    log("--json output then carries `disconnected: true`.");
     log("");
     log("Environment variables:");
     log(
@@ -931,6 +1018,9 @@ function printCommandHelp(
     log("                        non-loopback host. Must match the value the");
     log("                        hosted server was started with.");
     log("  ROUGHDRAFT_NO_OPEN    Set to 1 to suppress browser launch.");
+    log("  ROUGHDRAFT_WATCH_RECONNECT_SECONDS");
+    log("                        Seconds to wait for a stopped server to come");
+    log("                        back before giving up (default: 120).");
     log("  ROUGHDRAFT_ORCA       Inside an Orca terminal, documents open as a");
     log(
       "                        tab of that worktree in Orca's browser, which",
@@ -972,9 +1062,20 @@ function printCommandHelp(
 
   if (command === "status") {
     log("Usage:");
-    log("  roughdraft status [--json]");
+    log("  roughdraft status [<path>] [--json]");
     log("");
-    log("Shows whether Roughdraft is running.");
+    log("Shows whether Roughdraft is running, and which documents are open in");
+    log("it with the session label each was opened with.");
+    log("");
+    log("With a path, reports that document's open threads and last save: an");
+    log("open thread is any comment, reply or suggestion not marked resolved,");
+    log("which is the same count that ends the review loop, and the last save");
+    log("is the last time this server wrote the document while a tab had it");
+    log("open. A path that no tab has open is reported as not open, and a");
+    log("review index that cannot be read is reported as an error at exit 1.");
+    log("");
+    log("When several tabs hold the same path, Session and Opened name the");
+    log("newest tab and Also open in lists the rest.");
     log("");
     log("Flags:");
     log("  --json               Print machine-readable output");
@@ -1167,11 +1268,16 @@ function buildLoopbackUrl(host: string, port: number, pathname = "/"): URL {
   return new URL(`http://${baseHost}:${port}${pathname}`);
 }
 
-function buildTargetUrl(baseUrl: string, openPath: string): string {
+function buildTargetUrl(
+  baseUrl: string,
+  openPath: string,
+  sessionLabel: string | null = null,
+): string {
   const url = new URL(baseUrl);
 
   url.pathname = "/";
   url.searchParams.set("path", openPath);
+  if (sessionLabel) url.searchParams.set("label", sessionLabel);
   return url.toString();
 }
 
@@ -1469,6 +1575,32 @@ async function openInOrcaTab(
   return null;
 }
 
+// A second `open` of a document that a tab already shows reuses that tab
+// (each document has its own tab, so a tab is never pointed at another
+// document). When the tab belongs to another session, say so before taking
+// it over: that session's reviewer is in the middle of it, and Done
+// Reviewing there now reaches both sessions.
+function warnBeforeReusingAnotherSessionsTab(
+  deps: CliDependencies,
+  documents: StatusDocument[],
+  openPath: string,
+  sessionLabel: string | null,
+) {
+  const wanted = openPath.normalize("NFC");
+  const tabs = documents.filter(
+    (entry) => path.resolve(entry.path).normalize("NFC") === wanted,
+  );
+  const owner = tabs.at(-1);
+  // Same label (or neither labeled): the same session reopening for its
+  // next round, which is the normal review loop.
+  if (!owner || owner.sessionLabel === sessionLabel) return;
+
+  const ownerName = owner.sessionLabel ?? "a session with no label";
+  deps.error(
+    `${openPath} is already open in a tab opened by ${ownerName}. This open reuses that tab; Done Reviewing there reaches every session waiting on the file.`,
+  );
+}
+
 function describeOpenedDocument(openMode: OpenMode, url: string): string {
   switch (openMode) {
     case "chrome-app":
@@ -1491,13 +1623,18 @@ async function sendOpenRequestToExistingWindow(
   baseUrl: string,
   targetUrl: string,
   openPath: string,
+  sessionLabel: string | null,
 ): Promise<boolean> {
   try {
     const requestUrl = new URL("/api/open-request", baseUrl);
     const response = await deps.fetchImpl(requestUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: openPath, url: targetUrl }),
+      body: JSON.stringify({
+        path: openPath,
+        url: targetUrl,
+        ...(sessionLabel ? { label: sessionLabel } : {}),
+      }),
       signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
     });
 
@@ -1826,6 +1963,7 @@ async function findReusableServer(
         tracked: true,
         pid: normalizedState.pid,
         startedAt: normalizedState.startedAt,
+        documents: statusPayload.documents ?? [],
       };
     }
 
@@ -1838,6 +1976,7 @@ async function findReusableServer(
         tracked: false,
         pid: null,
         startedAt: null,
+        documents: statusPayload.documents ?? [],
       };
     }
   }
@@ -1853,6 +1992,7 @@ async function findReusableServer(
     tracked: false,
     pid: null,
     startedAt: null,
+    documents: preferredStatus.documents ?? [],
   };
 }
 
@@ -1919,6 +2059,7 @@ export async function ensureServerRunning(
       tracked: true,
       pid: state.pid,
       startedAt: state.startedAt,
+      documents: [],
     },
     reused: false,
     portChanged: port !== preferredPort,
@@ -1945,6 +2086,95 @@ function buildServerStatusJson(
     stateFile: stateFilePath,
     managed: server.tracked,
   };
+}
+
+// Describes one open document for `status <path>`: null when no tab has it
+// open. Several tabs can hold the same path; the newest one names the session
+// and the latest save across them counts, and every tab is listed in `tabs`.
+async function describeOpenDocument(
+  server: ReusableServer,
+  documentPath: string,
+  deps: CliDependencies,
+): Promise<OpenDocumentStatus | null> {
+  const wanted = documentPath.normalize("NFC");
+  const entries = server.documents.filter(
+    (entry) => path.resolve(entry.path).normalize("NFC") === wanted,
+  );
+  const newest = entries[entries.length - 1];
+  if (!newest) return null;
+
+  const lastSavedAt = entries
+    .map((entry) => entry.lastSavedAt)
+    .filter((value): value is string => value !== null)
+    .sort((a, b) => Date.parse(a) - Date.parse(b))
+    .pop();
+
+  const openDocument = {
+    path: documentPath,
+    open: true as const,
+    sessionLabel: newest.sessionLabel,
+    openedAt: newest.openedAt,
+    lastSavedAt: lastSavedAt ?? null,
+    tabs: entries.map((entry) => ({
+      sessionLabel: entry.sessionLabel,
+      openedAt: entry.openedAt,
+    })),
+  };
+
+  let reviewIndex: ReviewIndexPayload;
+  try {
+    const reviewIndexUrl = new URL("/api/review-index", server.url);
+    reviewIndexUrl.searchParams.set("projectPath", path.dirname(documentPath));
+    reviewIndexUrl.searchParams.set("path", path.basename(documentPath));
+    const response = await deps.fetchImpl(reviewIndexUrl, {
+      signal: AbortSignal.timeout(STATUS_TIMEOUT_MS * 4),
+    });
+    if (!response.ok) {
+      throw new Error(`the server answered ${response.status}`);
+    }
+    reviewIndex = (await response.json()) as ReviewIndexPayload;
+  } catch (error) {
+    // The file can be renamed or deleted, and the server can go away, between
+    // the status poll and this call. Report that instead of crashing.
+    return {
+      ...openDocument,
+      openThreads: null,
+      threadsError: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  // An open thread is any item the review index leaves unresolved, replies
+  // included: the same rule as `summary.unresolved`, which the
+  // `threads-cleared` done-signal reads, so this count and the end of the
+  // review loop always agree.
+  const openThreadIds = (reviewIndex.items ?? [])
+    .filter((item) => item.status !== "resolved")
+    .map((item) => item.id);
+
+  return {
+    ...openDocument,
+    openThreads: { count: openThreadIds.length, ids: openThreadIds },
+    threadsError: null,
+  };
+}
+
+function formatSessionLine(sessionLabel: string | null): string {
+  return `Session: ${sessionLabel ?? "no label given"}`;
+}
+
+function printServerProcessLines(
+  deps: CliDependencies,
+  server: ReusableServer,
+  stateFilePath: string,
+) {
+  if (server.tracked && server.pid !== null && server.startedAt !== null) {
+    deps.log(`PID: ${server.pid}`);
+    deps.log(`Started: ${server.startedAt}`);
+    deps.log(`State file: ${stateFilePath}`);
+    return;
+  }
+
+  deps.log(`This server is not managed by ${stateFilePath}.`);
 }
 
 async function stopTrackedServer(deps: CliDependencies): Promise<{
@@ -2215,22 +2445,69 @@ async function runWatch(
     serverUrl = result.server.url;
   }
   const relativePath = path.relative(target.projectDir, target.openPath);
+  const reconnectSeconds = readReconnectWindowSeconds(deps.env);
   // Bounded polls: a single request would die after five minutes
   // (UND_ERR_HEADERS_TIMEOUT), and reviews can take much longer.
-  const payload = await waitForReviewEvents({
-    fetchImpl: deps.fetchImpl,
-    serverUrl,
-    target: {
-      projectPath: target.projectDir,
-      path: relativePath,
-      batchWindowSeconds: options.batchWindowSeconds,
-    },
-    timeoutSeconds: options.timeoutSeconds,
-    fromNow: !options.replay,
-  });
+  let payload: Awaited<ReturnType<typeof waitForReviewEvents>>;
+  try {
+    payload = await waitForReviewEvents({
+      fetchImpl: deps.fetchImpl,
+      serverUrl,
+      target: {
+        projectPath: target.projectDir,
+        path: relativePath,
+        batchWindowSeconds: options.batchWindowSeconds,
+      },
+      timeoutSeconds: options.timeoutSeconds,
+      fromNow: !options.replay,
+      failureWindowMs: reconnectSeconds * 1000,
+      onConnectionLost: () => {
+        deps.error(
+          `Roughdraft server at ${serverUrl} stopped during the review; waiting up to ${reconnectSeconds} s for it to come back.`,
+        );
+      },
+      onReconnected: () => {
+        deps.error(
+          "Reconnected to the Roughdraft server; waiting for Done Reviewing again.",
+        );
+      },
+    });
+  } catch (error) {
+    if (!(error instanceof ReviewWatchConnectionLostError)) throw error;
+    // The server died mid-round and never came back: say so instead of
+    // throwing, so an agent in the loop knows to reopen rather than guess.
+    const message = `Roughdraft server at ${serverUrl} did not come back within ${reconnectSeconds} s. This command cannot receive Done Reviewing for ${target.openPath}; run \`roughdraft open ${relativeDisplayPath(deps.cwd, target.openPath)}\` again to resume the review.`;
+    if (json) {
+      emitJson(deps.log, {
+        disconnected: true,
+        error: message,
+        timedOut: false,
+        events: [],
+        ...(options.loop ? { done: false, doneReason: null } : {}),
+      });
+    } else {
+      deps.error(message);
+    }
+    return 1;
+  }
+
+  // A batch window can deliver several events in one round; the newest one
+  // reflects the document's latest state, so it decides the done-signal.
+  const latestEvent = (payload.events ?? []).at(-1) as
+    | {
+        doneReason?: ReviewDoneReason | null;
+        summary?: { unresolved?: number };
+      }
+    | undefined;
+  const doneReason = latestEvent?.doneReason ?? null;
 
   if (json) {
-    emitJson(deps.log, payload);
+    emitJson(
+      deps.log,
+      options.loop
+        ? { ...payload, done: doneReason !== null, doneReason }
+        : payload,
+    );
     return payload.timedOut ? 1 : 0;
   }
 
@@ -2241,7 +2518,33 @@ async function runWatch(
 
   deps.log(`Review completed for ${target.openPath}.`);
   deps.log(`Received ${(payload.events ?? []).length} event(s).`);
+  if (options.loop) {
+    deps.log(describeDoneSignal(doneReason, latestEvent?.summary?.unresolved));
+  }
   return 0;
+}
+
+const DEFAULT_RECONNECT_SECONDS = 120;
+
+function readReconnectWindowSeconds(env: NodeJS.ProcessEnv): number {
+  const configured = Number(env.ROUGHDRAFT_WATCH_RECONNECT_SECONDS);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_RECONNECT_SECONDS;
+}
+
+function describeDoneSignal(
+  doneReason: ReviewDoneReason | null,
+  unresolved: number | undefined,
+): string {
+  if (doneReason === "overall-comment") {
+    return "Reviewer signaled done: the overall comment says the review is done.";
+  }
+  if (doneReason === "threads-cleared") {
+    return "Reviewer signaled done: every thread is cleared.";
+  }
+  const openCount = typeof unresolved === "number" ? `${unresolved} ` : "";
+  return `Review continues: ${openCount}item(s) still open and no done-signal. Act on the feedback and reopen the document.`;
 }
 
 function isMarkdownPath(targetPath: string): boolean {
@@ -2436,21 +2739,28 @@ export async function runCli(
         return 0;
       }
 
-      if (options.positionals.length > 0) {
-        deps.error("Usage: roughdraft status [--json]");
+      if (options.positionals.length > 1) {
+        deps.error("Usage: roughdraft status [<path>] [--json]");
         return USAGE_ERROR;
       }
 
+      const documentPath =
+        options.positionals[0] !== undefined
+          ? path.resolve(deps.cwd, options.positionals[0])
+          : null;
       deps = applyCliEnvOverrides(deps, options);
       const json = parsed.global.json || options.json;
       shouldPrintUpdateNotice = !json;
+      const stateFilePath = getServerStateFilePath(deps.env);
       const server = await findReusableServer(deps);
       if (!server) {
         if (json) {
-          emitJson(
-            deps.log,
-            buildServerStatusJson(null, getServerStateFilePath(deps.env)),
-          );
+          emitJson(deps.log, {
+            ...buildServerStatusJson(null, stateFilePath),
+            ...(documentPath
+              ? { document: { path: documentPath, open: false } }
+              : {}),
+          });
           return 0;
         }
 
@@ -2460,23 +2770,68 @@ export async function runCli(
         return 1;
       }
 
-      if (json) {
-        emitJson(
-          deps.log,
-          buildServerStatusJson(server, getServerStateFilePath(deps.env)),
+      if (documentPath) {
+        const document = await describeOpenDocument(server, documentPath, deps);
+        if (json) {
+          emitJson(deps.log, {
+            ...buildServerStatusJson(server, stateFilePath),
+            document: document ?? { path: documentPath, open: false },
+          });
+          return document?.threadsError ? 1 : 0;
+        }
+
+        deps.log(`Roughdraft is running at ${server.url}`);
+        printServerProcessLines(deps, server, stateFilePath);
+        if (!document) {
+          deps.log(`${documentPath} is not open in Roughdraft.`);
+          return 1;
+        }
+
+        deps.log(`Document: ${document.path}`);
+        deps.log(formatSessionLine(document.sessionLabel));
+        deps.log(`Opened: ${document.openedAt}`);
+        const olderTabs = document.tabs.slice(0, -1);
+        if (olderTabs.length > 0) {
+          deps.log(
+            `Also open in: ${olderTabs
+              .map(
+                (tab) =>
+                  `${tab.sessionLabel ?? "no label given"} (opened ${tab.openedAt})`,
+              )
+              .join(", ")}`,
+          );
+        }
+        deps.log(`Last save: ${document.lastSavedAt ?? "none since opened"}`);
+        if (!document.openThreads) {
+          deps.error(
+            `Could not read the review index for ${documentPath}: ${document.threadsError}`,
+          );
+          return 1;
+        }
+        deps.log(
+          document.openThreads.count === 0
+            ? "Open threads: 0"
+            : `Open threads: ${document.openThreads.count} (${document.openThreads.ids.join(", ")})`,
         );
         return 0;
       }
 
+      if (json) {
+        emitJson(deps.log, {
+          ...buildServerStatusJson(server, stateFilePath),
+          documents: server.documents,
+        });
+        return 0;
+      }
+
       deps.log(`Roughdraft is running at ${server.url}`);
-      if (server.tracked && server.pid !== null && server.startedAt !== null) {
-        deps.log(`PID: ${server.pid}`);
-        deps.log(`Started: ${server.startedAt}`);
-        deps.log(`State file: ${getServerStateFilePath(deps.env)}`);
-      } else {
-        deps.log(
-          `This server is not managed by ${getServerStateFilePath(deps.env)}.`,
-        );
+      printServerProcessLines(deps, server, stateFilePath);
+      if (server.documents.length === 0) {
+        deps.log("Document: none open");
+      }
+      for (const document of server.documents) {
+        deps.log(`Document: ${document.path}`);
+        deps.log(formatSessionLine(document.sessionLabel));
       }
       return 0;
     }
@@ -2770,6 +3125,16 @@ export async function runCli(
         return USAGE_ERROR;
       }
 
+      if (options.loop && options.noWatch) {
+        deps.error("Use either --loop or --no-watch, not both.");
+        return USAGE_ERROR;
+      }
+
+      if (options.loop && options.printUrl) {
+        deps.error("Use either --loop or --print-url, not both.");
+        return USAGE_ERROR;
+      }
+
       deps = applyCliEnvOverrides(deps, options);
       const json = parsed.global.json || options.json;
       let resolvedTarget: ResolvedTargetPath;
@@ -2781,12 +3146,19 @@ export async function runCli(
       }
 
       const { projectDir, openPath } = resolvedTarget;
+      const sessionLabel = options.label?.trim() || null;
 
       const remoteHost =
         typeof deps.env.ROUGHDRAFT_HOST === "string"
           ? deps.env.ROUGHDRAFT_HOST.trim()
           : "";
       if (remoteHost.length > 0) {
+        if (options.loop) {
+          deps.error(
+            "--loop is not supported with ROUGHDRAFT_HOST: a remote session never receives Done Reviewing.",
+          );
+          return USAGE_ERROR;
+        }
         return runRemoteOpen(deps, {
           host: remoteHost,
           openPath,
@@ -2807,7 +3179,13 @@ export async function runCli(
         baseUrl = buildPublicBaseUrl(result.server.port);
       }
 
-      const targetUrl = buildTargetUrl(baseUrl, openPath);
+      const targetUrl = buildTargetUrl(baseUrl, openPath, sessionLabel);
+      warnBeforeReusingAnotherSessionsTab(
+        deps,
+        result?.server.documents ?? [],
+        openPath,
+        sessionLabel,
+      );
       let openMode: OpenMode = "disabled";
       if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
         // Why: inside Orca the tab in the agent's worktree wins over reusing a
@@ -2821,6 +3199,17 @@ export async function runCli(
           deps.error(error.message);
           return 1;
         }
+        if (orcaOpenMode === "existing-orca-tab") {
+          // Orca only brings the reused tab forward; the open request is
+          // what tells the page about the new session label.
+          await sendOpenRequestToExistingWindow(
+            deps,
+            baseUrl,
+            targetUrl,
+            openPath,
+            sessionLabel,
+          );
+        }
         openMode =
           orcaOpenMode ??
           ((await sendOpenRequestToExistingWindow(
@@ -2828,6 +3217,7 @@ export async function runCli(
             baseUrl,
             targetUrl,
             openPath,
+            sessionLabel,
           ))
             ? "existing-window"
             : deps.openUrl(targetUrl));
@@ -2859,6 +3249,7 @@ export async function runCli(
           batchWindowSeconds: options.batchWindowSeconds,
           help: false,
           json,
+          loop: options.loop,
           positionals: [target],
           replay: options.replay,
           serverUrl: liveDevFrontend?.apiUrl ?? undefined,

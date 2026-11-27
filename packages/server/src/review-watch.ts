@@ -7,7 +7,10 @@
  * answer within `MAX_REVIEW_POLL_SECONDS`, and the next one continues from the
  * event sequence the previous one reported, so no event is missed between
  * polls. Transient connection failures (for example a server restart) are
- * retried for a while instead of ending the wait.
+ * retried for a while instead of ending the wait. The first poll after a
+ * failure answers at once, so a restarted server (a new `instanceId`, whose
+ * event sequence starts over) is noticed before a long poll waits on a
+ * cursor that means nothing to it.
  */
 
 /** Longest single wait, safely below undici's 300 s headers timeout. */
@@ -16,11 +19,15 @@ export const MAX_REVIEW_POLL_SECONDS = 240;
 /** Extra time a poll may take before the client gives up on it. */
 const POLL_GRACE_SECONDS = 30;
 
-/** Backoff between retries after a failed poll; the last delay repeats. */
-const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
+/**
+ * Backoff between retries after a failed poll; the last delay repeats. Kept
+ * short: while the CLI is between retries the restarted server has no
+ * watcher, and an "I'm done" in that gap is not delivered.
+ */
+const RETRY_DELAYS_MS = [1_000, 2_000, 3_000];
 
-/** Give up after this long without a successful poll. */
-const MAX_FAILURE_WINDOW_MS = 120_000;
+/** Give up after this long without a successful poll, unless told otherwise. */
+const DEFAULT_FAILURE_WINDOW_MS = 120_000;
 
 export interface ReviewWatchTarget {
   projectPath: string;
@@ -32,6 +39,7 @@ export interface ReviewWatchPayload {
   events?: unknown[];
   timedOut?: boolean;
   nextSequence?: number;
+  instanceId?: string;
   [key: string]: unknown;
 }
 
@@ -46,6 +54,12 @@ export interface WaitForReviewEventsOptions {
   /** Ignore events that happened before the wait started (default). */
   fromNow?: boolean;
   headers?: Record<string, string>;
+  /** How long the server may stay unreachable before the wait gives up. */
+  failureWindowMs?: number;
+  /** Called once when a poll first fails to reach the server. */
+  onConnectionLost?: () => void;
+  /** Called when a poll succeeds again after a lost connection. */
+  onReconnected?: () => void;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
 }
@@ -57,6 +71,17 @@ function defaultSleep(milliseconds: number) {
 }
 
 class ReviewWatchHttpError extends Error {}
+
+/**
+ * The server stopped answering mid-wait and did not come back within the
+ * failure window. Callers report it as `disconnected` instead of crashing.
+ */
+export class ReviewWatchConnectionLostError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "ReviewWatchConnectionLostError";
+  }
+}
 
 export async function waitForReviewEvents(
   options: WaitForReviewEventsOptions,
@@ -71,13 +96,18 @@ export async function waitForReviewEvents(
   let afterSequence = options.afterSequence ?? 0;
   let failingSince: number | null = null;
   let failures = 0;
+  const failureWindowMs = options.failureWindowMs ?? DEFAULT_FAILURE_WINDOW_MS;
+  let knownInstanceId: string | null = null;
+  let reprime = false;
 
   while (true) {
     const remainingSeconds =
       deadline === null
         ? Number.POSITIVE_INFINITY
         : Math.max(0, (deadline - now()) / 1000);
-    const pollSeconds = Math.min(MAX_REVIEW_POLL_SECONDS, remainingSeconds);
+    const pollSeconds = reprime
+      ? 0
+      : Math.min(MAX_REVIEW_POLL_SECONDS, remainingSeconds);
     const body = {
       ...options.target,
       timeoutSeconds: pollSeconds,
@@ -109,25 +139,49 @@ export async function waitForReviewEvents(
       // connection: report it instead of retrying.
       if (error instanceof ReviewWatchHttpError) throw error;
 
-      failingSince ??= now();
+      if (failingSince === null) {
+        failingSince = now();
+        options.onConnectionLost?.();
+      }
       const deadlinePassed = deadline !== null && now() >= deadline;
-      if (deadlinePassed || now() - failingSince >= MAX_FAILURE_WINDOW_MS) {
-        throw error;
+      if (deadlinePassed || now() - failingSince >= failureWindowMs) {
+        throw new ReviewWatchConnectionLostError(error);
       }
 
       const delay =
         RETRY_DELAYS_MS[Math.min(failures, RETRY_DELAYS_MS.length - 1)] ??
         1_000;
       failures += 1;
+      reprime = true;
       await sleep(delay);
       continue;
     }
 
+    if (failingSince !== null) options.onReconnected?.();
     failingSince = null;
     failures = 0;
+    const wasReprime = reprime;
+    reprime = false;
+
+    const instanceId =
+      typeof payload.instanceId === "string" ? payload.instanceId : null;
+    if (instanceId !== null) {
+      const restarted =
+        knownInstanceId !== null && instanceId !== knownInstanceId;
+      knownInstanceId = instanceId;
+      if (restarted && !fromNow) {
+        // The poll was filtered with the old server's cursor. Every event
+        // the new server has happened after the restart, so after this
+        // wait began: take them all.
+        afterSequence = 0;
+        continue;
+      }
+    }
 
     if (!payload.timedOut) return payload;
-    if (deadline !== null && now() >= deadline) return payload;
+    // A quick poll after a reconnect found nothing yet: move the cursor as
+    // after any empty poll and keep waiting.
+    if (!wasReprime && deadline !== null && now() >= deadline) return payload;
 
     if (typeof payload.nextSequence === "number") {
       const latestSequence = payload.nextSequence - 1;
