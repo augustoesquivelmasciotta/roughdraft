@@ -40,14 +40,16 @@ describe("strikethrough takes two tildes (roughdraftplus #38)", () => {
   it("keeps single tildes in prose as text when the block is rewritten", () => {
     const input = "Roughly ~57% (~100h) of the work is left.\n";
 
-    expect(renderedBody(input).querySelector("del")).toBeNull();
+    expect(criticMarkdownToRenderedHtml(input).html).not.toContain("<del>");
     expect(rewrite(input)).toBe(input);
   });
 
   it("keeps a doubled-tilde strikethrough when the block is rewritten", () => {
     const input = "Ship ~~later~~ today.\n";
 
-    expect(renderedBody(input).querySelector("del")?.textContent).toBe("later");
+    expect(criticMarkdownToRenderedHtml(input).html).toContain(
+      "<del>later</del>",
+    );
     expect(rewrite(input)).toBe(input);
   });
 });
