@@ -987,7 +987,7 @@ const RawMarkdownBlock = Node.create({
 });
 
 /** Position of the raw block whose deletion was just refused, if any. */
-export interface RawMarkdownBlockGuardState {
+interface RawMarkdownBlockGuardState {
   refusedPos: number | null;
 }
 
