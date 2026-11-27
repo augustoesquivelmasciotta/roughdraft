@@ -11,6 +11,14 @@ import {
 import { isReviewEndmatter, parseReviewEndmatter } from "./review-endmatter";
 
 export const rawMarkdownBlockAttribute = "data-markdown-raw-block";
+export const rawMarkdownBlockTypeAttribute = "data-markdown-raw-block-type";
+
+/** Which construct a raw block keeps as source, so a placeholder can name it. */
+export type RawMarkdownBlockType =
+  | "table"
+  | "details"
+  | "html-comment"
+  | "indented-code";
 
 export interface MarkdownOptions {
   resolveFileUrl?: (path: string) => string | null;
@@ -62,14 +70,17 @@ export function decodeRawMarkdownBlock(encoded: string): string {
   }
 }
 
-function createRawMarkdownBlock(markdown: string): string {
+function createRawMarkdownBlock(
+  markdown: string,
+  blockType: RawMarkdownBlockType,
+): string {
   return `<div ${rawMarkdownBlockAttribute}="${escapeHtml(
     encodeRawMarkdownBlock(markdown),
-  )}"></div>\n`;
+  )}" ${rawMarkdownBlockTypeAttribute}="${blockType}"></div>\n`;
 }
 
 const rawMarkdownBlockPlaceholderPattern = new RegExp(
-  `<div ${rawMarkdownBlockAttribute}="([^"]*)"></div>(\\n?)`,
+  `<div ${rawMarkdownBlockAttribute}="([^"]*)"(?: ${rawMarkdownBlockTypeAttribute}="[^"]*")?></div>(\\n?)`,
   "g",
 );
 
@@ -87,7 +98,11 @@ export function decodeRawMarkdownPlaceholders(markdown: string): string {
   );
 }
 
-function replaceSpans(markdown: string, spans: MarkdownBlockSpan[]): string {
+function replaceSpans(
+  markdown: string,
+  spans: MarkdownBlockSpan[],
+  blockType: RawMarkdownBlockType,
+): string {
   if (spans.length === 0) return markdown;
 
   let output = "";
@@ -97,7 +112,10 @@ function replaceSpans(markdown: string, spans: MarkdownBlockSpan[]): string {
   )) {
     if (span.start < cursor) continue;
     output += markdown.slice(cursor, span.start);
-    output += createRawMarkdownBlock(markdown.slice(span.start, span.end));
+    output += createRawMarkdownBlock(
+      markdown.slice(span.start, span.end),
+      blockType,
+    );
     cursor = span.end;
   }
 
@@ -108,10 +126,12 @@ function protectRawHtmlBlocks(markdown: string): string {
   const withDetailsProtected = replaceSpans(
     markdown,
     findDetailsBlocks(markdown),
+    "details",
   );
   return replaceSpans(
     withDetailsProtected,
     findHtmlCommentBlocks(withDetailsProtected),
+    "html-comment",
   );
 }
 
@@ -119,7 +139,7 @@ function protectIndentedCodeAfterLists(markdown: string): string {
   return transformOutsideFencedCode(markdown, (segment) =>
     segment.replace(
       /^(?:[-*+]|\d+[.)]) [^\r\n]*(?:\r?\n)[ \t]*(?:\r?\n)(?:(?: {4}|\t)[^\r\n]*(?:\r?\n|$))+/gm,
-      (raw) => createRawMarkdownBlock(raw),
+      (raw) => createRawMarkdownBlock(raw, "indented-code"),
     ),
   );
 }
@@ -187,7 +207,7 @@ function protectPipeSensitiveTables(markdown: string): string {
 
     const raw = tableLines.join("");
     const needsProtection = raw.includes("\\|") || codeSpanContainsPipe(raw);
-    output.push(needsProtection ? createRawMarkdownBlock(raw) : raw);
+    output.push(needsProtection ? createRawMarkdownBlock(raw, "table") : raw);
     index -= 1;
   }
 

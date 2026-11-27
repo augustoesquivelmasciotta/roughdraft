@@ -19,6 +19,36 @@ test.describe("opening local markdown files", () => {
     removeMarkdownProject(projectDir);
   });
 
+  test("tags a table kept as source with its type and still shows it", async ({
+    page,
+  }) => {
+    const filePath = writeProjectFile(
+      projectDir,
+      "flags.md",
+      [
+        "# Flags",
+        "",
+        "| Flag | Meaning |",
+        "| --- | --- |",
+        "| `a \\| b` | either |",
+        "",
+        "After the table.",
+        "",
+      ].join("\n"),
+    );
+
+    await openMarkdownFile(page, filePath, "rich-text");
+
+    const editor = page.getByTestId("rich-text-editor");
+    const rawTable = editor.locator('[data-markdown-raw-block-type="table"]');
+    await expect(rawTable).toBeVisible();
+    await expect(rawTable).toContainText("either");
+    await expect(
+      editor.getByTestId("unrendered-block-placeholder"),
+    ).toHaveCount(0);
+    await expect(editor).toContainText("After the table.");
+  });
+
   test("renders core Markdown blocks from a real file @smoke", async ({
     page,
   }) => {

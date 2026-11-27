@@ -21,9 +21,12 @@ import DOMPurify from "dompurify";
 import { SectionFolding } from "./editor-folding";
 import {
   decodeRawMarkdownBlock,
+  type RawMarkdownBlockType,
   rawMarkdownBlockAttribute,
+  rawMarkdownBlockTypeAttribute,
   toHtml,
 } from "./markdown";
+import { alertVariants } from "./components/ui/alert";
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
@@ -771,9 +774,62 @@ const MarkdownImage = Image.extend({
  * preview. `<details>` blocks become real collapsible sections. HTML
  * comments are source-only notes and stay hidden.
  */
-function renderRawMarkdownPreview(dom: HTMLElement, encoded: string) {
+const rawBlockLabels: Record<RawMarkdownBlockType, string> = {
+  table: "Table",
+  details: "Details block",
+  "html-comment": "HTML comment",
+  "indented-code": "Indented code block",
+};
+
+function rawBlockLabel(blockType: string): string {
+  return blockType in rawBlockLabels
+    ? rawBlockLabels[blockType as RawMarkdownBlockType]
+    : "Block";
+}
+
+// Something a reader can see even without text: an image, a rule, a table...
+const visibleWithoutTextSelector =
+  "img, svg, hr, table, details, summary, pre, code, input, video, iframe";
+
+/**
+ * A visible box where a block could not be shown, naming its type, so the
+ * reader never meets an unexplained gap. The markdown is kept untouched.
+ */
+function renderUnrenderedBlockPlaceholder(dom: HTMLElement, blockType: string) {
+  const label = rawBlockLabel(blockType);
+  dom.className = "rd-raw-block rd-raw-block--unrendered my-4";
+  dom.dataset.unrenderedBlock = "true";
+
+  const alert = document.createElement("div");
+  alert.dataset.slot = "alert";
+  alert.dataset.testid = "unrendered-block-placeholder";
+  alert.dataset.blockType = blockType;
+  alert.setAttribute("role", "note");
+  alert.className = alertVariants({ variant: "default" });
+
+  const title = document.createElement("div");
+  title.dataset.slot = "alert-title";
+  title.className = "font-medium";
+  title.textContent = `${label} not rendered`;
+
+  const description = document.createElement("div");
+  description.dataset.slot = "alert-description";
+  description.className = "text-xs/relaxed text-muted-foreground";
+  description.textContent = `Roughdraft could not show this ${label.toLowerCase()} in rich text. Its Markdown is kept exactly as written; switch to code view to read or edit it.`;
+
+  alert.append(title, description);
+  dom.replaceChildren(alert);
+}
+
+function renderRawMarkdownPreview(
+  dom: HTMLElement,
+  encoded: string,
+  blockType: string,
+) {
   const markdown = decodeRawMarkdownBlock(encoded);
   dom.setAttribute(rawMarkdownBlockAttribute, encoded);
+  dom.setAttribute(rawMarkdownBlockTypeAttribute, blockType);
+  delete dom.dataset.unrenderedBlock;
 
   if (/^\s*<!--[\s\S]*-->\s*$/.test(markdown)) {
     dom.className = "rd-raw-block rd-raw-block--hidden";
@@ -781,8 +837,24 @@ function renderRawMarkdownPreview(dom: HTMLElement, encoded: string) {
     return;
   }
 
+  let html: string;
+  try {
+    html = DOMPurify.sanitize(toHtml(markdown));
+  } catch (error) {
+    console.error("Failed to render a raw markdown block:", error);
+    renderUnrenderedBlockPlaceholder(dom, blockType);
+    return;
+  }
+
   dom.className = "rd-raw-block";
-  dom.innerHTML = DOMPurify.sanitize(toHtml(markdown));
+  dom.innerHTML = html;
+  if (
+    !dom.textContent?.trim() &&
+    !dom.querySelector(visibleWithoutTextSelector)
+  ) {
+    renderUnrenderedBlockPlaceholder(dom, blockType);
+    return;
+  }
   for (const link of dom.querySelectorAll("a[href]")) {
     link.setAttribute("target", "_blank");
     link.setAttribute("rel", "noreferrer noopener");
@@ -801,16 +873,19 @@ const RawMarkdownBlock = Node.create({
       dom.contentEditable = "false";
       dom.dataset.testid = "raw-markdown-block";
       let currentMarkdown = String(node.attrs.rawMarkdown ?? "");
-      renderRawMarkdownPreview(dom, currentMarkdown);
+      let currentType = String(node.attrs.blockType ?? "block");
+      renderRawMarkdownPreview(dom, currentMarkdown, currentType);
 
       return {
         dom,
         update: (updatedNode) => {
           if (updatedNode.type.name !== "rawMarkdownBlock") return false;
           const nextMarkdown = String(updatedNode.attrs.rawMarkdown ?? "");
-          if (nextMarkdown !== currentMarkdown) {
+          const nextType = String(updatedNode.attrs.blockType ?? "block");
+          if (nextMarkdown !== currentMarkdown || nextType !== currentType) {
             currentMarkdown = nextMarkdown;
-            renderRawMarkdownPreview(dom, nextMarkdown);
+            currentType = nextType;
+            renderRawMarkdownPreview(dom, nextMarkdown, nextType);
           }
           return true;
         },
@@ -830,6 +905,14 @@ const RawMarkdownBlock = Node.create({
           element.getAttribute(rawMarkdownBlockAttribute) ?? "",
         renderHTML: (attributes) => ({
           [rawMarkdownBlockAttribute]: attributes.rawMarkdown ?? "",
+        }),
+      },
+      blockType: {
+        default: "block",
+        parseHTML: (element) =>
+          element.getAttribute(rawMarkdownBlockTypeAttribute) ?? "block",
+        renderHTML: (attributes) => ({
+          [rawMarkdownBlockTypeAttribute]: attributes.blockType ?? "block",
         }),
       },
     };
