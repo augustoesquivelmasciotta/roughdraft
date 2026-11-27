@@ -14,8 +14,13 @@ import type {
   Mark as ProseMirrorMark,
   Node as ProseMirrorNode,
 } from "@tiptap/pm/model";
-import { Plugin, PluginKey } from "@tiptap/pm/state";
-import { Decoration, DecorationSet } from "@tiptap/pm/view";
+import {
+  Plugin,
+  PluginKey,
+  TextSelection,
+  type Transaction,
+} from "@tiptap/pm/state";
+import { Decoration, DecorationSet, type EditorView } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
 import DOMPurify from "dompurify";
 import { SectionFolding } from "./editor-folding";
@@ -861,6 +866,42 @@ function renderRawMarkdownPreview(
   }
 }
 
+/**
+ * Spec key the guard puts on a node decoration when it has just refused a
+ * change that would have deleted this block.
+ */
+const rawMarkdownBlockDeletionRefusedDecoration =
+  "rawMarkdownBlockDeletionRefused";
+
+function hasDeletionRefusedDecoration(
+  decorations: readonly Decoration[],
+): boolean {
+  return decorations.some(
+    (decoration) =>
+      (decoration.spec as Record<string, unknown> | undefined)?.[
+        rawMarkdownBlockDeletionRefusedDecoration
+      ] === true,
+  );
+}
+
+/**
+ * Tells the reader why their keystroke did nothing. It says only what stays
+ * true once the refusal has run: the caret is already clear of the block, so
+ * the next character lands.
+ */
+function renderDeletionRefusedNote(dom: HTMLElement, blockType: string) {
+  const label = rawBlockLabel(blockType).toLowerCase();
+  // A hidden HTML comment has no box of its own; show the note anyway.
+  dom.classList.remove("rd-raw-block--hidden");
+  const note = document.createElement("div");
+  note.dataset.slot = "alert";
+  note.dataset.testid = "unrendered-block-deletion-refused";
+  note.setAttribute("role", "status");
+  note.className = `${alertVariants({ variant: "default" })} mt-2`;
+  note.textContent = `Rich text will not delete this ${label}, and will not delete a selection that includes it. Switch to code view to remove its Markdown.`;
+  dom.append(note);
+}
+
 const RawMarkdownBlock = Node.create({
   name: "rawMarkdownBlock",
   group: "block",
@@ -874,20 +915,38 @@ const RawMarkdownBlock = Node.create({
       dom.dataset.testid = "raw-markdown-block";
       let currentMarkdown = String(node.attrs.rawMarkdown ?? "");
       let currentType = String(node.attrs.blockType ?? "block");
+      let currentRefused = false;
       renderRawMarkdownPreview(dom, currentMarkdown, currentType);
 
       return {
         dom,
-        update: (updatedNode) => {
+        update: (updatedNode, decorations) => {
           if (updatedNode.type.name !== "rawMarkdownBlock") return false;
           const nextMarkdown = String(updatedNode.attrs.rawMarkdown ?? "");
           const nextType = String(updatedNode.attrs.blockType ?? "block");
-          if (nextMarkdown !== currentMarkdown || nextType !== currentType) {
+          const nextRefused = hasDeletionRefusedDecoration(decorations);
+          if (
+            nextMarkdown !== currentMarkdown ||
+            nextType !== currentType ||
+            nextRefused !== currentRefused
+          ) {
             currentMarkdown = nextMarkdown;
             currentType = nextType;
+            currentRefused = nextRefused;
             renderRawMarkdownPreview(dom, nextMarkdown, nextType);
+            if (nextRefused) renderDeletionRefusedNote(dom, nextType);
           }
           return true;
+        },
+        // Says whether the block is the editor's selection, which nothing
+        // else on this element shows (and a keystroke then acts on it).
+        selectNode: () => {
+          dom.dataset.selected = "true";
+          dom.classList.add("ProseMirror-selectednode");
+        },
+        deselectNode: () => {
+          delete dom.dataset.selected;
+          dom.classList.remove("ProseMirror-selectednode");
         },
         // The preview is read-only: let the reader open <details> and follow
         // links without the editor treating it as an edit.
@@ -927,6 +986,153 @@ const RawMarkdownBlock = Node.create({
   },
 });
 
+/** Position of the raw block whose deletion was just refused, if any. */
+export interface RawMarkdownBlockGuardState {
+  refusedPos: number | null;
+}
+
+export const rawMarkdownBlockGuardPluginKey =
+  new PluginKey<RawMarkdownBlockGuardState>("rawMarkdownBlockGuard");
+
+/**
+ * Position of the first raw block this transaction would drop, or null when
+ * it would drop none. Textblocks are not descended into, so the walk stays
+ * cheap enough to run on every transaction.
+ *
+ * Each block is judged on its own extent: both ends are mapped inward, so a
+ * deletion beside the block leaves them a whole node apart while a deletion
+ * of the block collapses them. The survivor must also carry the same
+ * Markdown, so swapping a different raw block in where one stood counts as a
+ * loss while replacing a block by an identical copy does not.
+ */
+function firstDroppedRawBlockPos(
+  tr: Transaction,
+  doc: ProseMirrorNode,
+): number | null {
+  let dropped: number | null = null;
+
+  doc.descendants((node, pos) => {
+    if (dropped !== null) return false;
+    if (node.type.name !== "rawMarkdownBlock") return !node.isTextblock;
+
+    const start = tr.mapping.map(pos, 1);
+    const end = tr.mapping.map(pos + node.nodeSize, -1);
+    const survivor = tr.doc.nodeAt(start);
+
+    if (
+      end - start !== node.nodeSize ||
+      survivor?.type.name !== "rawMarkdownBlock" ||
+      survivor.attrs.rawMarkdown !== node.attrs.rawMarkdown
+    ) {
+      dropped = pos;
+    }
+
+    return false;
+  });
+
+  return dropped;
+}
+
+/**
+ * Marks the refusal on the block and moves the caret clear of it. Without
+ * the move, the selection that spanned the block stays, and every character
+ * typed next would be another refused replacement of that range.
+ */
+function releaseSelection(view: EditorView, refusedPos: number): void {
+  if (view.isDestroyed) return;
+  const tr = view.state.tr.setMeta(rawMarkdownBlockGuardPluginKey, {
+    refusedPos,
+  });
+  const node = view.state.doc.nodeAt(refusedPos);
+  if (node) {
+    tr.setSelection(
+      TextSelection.near(view.state.doc.resolve(refusedPos + node.nodeSize), 1),
+    );
+  }
+  view.dispatch(tr);
+}
+
+/**
+ * Keeps a raw block (a <details> section, an escaped-pipe table, indented
+ * code after a list, an HTML comment) from leaving the document through rich
+ * text. Rich text cannot recreate these blocks, so Backspace or Delete on a
+ * selected block, typing, cutting or pasting over a selection that includes
+ * one, or Backspace at the start of the paragraph after one would drop its
+ * Markdown, and autosave would write the loss to disk.
+ *
+ * The rule is about the document, not about a gesture: any transaction that
+ * would drop a raw block is rejected, whatever produced it. Two exemptions
+ * cover the legitimate ways a block leaves: tiptap's `setContent` (a document
+ * loaded or reloaded from disk, Descartar cambios included), marked by the
+ * `preventUpdate` meta, and undo/redo, marked by the history meta. The code
+ * view edits the Markdown directly and never meets this rule.
+ *
+ * Suggesting mode never trips it (its handlers turn edits into suggestion
+ * marks), and Viewing mode dispatches no edits.
+ */
+const RawMarkdownBlockGuard = Extension.create({
+  name: "rawMarkdownBlockGuard",
+
+  addProseMirrorPlugins() {
+    const { editor } = this;
+
+    return [
+      new Plugin<RawMarkdownBlockGuardState>({
+        key: rawMarkdownBlockGuardPluginKey,
+        state: {
+          init: () => ({ refusedPos: null }),
+          apply(tr, value) {
+            const meta = tr.getMeta(rawMarkdownBlockGuardPluginKey) as
+              | RawMarkdownBlockGuardState
+              | undefined;
+            if (meta) return meta;
+            if (value.refusedPos === null) return value;
+            return tr.docChanged || tr.selectionSet
+              ? { refusedPos: null }
+              : value;
+          },
+        },
+        filterTransaction(tr, state) {
+          if (!tr.docChanged) return true;
+          // `PluginKey("history")` resolves to this name; reading it keeps
+          // the guard from importing the history plugin.
+          if (tr.getMeta("history$")) return true;
+          if (tr.getMeta("preventUpdate") !== undefined) return true;
+
+          const refusedPos = firstDroppedRawBlockPos(tr, state.doc);
+          if (refusedPos === null) return true;
+
+          // The transaction is rejected, so the position still points at the
+          // block. Marking it and moving the caret wait for this dispatch to
+          // finish.
+          queueMicrotask(() => {
+            releaseSelection(editor.view, refusedPos);
+          });
+          return false;
+        },
+        props: {
+          decorations(state) {
+            const refusedPos =
+              rawMarkdownBlockGuardPluginKey.getState(state)?.refusedPos ??
+              null;
+            if (refusedPos === null) return null;
+            const node = state.doc.nodeAt(refusedPos);
+            if (!node) return null;
+            return DecorationSet.create(state.doc, [
+              Decoration.node(
+                refusedPos,
+                refusedPos + node.nodeSize,
+                {},
+                { [rawMarkdownBlockDeletionRefusedDecoration]: true },
+              ),
+            ]);
+          },
+        },
+      }),
+    ];
+  },
+});
+
 export function createEditorExtensions(placeholder: string) {
   return [
     StarterKit.configure({
@@ -959,6 +1165,7 @@ export function createEditorExtensions(placeholder: string) {
     CommentRef,
     CriticChange,
     RawMarkdownBlock,
+    RawMarkdownBlockGuard,
     MarkdownCodeBlock,
     CommentHighlight,
     CriticChangeHighlight,
