@@ -46,6 +46,35 @@ test.describe("a raw block in editing mode", () => {
     const editor = richTextEditor(page);
     await editor.getByText("After the section.").click();
     await page.keyboard.press("Home");
+    // The editor takes the caret from the browser a moment after the click
+    // and Home; a Backspace before that acts on the old caret.
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const dom = document.querySelector(".ProseMirror") as
+            | (Element & {
+                editor?: {
+                  state: {
+                    selection: {
+                      empty: boolean;
+                      $from: {
+                        parentOffset: number;
+                        parent: { textContent: string };
+                      };
+                    };
+                  };
+                };
+              })
+            | null;
+          const selection = dom?.editor?.state.selection;
+          return selection?.empty &&
+            selection.$from.parentOffset === 0 &&
+            selection.$from.parent.textContent === "After the section."
+            ? "ready"
+            : "waiting";
+        }),
+      )
+      .toBe("ready");
     await page.keyboard.press("Backspace");
 
     await expect(
