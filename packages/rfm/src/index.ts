@@ -88,7 +88,64 @@ interface Metadata {
   endOffset: number;
 }
 
-const CRITICMARKUP_CLOSE_DELIMITER_PATTERN = /<<}|\+\+}|--}|~~}|==}/;
+const CRITICMARKUP_CLOSE_DELIMITERS = ["<<}", "++}", "--}", "~~}", "==}"];
+// A delimiter written with a leading backslash is literal text, not a marker
+// boundary. See the Escaping Delimiters section of the RFM spec.
+const CRITICMARKUP_ESCAPED_DELIMITER_PATTERN =
+  /\\(\\|\{==|==\}|\{>>|<<\}|\{\+\+|\+\+\}|\{--|--\}|\{~~|~~\}|~>)/g;
+
+function unescapeCriticMarkupText(text: string): string {
+  return text.replace(CRITICMARKUP_ESCAPED_DELIMITER_PATTERN, "$1");
+}
+
+function indexOfUnescaped(
+  markdown: string,
+  delimiter: string,
+  from: number,
+): number {
+  for (let offset = from; offset < markdown.length; offset += 1) {
+    if (markdown[offset] === "\\") {
+      offset += 1;
+      continue;
+    }
+    if (markdown.startsWith(delimiter, offset)) return offset;
+  }
+
+  return -1;
+}
+
+const CRITICMARKUP_OPEN_DELIMITERS = ["{==", "{>>", "{++", "{--", "{~~"];
+
+// A document written before escaping existed can end a marker's text with a
+// bare backslash, which an escape-aware scan reads as escaping the delimiter
+// that closes the marker. The scan stops at an unescaped opening delimiter,
+// since that is another marker starting and so the text ended before it, and
+// falls back to the first raw closing delimiter. Without that bound the scan
+// ran on to a later marker's close and the first marker swallowed the marker in
+// between. The bound never fires on a document this format wrote, because every
+// opener in its marker text is escaped.
+function indexOfMarkerDelimiter(
+  markdown: string,
+  delimiter: string,
+  from: number,
+): number {
+  for (let offset = from; offset < markdown.length; offset += 1) {
+    if (markdown[offset] === "\\") {
+      offset += 1;
+      continue;
+    }
+    if (markdown.startsWith(delimiter, offset)) return offset;
+    if (
+      CRITICMARKUP_OPEN_DELIMITERS.some((opener) =>
+        markdown.startsWith(opener, offset),
+      )
+    ) {
+      break;
+    }
+  }
+
+  return markdown.indexOf(delimiter, from);
+}
 
 interface IdReference {
   id: string;
@@ -321,7 +378,7 @@ export function validateRoughdraftMarkdown(
     }
 
     if (markdown.startsWith("{==", offset)) {
-      const end = markdown.indexOf("==}", offset + 3);
+      const end = indexOfMarkerDelimiter(markdown, "==}", offset + 3);
       if (end === -1) {
         addDiagnostic(
           "error",
@@ -539,13 +596,15 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
     }
 
     if (markdown.startsWith("{==", offset)) {
-      const end = markdown.indexOf("==}", offset + 3);
+      const end = indexOfMarkerDelimiter(markdown, "==}", offset + 3);
       if (end === -1) {
         offset += 3;
         continue;
       }
 
-      const anchorText = markdown.slice(offset + 3, end);
+      const anchorText = unescapeCriticMarkupText(
+        markdown.slice(offset + 3, end),
+      );
       let nextOffset = end + 3;
       let anchoredComments = 0;
       while (markdown.startsWith("{>>", nextOffset)) {
@@ -664,6 +723,8 @@ export function appendRoughdraftReply(
     });
   }
 
+  assertSafeMarkerText(options.message);
+
   const reply = `{>>${options.message}<<}${serializeMetadataAttributes({
     id: replyId,
     by: options.author ?? "AI",
@@ -674,13 +735,32 @@ export function appendRoughdraftReply(
   return `${markdown.slice(0, parent.endOffset)}${reply}${markdown.slice(parent.endOffset)}`;
 }
 
+// Reply text is written between delimiters verbatim, so a raw closing delimiter
+// would end the comment early. An escaped one is literal text the reader strips
+// again, which is what the shipped agent prompt tells an agent to write.
 function assertSafeCommentBodyText(message: string): void {
-  const match = message.match(CRITICMARKUP_CLOSE_DELIMITER_PATTERN);
-  if (!match) return;
+  for (const delimiter of CRITICMARKUP_CLOSE_DELIMITERS) {
+    if (indexOfUnescaped(message, delimiter, 0) === -1) continue;
 
-  throw new Error(
-    `Reply text contains CriticMarkup close delimiter "${match[0]}". Rewrite the reply without raw CriticMarkup delimiters.`,
-  );
+    throw new Error(
+      `Reply text contains an unescaped CriticMarkup close delimiter "${delimiter}". Write it as "\\${delimiter}" or rewrite the reply without it.`,
+    );
+  }
+}
+
+// Marker text must not contain an unescaped opening delimiter either, since an
+// unescaped opener is another marker beginning and a reader ends the marker
+// there. This applies only to text written between delimiters: a document-level
+// comment and a reply to an endmatter-backed item are written to YAML, where a
+// delimiter is inert and an escape would survive into the text.
+function assertSafeMarkerText(message: string): void {
+  for (const delimiter of CRITICMARKUP_OPEN_DELIMITERS) {
+    if (indexOfUnescaped(message, delimiter, 0) === -1) continue;
+
+    throw new Error(
+      `Reply text contains an unescaped CriticMarkup open delimiter "${delimiter}". Write it as "\\${delimiter}" or rewrite the reply without it.`,
+    );
+  }
 }
 
 export function markRoughdraftResolved(
@@ -838,7 +918,7 @@ function parseComment(
     offset: number,
   ) => void,
 ): ParsedComment | null {
-  const close = markdown.indexOf("<<}", offset + 3);
+  const close = indexOfMarkerDelimiter(markdown, "<<}", offset + 3);
   if (close === -1) {
     addDiagnostic(
       "error",
@@ -852,7 +932,7 @@ function parseComment(
   const metadata = parseMetadata(markdown, close + 3, true, addDiagnostic);
 
   return {
-    content: markdown.slice(offset + 3, close),
+    content: unescapeCriticMarkupText(markdown.slice(offset + 3, close)),
     metadata,
     offset,
     markerEndOffset: close + 3,
@@ -880,7 +960,9 @@ function parseSuggestion(
     );
     return {
       suggestionKind: "addition",
-      text: markdown.slice(offset + 3, addition.endOffset - 3),
+      text: unescapeCriticMarkupText(
+        markdown.slice(offset + 3, addition.endOffset - 3),
+      ),
       metadata,
       offset,
       markerEndOffset: addition.endOffset,
@@ -905,7 +987,9 @@ function parseSuggestion(
       false,
       addDiagnostic,
     );
-    const text = markdown.slice(offset + 3, deletion.endOffset - 3);
+    const text = unescapeCriticMarkupText(
+      markdown.slice(offset + 3, deletion.endOffset - 3),
+    );
     return {
       suggestionKind: "deletion",
       text,
@@ -927,9 +1011,11 @@ function parseSuggestion(
   }
 
   if (markdown.startsWith("{~~", offset)) {
-    const separator = markdown.indexOf("~>", offset + 3);
+    const separator = indexOfMarkerDelimiter(markdown, "~>", offset + 3);
     const close =
-      separator === -1 ? -1 : markdown.indexOf("~~}", separator + 2);
+      separator === -1
+        ? -1
+        : indexOfMarkerDelimiter(markdown, "~~}", separator + 2);
 
     if (separator === -1 || close === -1) {
       addDiagnostic(
@@ -945,9 +1031,13 @@ function parseSuggestion(
     const metadata = parseMetadata(markdown, endOffset, false, addDiagnostic);
     return {
       suggestionKind: "substitution",
-      text: markdown.slice(separator + 2, close),
-      originalText: markdown.slice(offset + 3, separator),
-      replacementText: markdown.slice(separator + 2, close),
+      text: unescapeCriticMarkupText(markdown.slice(separator + 2, close)),
+      originalText: unescapeCriticMarkupText(
+        markdown.slice(offset + 3, separator),
+      ),
+      replacementText: unescapeCriticMarkupText(
+        markdown.slice(separator + 2, close),
+      ),
       metadata,
       offset,
       markerEndOffset: endOffset,
@@ -966,7 +1056,11 @@ function parseWrappedMarker(
 ): { endOffset: number } | null {
   if (!markdown.startsWith(open, offset)) return null;
 
-  const closeOffset = markdown.indexOf(close, offset + open.length);
+  const closeOffset = indexOfMarkerDelimiter(
+    markdown,
+    close,
+    offset + open.length,
+  );
   return closeOffset === -1 ? null : { endOffset: closeOffset + close.length };
 }
 

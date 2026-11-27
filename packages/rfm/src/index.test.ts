@@ -617,3 +617,151 @@ describe("RFM mutation helpers", () => {
     });
   });
 });
+
+describe("escaped review delimiters", () => {
+  const typedText = String.raw`back\slash {==a==} {>>b<<} {++c++} {--d--} {~~e~>f~~} g~>h`;
+  const escapedText = String.raw`back\\slash \{==a\==} \{>>b\<<} \{++c\++} \{--d\--} \{~~e\~>f\~~} g\~>h`;
+
+  it("reads a comment body past its escaped delimiters", () => {
+    const markdown = `Please revisit {==this claim==}{>>${escapedText}<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.\n`;
+
+    expect(codes(markdown)).toEqual([]);
+    expect(extractRoughdraftReviewIndex(markdown).items).toMatchObject([
+      { id: "c1", kind: "comment", text: typedText, anchorText: "this claim" },
+    ]);
+  });
+
+  it("reads an escaped anchor, insertion, deletion and substitution", () => {
+    const markdown = [
+      `Anchor {==${escapedText}==}{>>Needs a source.<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.`,
+      `Add {++${escapedText}++}{id="s1" by="AI" at="2026-04-28T12:05:00.000Z"}.`,
+      `Drop {--${escapedText}--}{id="s2" by="AI" at="2026-04-28T12:06:00.000Z"}.`,
+      `Use {~~${escapedText}~>${escapedText}~~}{id="s3" by="AI" at="2026-04-28T12:07:00.000Z"}.`,
+      "",
+    ].join("\n");
+
+    expect(codes(markdown)).toEqual([]);
+    expect(extractRoughdraftReviewIndex(markdown).items).toMatchObject([
+      { id: "c1", anchorText: typedText },
+      { id: "s1", suggestionKind: "addition", text: typedText },
+      { id: "s2", suggestionKind: "deletion", originalText: typedText },
+      {
+        id: "s3",
+        suggestionKind: "substitution",
+        originalText: typedText,
+        replacementText: typedText,
+      },
+    ]);
+  });
+
+  it("accepts an escaped close delimiter in reply text and rejects a raw one", () => {
+    const markdown = `Please revisit {==this claim==}{>>Needs a source.<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.\n`;
+    const reply = (message: string) =>
+      appendRoughdraftReply(markdown, {
+        parentId: "c1",
+        message,
+        at: "2026-04-28T12:10:00.000Z",
+      });
+
+    // The form `prompt.md` tells an agent to write.
+    const updated = reply(String.raw`Write \{>>a note\<<} to reply.`);
+    expect(extractRoughdraftReviewIndex(updated).items).toMatchObject([
+      { id: "c1" },
+      { id: "c2", text: "Write {>>a note<<} to reply." },
+    ]);
+
+    expect(() => reply("Write {>>a note<<} to reply.")).toThrow(
+      /unescaped CriticMarkup close delimiter/,
+    );
+  });
+
+  // The same bytes the app pins in packages/app/test/critic-markup.test.ts,
+  // under "escape-inert Markdown contexts stay byte-stable". The two readers
+  // must report one logical text for one document; before escapes were stripped
+  // from code spans and autolinks, the app held a doubled copy of this.
+  it("agrees with the app's reader on escape-inert text", () => {
+    const inertText =
+      "a code span `C:\\\\dir` and `x\\{++y\\++}z`, " +
+      "an autolink <https://example.com/p\\{++q\\++}r>";
+    const markdown = `See {==${inertText}==}{>>${inertText}<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.\n`;
+    const typedText =
+      "a code span `C:\\dir` and `x{++y++}z`, " +
+      "an autolink <https://example.com/p{++q++}r>";
+
+    expect(codes(markdown)).toEqual([]);
+    expect(extractRoughdraftReviewIndex(markdown).items).toMatchObject([
+      { id: "c1", text: typedText, anchorText: typedText },
+    ]);
+  });
+
+  it("rejects an unescaped open delimiter in an inline reply and allows it in endmatter", () => {
+    const inlineParent = `Please revisit {==this claim==}{>>Needs a source.<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.\n`;
+    const message = "Use {++ to insert.";
+
+    expect(() =>
+      appendRoughdraftReply(inlineParent, {
+        parentId: "c1",
+        message,
+        at: "2026-04-28T12:10:00.000Z",
+      }),
+    ).toThrow(/unescaped CriticMarkup open delimiter/);
+
+    const escaped = appendRoughdraftReply(inlineParent, {
+      parentId: "c1",
+      message: String.raw`Use \{++ to insert.`,
+      at: "2026-04-28T12:10:00.000Z",
+    });
+    expect(extractRoughdraftReviewIndex(escaped).items).toMatchObject([
+      { id: "c1" },
+      { id: "c2", text: message },
+    ]);
+
+    // A document-level comment is written to YAML, where a delimiter is inert
+    // and an escape would survive into the reviewer's own text.
+    const documentComment = appendRoughdraftDocumentComment("Body text.\n", {
+      message,
+      at: "2026-04-28T12:10:00.000Z",
+    });
+    expect(documentComment).toContain(`body: ${message}`);
+  });
+
+  it("keeps a later comment when an earlier body ends with a backslash", () => {
+    const markdown = [
+      'See {==first==}{>>ends with a backslash\\<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}',
+      ' and {==second==}{>>second note<<}{id="c2" by="user" at="2026-04-28T12:01:00.000Z"}.\n',
+    ].join("");
+
+    expect(codes(markdown)).toEqual([]);
+    expect(extractRoughdraftReviewIndex(markdown).items).toMatchObject([
+      { id: "c1", text: "ends with a backslash\\", anchorText: "first" },
+      { id: "c2", text: "second note", anchorText: "second" },
+    ]);
+  });
+
+  it("still reads a body that ends with a bare backslash", () => {
+    // Written before escaping existed, so the backslash is ordinary text
+    // rather than an escape of the delimiter that closes the comment.
+    const markdown = `Please revisit {==this claim==}{>>ends with a backslash\\<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.\n`;
+
+    expect(codes(markdown)).toEqual([]);
+    expect(extractRoughdraftReviewIndex(markdown).items).toMatchObject([
+      { id: "c1", text: "ends with a backslash\\" },
+    ]);
+  });
+
+  it("appends a reply after a comment whose body carries escapes", () => {
+    const markdown = `Please revisit {==this claim==}{>>${escapedText}<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.\n`;
+
+    const updated = appendRoughdraftReply(markdown, {
+      parentId: "c1",
+      message: "Noted.",
+      at: "2026-04-28T12:10:00.000Z",
+    });
+
+    expect(updated).toContain(`{>>${escapedText}<<}`);
+    expect(extractRoughdraftReviewIndex(updated).items).toMatchObject([
+      { id: "c1", text: typedText },
+      { id: "c2", parentId: "c1", text: "Noted." },
+    ]);
+  });
+});

@@ -137,6 +137,93 @@ test.describe("CriticMarkup review flows", () => {
     });
   });
 
+  test("keeps typed CriticMarkup literal in a comment body @smoke", async ({
+    page,
+  }) => {
+    const typedBody = "Write {>>a note<<} or {++an insert++} here.";
+    const filePath = writeProjectFile(
+      projectDir,
+      "typed-markup-comment.md",
+      [
+        "# Typed Markup Comment",
+        "",
+        "This paragraph has target text to review.",
+        "",
+      ].join("\n"),
+    );
+
+    await openMarkdownFile(page, filePath);
+    await selectRichText(page, "target text");
+    await page.getByTestId("selection-menu-action-comment").click();
+    await page.getByTestId("comment-rail-c1-editor").fill(typedBody);
+    await page.getByTestId("comment-rail-c1-action-save").click();
+
+    await expect
+      .poll(() => readProjectFile(projectDir, "typed-markup-comment.md"))
+      .toContain("{==target text==}");
+
+    const savedMarkdown = readProjectFile(
+      projectDir,
+      "typed-markup-comment.md",
+    );
+    expect(savedMarkdown).toContain(
+      "{>>Write \\{>>a note\\<<} or \\{++an insert\\++} here.<<}",
+    );
+
+    await page.reload();
+    await expect(page.getByTestId("comment-rail-c1")).toContainText(typedBody);
+    await expect(page.getByTestId("comment-thread-c1")).toHaveCount(1);
+    await expect(page.getByTestId("comment-rail-c2")).toHaveCount(0);
+
+    logE2eEvent("criticmarkup.typed-markup-comment-escaped", {
+      file: "typed-markup-comment.md",
+    });
+  });
+
+  test("keeps typed CriticMarkup literal inside an edited mark @smoke", async ({
+    page,
+  }) => {
+    const typedText = "{++live++}";
+    const filePath = writeProjectFile(
+      projectDir,
+      "typed-markup-mark.md",
+      [
+        "# Typed Markup Mark",
+        "",
+        "This paragraph has target text to review.",
+        "",
+      ].join("\n"),
+    );
+
+    await openMarkdownFile(page, filePath);
+    await selectRichText(page, "target text");
+    await page
+      .getByTestId("rich-text-editor")
+      .dispatchEvent("contextmenu", { clientX: 200, clientY: 200 });
+    await page
+      .getByTestId("editor-context-menu-action-suggest-replacement")
+      .click();
+    await page.getByTestId("draft-suggestion-editor").fill(typedText);
+    await page.getByTestId("draft-suggestion-action-apply").click();
+
+    await expect
+      .poll(() => readProjectFile(projectDir, "typed-markup-mark.md"))
+      .toContain("{~~target text~>");
+
+    const savedMarkdown = readProjectFile(projectDir, "typed-markup-mark.md");
+    expect(savedMarkdown).toContain("{~~target text~>\\{++live\\++}~~}");
+
+    await page.reload();
+    await expect(page.getByTestId("suggestion-thread-s1")).toContainText(
+      typedText,
+    );
+    await expect(page.getByTestId("suggestion-thread-s2")).toHaveCount(0);
+
+    logE2eEvent("criticmarkup.typed-markup-mark-escaped", {
+      file: "typed-markup-mark.md",
+    });
+  });
+
   test("animates the document layout when the review rail appears and disappears @smoke", async ({
     page,
   }) => {

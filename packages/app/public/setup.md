@@ -134,6 +134,8 @@ Deletion: `{--old text--}`
 Substitution: `{~~old~>new~~}`
 Highlight: `{==text==}`
 
+Write a backslash before any of those delimiters when the text itself contains one, so it stays literal instead of closing or reopening the marker around it: `{>>Write \{>>a note\<<} to reply.<<}`. This covers `{==`, `==}`, `{>>`, `<<}`, `{++`, `++}`, `{--`, `--}`, `{~~`, `~~}`, `~>` and the backslash itself, which you write as `\\`. Roughdraft strips the backslashes when it reads the text back, so the reviewer sees exactly what you typed.
+
 When you add a new comment or suggested change, use the extended Roughdraft format with a compact inline reference such as `{#c1}` or `{#s1}`, then add metadata in final YAML endmatter. Generate a stable document-local id (`c1`, `c2`, etc. for comments; `s1`, `s2`, etc. for suggestions), set `by` to your agent or author label, set `at` to the current ISO timestamp, and set `re` when replying to an existing comment or suggestion.
 
 Roughdraft may already have inline attribute blocks after comments and suggestions from older documents. Preserve these attributes unless you are intentionally removing the associated comment or suggestion. For new feedback, prefer compact references plus YAML endmatter.
