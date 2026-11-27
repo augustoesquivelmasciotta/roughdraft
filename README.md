@@ -66,6 +66,8 @@ roughdraft status
 roughdraft stop
 ```
 
+`roughdraft status` also names each document open in a tab and the session label it was opened with (`Session: no label given` when `open` ran without `--label`). `roughdraft status <path>` reports that document's open threads (every comment, reply and suggestion not marked resolved, with their ids) and the last time the server saved it while a tab had it open, or says the path is not open. The open-thread count is the one the review loop clears, so `Open threads: 0` and a `threads-cleared` Done Reviewing agree. With `--json` the same facts come under `documents` and `document`; the MCP tool `roughdraft_get_open_documents` returns the same list.
+
 `roughdraft open` will reuse the running server and auto-start it if needed. You can also use `roughdraft ./path/to/file.md` as a shortcut when the input clearly looks like a path.
 
 Roughdraft does not edit `~/CLAUDE.md`, `~/AGENTS.md`, or other user-level agent files. The setup prompt asks your agent to update its own guidance.
@@ -184,7 +186,7 @@ Commands:
 ```text
 open <path>        Open one Markdown file and wait for Done Reviewing
 start              Start or reuse the background server
-status             Show server status
+status [<path>]    Show server status, or a document's open threads
 stop               Stop the managed background server
 watch <path>       Wait for a Done Reviewing event
 mcp                Start the experimental stdio MCP server
@@ -213,6 +215,8 @@ roughdraft open <path> --json
 roughdraft open <path> --no-watch
 roughdraft start --port <port>
 roughdraft status --json
+roughdraft status ./draft.md
+roughdraft status ./draft.md --json
 roughdraft stop --all
 roughdraft watch ./draft.md --json
 roughdraft doctor --json
@@ -220,7 +224,7 @@ roughdraft doctor ./draft.md
 roughdraft doctor ./draft.md --json
 ```
 
-Usage errors return exit code `2`. Runtime failures return exit code `1`. `roughdraft status --json` returns exit code `0` even when the JSON says `"running": false`.
+Usage errors return exit code `2`. Runtime failures return exit code `1`. `roughdraft status --json` returns exit code `0` even when the JSON says `"running": false`, and `roughdraft status <path> --json` returns `0` even when `document.open` is `false`; without `--json`, a path that is not open exits `1`. When the review index of an open document cannot be read, both forms exit `1` and `--json` sets `document.openThreads` to `null` with `document.threadsError` saying why.
 
 Supported environment variables:
 

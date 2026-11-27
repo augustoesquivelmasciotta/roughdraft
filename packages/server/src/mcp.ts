@@ -34,7 +34,7 @@ const tools: ToolDefinition[] = [
   {
     name: "roughdraft_get_open_documents",
     description:
-      "Return Roughdraft documents known to the MCP server. This first version is stateless and may return an empty list.",
+      "Return the documents open in a Roughdraft tab right now, each with its path, the session label it was opened with, when the tab opened it and the server's last save of it (the same record `roughdraft status` prints). Empty when Roughdraft is not running.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -237,7 +237,20 @@ export async function callTool(
   fetchImpl: typeof fetch,
 ): Promise<unknown> {
   if (name === "roughdraft_get_open_documents") {
-    return { documents: [] };
+    const server = readServerState(env);
+    if (!server) return { running: false, documents: [] };
+    try {
+      const response = await fetchImpl(new URL("/api/status", server.url), {
+        signal: AbortSignal.timeout(2_000),
+      });
+      const payload = (await response.json()) as { documents?: unknown };
+      return {
+        running: true,
+        documents: Array.isArray(payload.documents) ? payload.documents : [],
+      };
+    } catch {
+      return { running: false, documents: [] };
+    }
   }
 
   if (name === "roughdraft_get_review_index") {

@@ -28,6 +28,56 @@ describe("mcp", () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it("returns the open documents the running server reports", async () => {
+    const documents = [
+      {
+        path: documentPath,
+        sessionLabel: "plan-review",
+        openedAt: "2026-11-26T00:00:00.000Z",
+        lastSavedAt: null,
+      },
+    ];
+    const urls: string[] = [];
+    const fetchImpl: typeof fetch = async (input) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({ documents }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    const result = await callTool(
+      "roughdraft_get_open_documents",
+      {},
+      { ROUGHDRAFT_STATE_FILE: stateFile },
+      fetchImpl,
+    );
+
+    expect(urls).toEqual(["http://localhost:7373/api/status"]);
+    expect(result).toEqual({ running: true, documents });
+  });
+
+  it("returns the done-signal of the round from the review watch", async () => {
+    const fetchImpl: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          events: [{ sequence: 1, done: true, doneReason: "threads-cleared" }],
+          timedOut: false,
+          nextSequence: 2,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+
+    const result = await callTool(
+      "roughdraft_watch_review_events",
+      { documentPath, projectPath: projectDir },
+      { ROUGHDRAFT_STATE_FILE: stateFile },
+      fetchImpl,
+    );
+
+    expect(result).toMatchObject({ done: true, doneReason: "threads-cleared" });
+  });
+
   it("bounds each review watch poll and forwards a caller's shorter timeout", async () => {
     const requestBodies: Array<Record<string, unknown>> = [];
     const fetchImpl: typeof fetch = async (_input, init) => {

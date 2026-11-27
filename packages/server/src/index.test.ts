@@ -783,6 +783,7 @@ describe("createApp", () => {
       port: 4312,
       serverRoot,
       stateless: true,
+      documents: [],
       capabilities: {
         projectPathRequired: true,
         fileSystemBrowsing: true,
@@ -1049,6 +1050,86 @@ describe("createApp", () => {
           .send({ path: target, url: "http://localhost:4312/" });
 
         expect(sent.body).toEqual({ delivered: false });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("open document record", () => {
+    it("lists each polling tab's document with its timestamps on /api/status", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const documentPath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      const before = Date.now();
+
+      await request(app)
+        .get("/api/open-requests/poll")
+        .query({ path: documentPath, clientId: "tab-1" });
+      await request(app)
+        .get("/api/open-requests/poll")
+        .query({ clientId: "home-tab" });
+
+      const status = await request(app).get("/api/status");
+
+      expect(status.body.documents).toEqual([
+        {
+          path: documentPath,
+          sessionLabel: null,
+          openedAt: expect.any(String),
+          lastSavedAt: null,
+        },
+      ]);
+      expect(
+        Date.parse(status.body.documents[0].openedAt),
+      ).toBeGreaterThanOrEqual(before - 1000);
+    });
+
+    it("stamps the last save on the tab that has the saved document open", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const documentPath = path.join(projectDir, "draft.md");
+      const otherPath = path.join(projectDir, "other.md");
+      fs.writeFileSync(documentPath, "# Draft\n");
+      fs.writeFileSync(otherPath, "# Other\n");
+      await request(app)
+        .get("/api/open-requests/poll")
+        .query({ path: documentPath, clientId: "tab-1" });
+      await request(app)
+        .get("/api/open-requests/poll")
+        .query({ path: otherPath, clientId: "tab-2" });
+
+      const before = Date.now();
+      const saved = await request(app)
+        .put("/api/markdown-file")
+        .query({ projectPath: projectDir, path: "draft.md" })
+        .send({ content: "# Saved\n" });
+      expect(saved.status).toBe(200);
+
+      const status = await request(app).get("/api/status");
+      const documents = status.body.documents as Array<{
+        path: string;
+        lastSavedAt: string | null;
+      }>;
+      const draft = documents.find((entry) => entry.path === documentPath);
+      const other = documents.find((entry) => entry.path === otherPath);
+      expect(Date.parse(draft?.lastSavedAt ?? "")).toBeGreaterThanOrEqual(
+        before - 1000,
+      );
+      expect(other?.lastSavedAt).toBeNull();
+    });
+
+    it("drops a tab that stopped polling from the record", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const { app } = createApp({ homeDir, staticDirPath: projectDir });
+        await request(app)
+          .get("/api/open-requests/poll")
+          .query({ path: path.join(projectDir, "draft.md"), clientId: "t" });
+        vi.advanceTimersByTime(60_000);
+
+        const status = await request(app).get("/api/status");
+
+        expect(status.body.documents).toEqual([]);
       } finally {
         vi.useRealTimers();
       }
