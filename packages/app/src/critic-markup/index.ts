@@ -1335,14 +1335,113 @@ export function criticMarkdownToRenderedHtml(
   };
 }
 
+// Ported from kudzuweb/roughdraftplus #24 (PR #97). A change mark that covers
+// only whitespace was lost on both sides of the conversion: Turndown reads an
+// inline element holding only whitespace as blank and lifts the whitespace
+// out of it, and the editor's HTML parser collapses whitespace that sits
+// between two inline elements. That whitespace is padded with a private-use
+// character on the way through and the padding taken back out. It is not a
+// zero-width space because an author can type one of those.
+const criticWhitespacePlaceholder = "";
+
+function stripCriticWhitespacePlaceholder(text: string): string {
+  return text.replaceAll(criticWhitespacePlaceholder, "");
+}
+
+function padCriticWhitespace(text: string): string {
+  return `${criticWhitespacePlaceholder}${text}${criticWhitespacePlaceholder}`;
+}
+
+/**
+ * The whitespace a marker covers, when it covers nothing else, and null when
+ * it covers anything more. Markdown cannot wrap whitespace alone in emphasis
+ * or a link, so a marker over whitespace is written as the bare whitespace and
+ * the runs on either side keep their own formatting. Turndown would write
+ * `** **` around a space, which reads back as two asterisks rather than bold.
+ */
+function whitespaceOnlyChangeText(element: HTMLElement): string | null {
+  let text = "";
+
+  const visit = (node: ChildNode): boolean => {
+    if (node.nodeType === 3) {
+      const value = stripCriticWhitespacePlaceholder(node.nodeValue ?? "");
+      if (/\S/.test(value)) return false;
+
+      text += value;
+      return true;
+    }
+
+    if (node.nodeType !== 1) return true;
+    if (node.nodeName === "BR") return false;
+
+    return [...node.childNodes].every(visit);
+  };
+
+  if (![...element.childNodes].every(visit)) return null;
+
+  return text.length > 0 ? text : null;
+}
+
+/**
+ * A change span holding only whitespace, padded so the editor's HTML parser
+ * keeps it. A span whose content is only whitespace holds no tags, so this
+ * reaches its own closing tag without balancing anything.
+ */
+const whitespaceOnlyChangeSpan =
+  /(<span data-critic-change-kind="[^"]*"[^>]*>)(\s+)(<\/span>)/g;
+
+function padWhitespaceChangeSpans(html: string): string {
+  return html.replace(
+    whitespaceOnlyChangeSpan,
+    (_match, open: string, whitespace: string, close: string) =>
+      `${open}${padCriticWhitespace(whitespace)}${close}`,
+  );
+}
+
+/** Takes that padding back out of a change's own text in parsed nodes. */
+function stripWhitespaceChangePadding(node: JSONContent): JSONContent {
+  if (
+    node.type === "text" &&
+    typeof node.text === "string" &&
+    (node.marks ?? []).some((mark) => mark.type === "criticChange")
+  ) {
+    return { ...node, text: stripCriticWhitespacePlaceholder(node.text) };
+  }
+
+  if (!node.content) return node;
+
+  return { ...node, content: node.content.map(stripWhitespaceChangePadding) };
+}
+
+/**
+ * Pads whitespace-only change text before Turndown sees it, which makes the
+ * element ordinary text; `serializeCriticChangeElement` takes the padding
+ * back out of every text it writes.
+ */
+function padWhitespaceChangeText(node: JSONContent): JSONContent {
+  if (
+    node.type === "text" &&
+    typeof node.text === "string" &&
+    node.text.length > 0 &&
+    node.text.trim() === "" &&
+    (node.marks ?? []).some((mark) => mark.type === "criticChange")
+  ) {
+    return { ...node, text: padCriticWhitespace(node.text) };
+  }
+
+  if (!node.content) return node;
+
+  return { ...node, content: node.content.map(padWhitespaceChangeText) };
+}
+
 function htmlToTopLevelNodes(html: string): JSONContent[] {
   if (!html.trim()) return [];
 
   const schema = getEditorSchema();
   const parsed = ProseMirrorDOMParser.fromSchema(schema)
-    .parse(elementFromString(html))
+    .parse(elementFromString(padWhitespaceChangeSpans(html)))
     .toJSON() as JSONContent;
-  const nodes = parsed.content ?? [];
+  const nodes = (parsed.content ?? []).map(stripWhitespaceChangePadding);
   const isOnlyAnEmptyParagraph =
     nodes.length === 1 &&
     nodes[0]?.type === "paragraph" &&
@@ -1678,7 +1777,11 @@ function serializeCriticChangeElement(
     service.turndown(paired.innerHTML).trim(),
 ) {
   const change = getElementChangeAttrs(element);
-  if (!change) return content;
+  // Every text this marker writes passes through here, so this is where the
+  // whitespace padding comes back out. One mark can cover a padded space and
+  // formatted text at once, and the padding has to leave with either.
+  const changeContent = stripCriticWhitespacePlaceholder(content);
+  if (!change) return changeContent;
 
   if (
     change.kind === "substitution-new" &&
@@ -1704,7 +1807,10 @@ function serializeCriticChangeElement(
       "substitution-new",
       change.changeId,
     )
-      ? escapeCriticMarkupText(readPairedText(nextElement))
+      ? escapeCriticMarkupText(
+          whitespaceOnlyChangeText(nextElement) ??
+            stripCriticWhitespacePlaceholder(readPairedText(nextElement)),
+        )
       : null;
   const writtenKind =
     change.kind === "substitution-new"
@@ -1714,7 +1820,9 @@ function serializeCriticChangeElement(
         : change.kind;
   const claimed = claimChangeId({ ...change, kind: writtenKind }, context);
   const metadata = changeMetadata(claimed, change.changeId, context);
-  const markerText = escapeCriticMarkupText(content);
+  const markerText = escapeCriticMarkupText(
+    whitespaceOnlyChangeText(element) ?? changeContent,
+  );
 
   if (writtenKind === "addition") {
     return `{++${markerText}++}${metadata}${commentBlocks}`;
@@ -2004,7 +2112,9 @@ export function editorStateToCriticMarkdown(
     contextRef.current = context;
     try {
       const html = getHTMLFromFragment(
-        Fragment.from(ProseMirrorNode.fromJSON(schema, node)),
+        Fragment.from(
+          ProseMirrorNode.fromJSON(schema, padWhitespaceChangeText(node)),
+        ),
         schema,
       );
       return collapseBlankLines(service.turndown(html)).trim();
@@ -2050,7 +2160,7 @@ export function editorStateToCriticMarkdown(
     });
   } else {
     const html = getHTMLFromFragment(
-      ProseMirrorNode.fromJSON(schema, doc).content,
+      ProseMirrorNode.fromJSON(schema, padWhitespaceChangeText(doc)).content,
       schema,
     );
     body = normalizeBlockSpacing(`${service.turndown(html).trimEnd()}\n`);
