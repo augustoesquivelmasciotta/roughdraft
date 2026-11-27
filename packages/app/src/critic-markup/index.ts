@@ -1662,12 +1662,20 @@ function changeMetadata(
     : serializeChangeAttributeMetadata(change);
 }
 
+/**
+ * `readPairedText` reads the other half of a substitution. It defaults to the
+ * turndown pass a substitution in prose needs; a fence passes the code
+ * element's own text instead, since turndown would collapse the replacement's
+ * newlines to spaces.
+ */
 function serializeCriticChangeElement(
   service: TurndownService,
   element: HTMLElement,
   content: string,
   context: CriticSerializeContext,
   extraCommentIds: string[] = [],
+  readPairedText: (paired: HTMLElement) => string = (paired) =>
+    service.turndown(paired.innerHTML).trim(),
 ) {
   const change = getElementChangeAttrs(element);
   if (!change) return content;
@@ -1696,7 +1704,7 @@ function serializeCriticChangeElement(
       "substitution-new",
       change.changeId,
     )
-      ? escapeCriticMarkupText(service.turndown(nextElement.innerHTML).trim())
+      ? escapeCriticMarkupText(readPairedText(nextElement))
       : null;
   const writtenKind =
     change.kind === "substitution-new"
@@ -1720,6 +1728,7 @@ function serializeCriticChangeElement(
 }
 
 function serializeCodeElementContent(
+  service: TurndownService,
   node: Node,
   context: CriticSerializeContext,
 ): string {
@@ -1736,7 +1745,25 @@ function serializeCodeElementContent(
       continue;
     }
 
-    const inner = serializeCodeElementContent(child, context);
+    // A change mark inside a fence is only reachable by editing one there.
+    // Its text is source text, so it is read as-is rather than through
+    // turndown, which would collapse its newlines to spaces.
+    const changeElement = child.hasAttribute("data-critic-change-kind")
+      ? child
+      : child.querySelector("span[data-critic-change-kind]");
+    if (changeElement instanceof HTMLElement) {
+      result += serializeCriticChangeElement(
+        service,
+        changeElement,
+        changeElement.textContent ?? "",
+        context,
+        changeElement === child ? [] : getElementCommentIds(child),
+        (paired) => paired.textContent ?? "",
+      );
+      continue;
+    }
+
+    const inner = serializeCodeElementContent(service, child, context);
     if (child.hasAttribute("data-comment-ids")) {
       const commentBlocks = serializeCommentBlocks(
         getElementCommentIds(child),
@@ -1828,6 +1855,7 @@ function createCriticTurndownService(contextRef: {
           ? storedInfo
           : language;
       const body = serializeCodeElementContent(
+        service,
         code,
         contextRef.current,
       ).replace(/\n$/, "");

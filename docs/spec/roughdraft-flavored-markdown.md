@@ -24,9 +24,11 @@ Roughdraft uses these CriticMarkup-compatible markers:
 {==highlighted text==}
 ```
 
-An implementation MUST treat the opening and closing marker pairs as review delimiters outside inline code and fenced code blocks.
+An implementation MUST treat the opening and closing marker pairs as review delimiters outside inline code and fenced code blocks, and inside a fenced code block only for the one construct named below.
 
-Implementations MUST treat review markers inside inline code spans and fenced code blocks as literal example text. They MUST NOT create comments, suggestions, or highlights from those code contexts.
+Implementations MUST treat review markers inside inline code spans as literal example text, and MUST NOT create comments, suggestions, or highlights from them.
+
+Inside a fenced code block, one construct is live and every other marker is literal. An anchor immediately followed by one or more comment blocks MUST be parsed as a comment thread, so a document can carry review of the markers it is displaying. Every other marker inside a fenced code block MUST be treated as literal example text, among them a standalone comment, an insertion, a deletion, and a substitution. Implementations MUST NOT create a suggestion or a bare highlight from a fenced code block.
 
 ## Escaping Delimiters
 

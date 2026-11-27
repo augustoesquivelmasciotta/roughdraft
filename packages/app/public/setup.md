@@ -231,7 +231,7 @@ at  ISO timestamp
 re  Parent comment or suggestion id for replies
 ```
 
-CriticMarkup inside fenced code blocks is literal example text. Do not treat it as review feedback.
+CriticMarkup inside a fenced code block is literal example text, with one exception: an anchor followed by a comment, such as `{==anchor==}{>>note<<}{#c1}`, is a real comment thread there and is review feedback to act on. A standalone comment, an insertion, a deletion, and a substitution inside a fence are all examples, not feedback.
 
 User comments may appear inline in the Markdown file. Suggested insertions, deletions, and substitutions should be interpreted as review feedback unless the user asks you to accept them directly.
 
