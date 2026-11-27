@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { CriticComment } from "../src/critic-markup";
+import { buildCommentThreads } from "../src/critic-markup";
 import {
   buildCommentThreadRailItems,
+  collapseCommentThread,
   getCommentAnchorMeasurements,
   getRootThreadIdForCommentId,
   groupCommentAnchorMeasurements,
@@ -467,5 +469,138 @@ describe("document comment layout helpers", () => {
         railBottom: 236,
       },
     ]);
+  });
+});
+
+describe("collapseCommentThread", () => {
+  function createThread(comments: CriticComment[]) {
+    const [thread] = buildCommentThreads(comments);
+    if (!thread) throw new Error("expected a root thread");
+    return thread;
+  }
+
+  it("leaves a thread with no replies untouched", () => {
+    const thread = createThread([
+      { id: "root", content: "Root", createdAt: "2026-04-24T00:00:00.000Z" },
+    ]);
+
+    expect(collapseCommentThread(thread)).toEqual({
+      thread,
+      hiddenReplyCount: 0,
+    });
+  });
+
+  it("leaves a thread with one reply untouched", () => {
+    const thread = createThread([
+      { id: "root", content: "Root", createdAt: "2026-04-24T00:00:00.000Z" },
+      {
+        id: "r1",
+        content: "Only reply",
+        createdAt: "2026-04-24T00:00:01.000Z",
+        parentCommentId: "root",
+      },
+    ]);
+
+    expect(collapseCommentThread(thread)).toEqual({
+      thread,
+      hiddenReplyCount: 0,
+    });
+  });
+
+  it("keeps the anchor plus the newest reply and counts the rest as hidden", () => {
+    const thread = createThread([
+      { id: "root", content: "Root", createdAt: "2026-04-24T00:00:00.000Z" },
+      {
+        id: "r1",
+        content: "First reply",
+        createdAt: "2026-04-24T00:00:01.000Z",
+        parentCommentId: "root",
+      },
+      {
+        id: "r2",
+        content: "Second reply",
+        createdAt: "2026-04-24T00:00:02.000Z",
+        parentCommentId: "root",
+      },
+      {
+        id: "r3",
+        content: "Third reply",
+        createdAt: "2026-04-24T00:00:03.000Z",
+        parentCommentId: "root",
+      },
+    ]);
+
+    expect(collapseCommentThread(thread)).toEqual({
+      thread: {
+        comment: thread.comment,
+        replies: [
+          {
+            comment: {
+              id: "r3",
+              content: "Third reply",
+              createdAt: "2026-04-24T00:00:03.000Z",
+              parentCommentId: "root",
+            },
+            replies: [],
+          },
+        ],
+      },
+      hiddenReplyCount: 2,
+    });
+  });
+
+  it("picks the newest reply by timestamp even when it is nested under an older reply", () => {
+    const thread = createThread([
+      { id: "root", content: "Root", createdAt: "2026-04-24T00:00:00.000Z" },
+      {
+        id: "r1",
+        content: "First reply",
+        createdAt: "2026-04-24T00:00:01.000Z",
+        parentCommentId: "root",
+      },
+      {
+        id: "r1a",
+        content: "Nested newest",
+        createdAt: "2026-04-24T00:00:05.000Z",
+        parentCommentId: "r1",
+      },
+      {
+        id: "r2",
+        content: "Later sibling",
+        createdAt: "2026-04-24T00:00:02.000Z",
+        parentCommentId: "root",
+      },
+    ]);
+
+    const collapsed = collapseCommentThread(thread);
+
+    expect(collapsed.hiddenReplyCount).toBe(2);
+    expect(collapsed.thread.replies.map((reply) => reply.comment.id)).toEqual([
+      "r1a",
+    ]);
+  });
+
+  it("breaks timestamp ties in favor of the later reply in thread order", () => {
+    const thread = createThread([
+      { id: "root", content: "Root", createdAt: "2026-04-24T00:00:00.000Z" },
+      {
+        id: "r1",
+        content: "First reply",
+        createdAt: "2026-04-24T00:00:01.000Z",
+        parentCommentId: "root",
+      },
+      {
+        id: "r2",
+        content: "Second reply",
+        createdAt: "2026-04-24T00:00:01.000Z",
+        parentCommentId: "root",
+      },
+    ]);
+
+    expect(
+      collapseCommentThread(thread).thread.replies.map(
+        (reply) => reply.comment.id,
+      ),
+    ).toEqual(["r2"]);
   });
 });

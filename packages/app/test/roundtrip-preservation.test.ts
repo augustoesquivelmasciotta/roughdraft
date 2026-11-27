@@ -25,6 +25,109 @@ function roundTrip(input: string): string {
   return editorStateToCriticMarkdown(doc, comments);
 }
 
+// An untouched block is written back from its source bytes, so this drops
+// the parser's source snapshot to make the writer serialize every block, as
+// it does for a block the reviewer edited.
+function rewrite(input: string): string {
+  const { doc, comments } = criticMarkdownToEditorState(input);
+  const { roughdraftSource: _source, ...fresh } = doc as JSONContent & {
+    roughdraftSource?: unknown;
+  };
+  return editorStateToCriticMarkdown(fresh, comments);
+}
+
+describe("strikethrough takes two tildes (roughdraftplus #38)", () => {
+  it("keeps single tildes in prose as text when the block is rewritten", () => {
+    const input = "Roughly ~57% (~100h) of the work is left.\n";
+
+    expect(criticMarkdownToRenderedHtml(input).html).not.toContain("<del>");
+    expect(rewrite(input)).toBe(input);
+  });
+
+  it("keeps a doubled-tilde strikethrough when the block is rewritten", () => {
+    const input = "Ship ~~later~~ today.\n";
+
+    expect(criticMarkdownToRenderedHtml(input).html).toContain(
+      "<del>later</del>",
+    );
+    expect(rewrite(input)).toBe(input);
+  });
+});
+
+// kudzuweb/roughdraftplus #24: a marker that covers only whitespace was lost
+// on save. Each case is rewritten four times and every round is checked, so
+// a one-time normalization cannot hide a drift that compounds.
+function expectRewritesToSettleOn(
+  input: string,
+  settled: string,
+  settlesBy = 1,
+): void {
+  expect(roundTrip(input)).toBe(input);
+  let saved = input;
+  for (let round = 1; round <= 4; round += 1) {
+    saved = rewrite(saved);
+    expect(saved).not.toContain("\ue000");
+    if (round >= settlesBy) expect(saved, `rewrite ${round}`).toBe(settled);
+  }
+}
+
+const s1 = '{id="s1" by="user" at="2026-01-01T00:00:00.000Z"}';
+
+describe("a suggested change over whitespace survives a save (roughdraftplus #24)", () => {
+  it("keeps a deletion that covers only a space between two words", () => {
+    const input = `Two{-- --}${s1}words here.\n`;
+    expectRewritesToSettleOn(input, input);
+  });
+
+  it("keeps a deletion that covers a space and bold text together", () => {
+    const input = `Keep{-- **bold** text--}${s1} here.\n`;
+    expectRewritesToSettleOn(input, input);
+  });
+
+  it("keeps a deletion that covers a space and a code span together", () => {
+    const input = `Keep{-- \`code\` text--}${s1} here.\n`;
+    expectRewritesToSettleOn(input, input);
+  });
+
+  it("keeps a zero-width space the author typed inside a deletion", () => {
+    const input = `Keep {--\u200b--}${s1} here.\n`;
+    expectRewritesToSettleOn(input, input);
+  });
+
+  it("keeps an insertion that covers only a space", () => {
+    const input = `Two{++ ++}${s1}words here.\n`;
+    expectRewritesToSettleOn(input, input);
+  });
+
+  it("keeps a substitution from a space to a space", () => {
+    const input = `Two{~~ ~> ~~}${s1}words here.\n`;
+    expectRewritesToSettleOn(input, input);
+  });
+
+  it("settles a substitution from one space to two on a single space", () => {
+    expectRewritesToSettleOn(
+      `Two{~~ ~>  ~~}${s1}words here.\n`,
+      `Two{~~ ~> ~~}${s1}words here.\n`,
+    );
+  });
+
+  // Markdown cannot wrap whitespace alone in emphasis or a link, so a marker
+  // covering only whitespace is written between the formatted runs.
+  it("settles a deleted space inside bold between the bold runs", () => {
+    expectRewritesToSettleOn(
+      `A **bold{-- --}${s1}here** ends.\n`,
+      `A **bold**{-- --}${s1}**here** ends.\n`,
+    );
+  });
+
+  it("settles a deleted space inside a link between two links", () => {
+    expectRewritesToSettleOn(
+      `A [linked phrase{-- --}${s1}wrapped tight](https://example.com) ends.\n`,
+      `A [linked phrase](https://example.com){-- --}${s1}[wrapped tight](https://example.com) ends.\n`,
+    );
+  });
+});
+
 function findNodes(
   root: JSONContent,
   predicate: (node: JSONContent) => boolean,

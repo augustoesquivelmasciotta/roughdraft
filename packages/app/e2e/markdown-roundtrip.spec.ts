@@ -166,6 +166,49 @@ test.describe("markdown round-trips", () => {
     expect(savedEndmatter?.startsWith(originalEndmatter ?? "")).toBe(true);
   });
 
+  test("saves a rich-text edit without flattening a fence that holds a comment @smoke", async ({
+    page,
+  }) => {
+    const fence = [
+      "```text",
+      "first line",
+      '{==anchor==}{>>Note<<}{id="c1" by="user" at="2026-01-01T00:00:00.000Z"}',
+      "",
+      "last line",
+      "```",
+    ].join("\n");
+    const initial = [
+      "# Fenced Comment",
+      "",
+      fence,
+      "",
+      "Tail paragraph.",
+      "",
+    ].join("\n");
+    const filePath = writeProjectFile(projectDir, "fenced-comment.md", initial);
+
+    await openMarkdownFile(page, filePath, "rich-text");
+    const editor = richTextEditor(page);
+    await expect(editor).toBeVisible();
+    await editor.click();
+    await page.keyboard.press(
+      process.platform === "darwin" ? "Meta+End" : "Control+End",
+    );
+    await page.keyboard.type(" Edited.");
+    await page.keyboard.press(
+      process.platform === "darwin" ? "Meta+S" : "Control+S",
+    );
+
+    await expect
+      .poll(() => readProjectFile(projectDir, "fenced-comment.md"))
+      .toContain("Edited.");
+    expect(readProjectFile(projectDir, "fenced-comment.md")).toContain(fence);
+
+    logE2eEvent("markdown-roundtrip.fenced-comment-save", {
+      file: "fenced-comment.md",
+    });
+  });
+
   test("initial open shows persistent saved status", async ({ page }) => {
     const filePath = writeProjectFile(
       projectDir,

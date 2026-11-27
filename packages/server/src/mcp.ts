@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   appendRoughdraftReply,
+  decideRoughdraftSuggestion,
   extractRoughdraftReviewIndex,
   markRoughdraftResolved,
 } from "@roughdraft/rfm";
@@ -111,6 +112,22 @@ const tools: ToolDefinition[] = [
         documentPath: { type: "string" },
         targetId: { type: "string" },
         summary: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "roughdraft_decide_suggestion",
+    description:
+      "Accept, reject or edit one CriticMarkup suggestion (insertion, deletion or substitution) in a local Markdown file, leaving plain prose. The suggestion's reply thread is removed with it. `text` is required for `edit` and is the text left in the prose; a deletion cannot be edited.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["documentPath", "targetId", "action"],
+      properties: {
+        documentPath: { type: "string" },
+        targetId: { type: "string" },
+        action: { type: "string", enum: ["accept", "reject", "edit"] },
+        text: { type: "string" },
       },
     },
   },
@@ -314,6 +331,23 @@ export async function callTool(
     const updated = markRoughdraftResolved(markdown, {
       targetId,
       summary: typeof args.summary === "string" ? args.summary : undefined,
+    });
+    fs.writeFileSync(documentPath, updated);
+    return { ok: true, documentPath };
+  }
+
+  if (name === "roughdraft_decide_suggestion") {
+    const documentPath = requireDocumentPath(args);
+    const targetId = requireString(args, "targetId");
+    const action = requireString(args, "action");
+    if (action !== "accept" && action !== "reject" && action !== "edit") {
+      throw new Error('action must be "accept", "reject" or "edit".');
+    }
+    const markdown = fs.readFileSync(documentPath, "utf8");
+    const updated = decideRoughdraftSuggestion(markdown, {
+      targetId,
+      action,
+      text: typeof args.text === "string" ? args.text : undefined,
     });
     fs.writeFileSync(documentPath, updated);
     return { ok: true, documentPath };

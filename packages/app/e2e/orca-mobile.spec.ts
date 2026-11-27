@@ -147,6 +147,7 @@ test.describe("Orca mobile", () => {
 
   test("steps to a suggestion with the navigator and accepts it", async ({
     page,
+    request,
   }) => {
     const filePath = writeProjectFile(
       projectDir,
@@ -164,8 +165,24 @@ test.describe("Orca mobile", () => {
     await phone.tapElement(page.getByTestId("review-navigator-next"));
     const sheet = page.getByTestId("document-review-sheet");
     await expect(sheet).toContainText("next");
-    await phone.tapElement(sheet.getByTestId("comment-rail-s1-action-accept"));
+    // Approving waits for "I'm done", which applies it in the handoff save.
+    await phone.tapElement(sheet.getByTestId("comment-rail-s1-action-approve"));
+    await phone.tapElement(
+      sheet.getByTestId("comment-rail-s1-action-approve-confirm"),
+    );
+    await expect(
+      sheet.getByTestId("comment-rail-s1-approval-pending"),
+    ).toHaveText("Approved");
+    await phone.tapElement(sheet.getByTestId("document-review-sheet-close"));
 
+    pendingWatch = request.post("/api/review-events/watch", {
+      data: {
+        projectPath: projectDir,
+        path: "suggestion.md",
+        timeoutSeconds: 10,
+      },
+    });
+    await phone.tapElement(page.getByTestId("review-handoff-button"));
     await expect
       .poll(() => readProjectFile(projectDir, "suggestion.md"))
       .toBe("# Suggestion\n\nLaunch next week.\n");

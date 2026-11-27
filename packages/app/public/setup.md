@@ -134,11 +134,15 @@ Deletion: `{--old text--}`
 Substitution: `{~~old~>new~~}`
 Highlight: `{==text==}`
 
+Write a backslash before any of those delimiters when the text itself contains one, so it stays literal instead of closing or reopening the marker around it: `{>>Write \{>>a note\<<} to reply.<<}`. This covers `{==`, `==}`, `{>>`, `<<}`, `{++`, `++}`, `{--`, `--}`, `{~~`, `~~}`, `~>` and the backslash itself, which you write as `\\`. Roughdraft strips the backslashes when it reads the text back, so the reviewer sees exactly what you typed.
+
 When you add a new comment or suggested change, use the extended Roughdraft format with a compact inline reference such as `{#c1}` or `{#s1}`, then add metadata in final YAML endmatter. Generate a stable document-local id (`c1`, `c2`, etc. for comments; `s1`, `s2`, etc. for suggestions), set `by` to your agent or author label, set `at` to the current ISO timestamp, and set `re` when replying to an existing comment or suggestion.
 
 Roughdraft may already have inline attribute blocks after comments and suggestions from older documents. Preserve these attributes unless you are intentionally removing the associated comment or suggestion. For new feedback, prefer compact references plus YAML endmatter.
 
 Anchored comments usually look like `{==selected text==}{>>Comment text<<}{#c1}`. Suggested changes usually look like `{++new text++}{#s1}` or `{~~old text~>new text~~}{#s2}`. Replies live in final YAML endmatter with a `body` and `re` pointer.
+
+When nothing in the document is a natural anchor for a comment, add a sentence written only to carry it and mark the comment with `anchor="disposable"` in its inline attribute block, such as `{==Placeholder for the pricing decision.==}{>>Which tier ships first?<<}{id="c1" by="AI" at="2026-04-28T12:00:00.000Z" anchor="disposable"}`; when the reviewer deletes that thread, Roughdraft removes the sentence with it. Without the flag the anchor text stays after its thread is deleted, so never put the flag on a comment anchored to real document text.
 
 Example:
 
@@ -229,7 +233,7 @@ at  ISO timestamp
 re  Parent comment or suggestion id for replies
 ```
 
-CriticMarkup inside fenced code blocks is literal example text. Do not treat it as review feedback.
+CriticMarkup inside a fenced code block is literal example text, with one exception: an anchor followed by a comment, such as `{==anchor==}{>>note<<}{#c1}`, is a real comment thread there and is review feedback to act on. A standalone comment, an insertion, a deletion, and a substitution inside a fence are all examples, not feedback.
 
 User comments may appear inline in the Markdown file. Suggested insertions, deletions, and substitutions should be interpreted as review feedback unless the user asks you to accept them directly.
 

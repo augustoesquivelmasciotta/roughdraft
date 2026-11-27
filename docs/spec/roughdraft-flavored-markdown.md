@@ -10,7 +10,7 @@ The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this docu
 
 This specification defines the review markup that Roughdraft reads and writes. It does not define a replacement for Markdown, a hosted document format, a sync protocol, or a project database.
 
-A conforming document is a Markdown document that may contain Roughdraft review spans. Markdown parsing SHOULD follow CommonMark with GitHub Flavored Markdown extensions. Implementations MAY preserve YAML frontmatter as document metadata. Roughdraft review state lives in the same Markdown file, either as inline review anchors or as final YAML endmatter.
+A conforming document is a Markdown document that may contain Roughdraft review spans. Markdown parsing SHOULD follow CommonMark with GitHub Flavored Markdown extensions. Strikethrough is the one deliberate departure: a doubled tilde (`~~struck~~`) renders as strikethrough and a single tilde (`~struck~`) does not, because GFM's single-tilde form turns ordinary prose such as `~57% (~100h)` into strikethrough and saves it back as `~~57% (~~100h)`. Implementations MAY preserve YAML frontmatter as document metadata. Roughdraft review state lives in the same Markdown file, either as inline review anchors or as final YAML endmatter.
 
 ## Canonical Markers
 
@@ -24,9 +24,32 @@ Roughdraft uses these CriticMarkup-compatible markers:
 {==highlighted text==}
 ```
 
-An implementation MUST treat the opening and closing marker pairs as review delimiters outside inline code and fenced code blocks.
+An implementation MUST treat the opening and closing marker pairs as review delimiters outside inline code and fenced code blocks, and inside a fenced code block only for the one construct named below.
 
-Implementations MUST treat review markers inside inline code spans and fenced code blocks as literal example text. They MUST NOT create comments, suggestions, or highlights from those code contexts.
+Implementations MUST treat review markers inside inline code spans as literal example text, and MUST NOT create comments, suggestions, or highlights from them.
+
+Inside a fenced code block, one construct is live and every other marker is literal. An anchor immediately followed by one or more comment blocks MUST be parsed as a comment thread, so a document can carry review of the markers it is displaying. Every other marker inside a fenced code block MUST be treated as literal example text, among them a standalone comment, an insertion, a deletion, and a substitution. Implementations MUST NOT create a suggestion or a bare highlight from a fenced code block.
+
+## Escaping Delimiters
+
+Marker text has no delimiter of its own, so a review delimiter typed inside a comment, an anchor, or a suggestion would close or reopen the marker that holds it. A backslash immediately before a review delimiter escapes it: the delimiter is literal text and the backslash is not part of the text. The escapable sequences are the ten opening and closing markers `{==`, `==}`, `{>>`, `<<}`, `{++`, `++}`, `{--`, `--}`, `{~~` and `~~}`, the substitution arrow `~>`, and the backslash itself.
+
+```markdown
+Please revisit {==this claim==}{>>Write \{>>a note\<<} to reply.<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.
+```
+
+A writer that escapes MUST escape every one of those sequences wherever it writes comment text, anchor text, or suggestion text, and MUST write a literal backslash in that text as `\\`. A reader MUST treat a backslash before one of those sequences as an escape, MUST NOT end a marker at an escaped closing delimiter, and MUST report the text with the escapes removed.
+
+A backslash before anything else is ordinary text and a reader MUST leave it as written, so a document from a writer that did not escape keeps its backslashes. One case from such a document is ambiguous: text that ends with a backslash reads as escaping the delimiter that closes the marker, so the marker appears to run past its own end. A reader that does not find an unescaped closing delimiter for a marker SHOULD fall back to the first raw one rather than discarding the marker.
+
+Marker text MUST NOT contain an unescaped opening delimiter, since an unescaped opener is another marker beginning. A reader MUST end its search for a closing delimiter there, and this is what keeps that fallback local: without it a marker whose text ends with a backslash runs on to a later marker's closing delimiter and swallows every marker in between.
+
+Every escaped form above is also a CommonMark backslash escape, so a Markdown renderer that knows nothing of this specification shows the literal delimiter rather than the backslash. A reader MUST NOT leave the work to its Markdown parser on that account: it MUST remove these escapes itself wherever a backslash survives Markdown parsing. Two separate things put one there, and a reader that accounts for only the first will hand back text that is still escaped and escape it again on the next write:
+
+- Markdown leaves a backslash as ordinary text in some constructs, among them a code span, a code block, an autolink and raw HTML.
+- An implementation's own Markdown serialization may escape a backslash, as a quoted link or image title does, so the text carries that layer as well as this one and reading removes only the serializer's.
+
+Escaping is an extension: an implementation MAY instead reject review text containing a raw delimiter, as [Comments](#comments) describes. A writer that rejects SHOULD do so only for text it writes between delimiters, since text bound for YAML endmatter carries no delimiter that could end a marker and would keep an escape as written.
 
 ## Comments
 
@@ -36,7 +59,7 @@ A comment is written as:
 comment = "{>>" comment-text "<<}" [ metadata ]
 ```
 
-Comment text is plain inline Markdown content. Comment text MUST NOT contain the literal closing delimiter `<<}` unless the implementation defines an escaping extension. Writers that do not implement escaping MUST reject comment or reply text containing raw CriticMarkup close delimiters instead of emitting ambiguous review markup.
+Comment text is plain inline Markdown content. Comment text MUST NOT contain an unescaped literal closing delimiter `<<}`; see [Escaping Delimiters](#escaping-delimiters). Writers that do not implement escaping MUST reject comment or reply text containing raw CriticMarkup close delimiters instead of emitting ambiguous review markup.
 
 A comment MAY appear by itself when the feedback applies to the surrounding paragraph or document:
 
@@ -74,6 +97,18 @@ comments:
 The highlighted text is the visible anchor. Implementations SHOULD attach all immediately following comment blocks to the same anchor until another token interrupts the sequence.
 
 A standalone highlight is valid CriticMarkup. Roughdraft 0.1 reserves it as review syntax, but standalone highlights are not required to produce a review-thread item unless an implementation explicitly supports highlight-only annotations.
+
+### Disposable Anchors
+
+A comment must anchor on some text, so when nothing in the document is a natural anchor a writer may add a sentence written only to carry the thread. The comment marks that sentence as filler with `anchor="disposable"`:
+
+```markdown
+{==Placeholder for the pricing decision.==}{>>Which tier ships first?<<}{id="c1" by="AI" at="2026-04-28T12:00:00.000Z" anchor="disposable"}
+```
+
+When a comment carrying `anchor="disposable"` is removed and no comment remains on its anchor, an implementation MUST remove the anchor text with it. This applies to the whole set of comments removed together: clearing a flagged thread removes its replies and the anchor in one action. While any comment still references the anchor, the anchor text stays. Resolving a thread does not remove it. Removing a comment without the flag leaves its anchor text in place as plain prose. A writer SHOULD put the flag on the root comment of the thread, and MUST NOT put it on a comment whose anchor is real document text.
+
+The flag is read only from a comment's inline attribute block. A comment written in the compact reference form, `{#c1}` with its metadata in the YAML endmatter, cannot carry it: an endmatter `anchor` entry is ignored and the anchor text stays.
 
 ## Suggestions
 
@@ -211,6 +246,7 @@ Known metadata attributes:
 | `by` | Comments and suggestions | Yes | Author or agent label. `AI` identifies an agent author. |
 | `at` | Comments and suggestions | Yes | ISO 8601 timestamp. |
 | `re` | Comments | No | Parent comment or suggestion id for threaded replies. |
+| `anchor` | Comments | No | `disposable` marks the anchor text as filler written only to carry the thread, removed with the last comment on it. See [Disposable Anchors](#disposable-anchors). |
 | `status` | Comments and suggestions | No | Review state. Roughdraft currently writes `resolved` when an item has been addressed. |
 | `resolved` | Comments and suggestions | No | Optional short resolution summary for an item whose `status` is `resolved`. |
 
@@ -238,7 +274,7 @@ One document MAY mix the metadata formats above, for example root comments with 
 
 ### Long Or Multi-Line Comment Text
 
-Comment text is inline content, so it cannot hold line breaks or CriticMarkup delimiters. When a root comment's text has either, writers MAY store the full text as the `body` of its endmatter entry and write a one-line excerpt inline:
+Comment text is inline content, so it cannot hold line breaks. CriticMarkup delimiters are written escaped (see [Escaping Delimiters](#escaping-delimiters)) and stay inline. When a root comment's text has a line break, writers MAY store the full text as the `body` of its endmatter entry and write a one-line excerpt inline:
 
 ```markdown
 See {==the launch plan==}{>>Pasted article: launch risks …<<}{#c4}.
@@ -310,6 +346,7 @@ Round trips SHOULD preserve:
 - Inline code and fenced code blocks, including the fence length and character (a fence of four or more backticks is closed only by a fence at least as long).
 - Raw review marker text inside code contexts.
 - Metadata values, including escaped quotes and backslashes.
+- Escaped review delimiters in comment, anchor, and suggestion text.
 
 When importing a valid comment or suggestion without metadata, an implementation MAY synthesize missing `id`, `by`, and `at` values on write.
 
