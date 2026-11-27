@@ -457,6 +457,55 @@ test.describe("CriticMarkup review flows", () => {
     });
   });
 
+  test("collapses a thread to its anchor plus the newest reply until expanded @smoke", async ({
+    page,
+  }) => {
+    const filePath = writeProjectFile(
+      projectDir,
+      "collapsed-thread.md",
+      [
+        "# Collapsed Thread",
+        "",
+        'This paragraph has {==target text==}{>>Needs detail<<}{id="c1" by="user" at="2026-04-23T18:00:00.000Z"}{>>First follow-up<<}{id="c2" by="user" at="2026-04-23T18:01:00.000Z" re="c1"}{>>Newest follow-up<<}{id="c3" by="user" at="2026-04-23T18:02:00.000Z" re="c1"}.',
+        "",
+      ].join("\n"),
+    );
+
+    await openMarkdownFile(page, filePath);
+    const rail = page.getByTestId("document-review-rail");
+    await expect(rail.getByTestId("comment-rail-c1")).toBeVisible();
+    await expect(rail.getByTestId("comment-rail-c3")).toBeVisible();
+    await expect(rail.getByTestId("comment-rail-c2")).toHaveCount(0);
+    await expect(
+      rail.getByTestId("comment-rail-c1-action-expand-replies"),
+    ).toContainText("1 earlier reply");
+
+    // Actions are clickable on every thread here, so no selection first: a
+    // click on the thread's middle would land on the toggle itself.
+    await rail.getByTestId("comment-rail-c1-action-expand-replies").click();
+
+    await expect(rail.getByTestId("comment-rail-c2")).toBeVisible();
+    const [rootBox, firstReplyBox, newestReplyBox] = await Promise.all([
+      rail.getByTestId("comment-rail-c1").boundingBox(),
+      rail.getByTestId("comment-rail-c2").boundingBox(),
+      rail.getByTestId("comment-rail-c3").boundingBox(),
+    ]);
+    expect(rootBox?.y).toBeLessThan(firstReplyBox?.y ?? Number.NaN);
+    expect(firstReplyBox?.y).toBeLessThan(newestReplyBox?.y ?? Number.NaN);
+
+    await rail.getByTestId("comment-rail-c1-action-collapse-replies").click();
+
+    await expect(rail.getByTestId("comment-rail-c2")).toHaveCount(0);
+    await expect(rail.getByTestId("comment-rail-c3")).toBeVisible();
+    await expect(
+      rail.getByTestId("comment-rail-c1-action-expand-replies"),
+    ).toBeVisible();
+
+    logE2eEvent("criticmarkup.thread-collapse-toggled", {
+      file: "collapsed-thread.md",
+    });
+  });
+
   test("applies approved, rejected and edited marks on disk at Done Reviewing @smoke", async ({
     page,
     request,

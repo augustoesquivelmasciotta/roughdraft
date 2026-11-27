@@ -1,5 +1,6 @@
-// Ported from kudzuweb/roughdraftplus #9 (PR #50): the approve action on an
-// agent reply. In this fork approving is the quick path to Resolve.
+// Ported from kudzuweb/roughdraftplus #8 (PR #31, collapsed threads) and #9
+// (PR #50, the approve action on an agent reply, which in this fork is the
+// quick path to Resolve).
 import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -29,6 +30,200 @@ async function click(element: Element) {
     await Promise.resolve();
   });
 }
+
+function createThread(replyCount: number): CriticComment[] {
+  const root: CriticComment = {
+    id: "root",
+    content: "Root comment",
+    createdAt: "2026-04-24T00:00:00.000Z",
+  };
+  const replies = Array.from({ length: replyCount }, (_, index) => ({
+    id: `r${index + 1}`,
+    content: `Reply ${index + 1}`,
+    createdAt: `2026-04-24T00:00:0${index + 1}.000Z`,
+    parentCommentId: "root",
+  }));
+
+  return [root, ...replies];
+}
+
+describe("CommentEditorList reply collapsing", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  async function renderList(
+    comments: CriticComment[],
+    variant: "rail" | "banner" = "rail",
+  ) {
+    await act(async () => {
+      root.render(
+        <TooltipProvider>
+          <CommentEditorList
+            comments={comments}
+            variant={variant}
+            onDeleteComment={vi.fn()}
+            onUpdateComment={vi.fn()}
+            onReplyComment={vi.fn()}
+          />
+        </TooltipProvider>,
+      );
+    });
+  }
+
+  it("opens a collapsed thread when one of its hidden replies is selected", async () => {
+    await act(async () => {
+      root.render(
+        <TooltipProvider>
+          <CommentEditorList
+            comments={createThread(3)}
+            variant="rail"
+            selectedCommentId="r1"
+            onDeleteComment={vi.fn()}
+            onUpdateComment={vi.fn()}
+          />
+        </TooltipProvider>,
+      );
+    });
+
+    expect(queryByTestId(container, "comment-rail-r1")).not.toBeNull();
+    expect(
+      queryByTestId(container, "comment-rail-root-action-collapse-replies"),
+    ).not.toBeNull();
+  });
+
+  it("renders a thread with one reply in full without a toggle", async () => {
+    await renderList(createThread(1));
+
+    expect(queryByTestId(container, "comment-rail-root")).not.toBeNull();
+    expect(queryByTestId(container, "comment-rail-r1")).not.toBeNull();
+    expect(
+      queryByTestId(container, "comment-rail-root-action-expand-replies"),
+    ).toBeNull();
+    expect(
+      queryByTestId(container, "comment-rail-root-action-collapse-replies"),
+    ).toBeNull();
+  });
+
+  it("collapses a thread with several replies to the anchor plus the newest reply", async () => {
+    await renderList(createThread(3));
+
+    expect(queryByTestId(container, "comment-rail-root")).not.toBeNull();
+    expect(queryByTestId(container, "comment-rail-r1")).toBeNull();
+    expect(queryByTestId(container, "comment-rail-r2")).toBeNull();
+    expect(queryByTestId(container, "comment-rail-r3")).not.toBeNull();
+
+    const expandButton = getByTestId<HTMLButtonElement>(
+      container,
+      "comment-rail-root-action-expand-replies",
+    );
+    expect(expandButton.textContent).toContain("2 earlier replies");
+    expect(expandButton.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("expands to every reply in order and collapses back to the default", async () => {
+    await renderList(createThread(3));
+
+    await click(
+      getByTestId(container, "comment-rail-root-action-expand-replies"),
+    );
+
+    const visibleIds = [
+      ...container.querySelectorAll(
+        '[data-testid="comment-rail-r1"], [data-testid="comment-rail-r2"], [data-testid="comment-rail-r3"]',
+      ),
+    ].map((element) => element.getAttribute("data-testid"));
+    expect(visibleIds).toEqual([
+      "comment-rail-r1",
+      "comment-rail-r2",
+      "comment-rail-r3",
+    ]);
+    expect(
+      queryByTestId(container, "comment-rail-root-action-expand-replies"),
+    ).toBeNull();
+
+    const collapseButton = getByTestId<HTMLButtonElement>(
+      container,
+      "comment-rail-root-action-collapse-replies",
+    );
+    expect(collapseButton.getAttribute("aria-expanded")).toBe("true");
+    await click(collapseButton);
+
+    expect(queryByTestId(container, "comment-rail-r1")).toBeNull();
+    expect(queryByTestId(container, "comment-rail-r2")).toBeNull();
+    expect(queryByTestId(container, "comment-rail-r3")).not.toBeNull();
+    expect(
+      queryByTestId(container, "comment-rail-root-action-expand-replies"),
+    ).not.toBeNull();
+  });
+
+  it("applies the same collapsing to the banner variant used in prose", async () => {
+    await renderList(createThread(2), "banner");
+
+    expect(queryByTestId(container, "comment-banner-r1")).toBeNull();
+    expect(queryByTestId(container, "comment-banner-r2")).not.toBeNull();
+    expect(
+      getByTestId(container, "comment-banner-root-action-expand-replies")
+        .textContent,
+    ).toContain("1 earlier reply");
+  });
+
+  it("keeps a collapsed thread expanded while a hidden reply is being edited, even after the pending focus clears", async () => {
+    const comments = createThread(3);
+    const renderWithPendingFocus = async (
+      pendingFocusCommentId: string | null,
+    ) => {
+      await act(async () => {
+        root.render(
+          <TooltipProvider>
+            <CommentEditorList
+              comments={comments}
+              variant="rail"
+              pendingFocusCommentId={pendingFocusCommentId}
+              onDeleteComment={vi.fn()}
+              onUpdateComment={vi.fn()}
+              onReplyComment={vi.fn()}
+            />
+          </TooltipProvider>,
+        );
+      });
+    };
+
+    await renderWithPendingFocus("r1");
+
+    expect(queryByTestId(container, "comment-rail-r1-editor")).not.toBeNull();
+    expect(queryByTestId(container, "comment-rail-r2")).not.toBeNull();
+
+    await renderWithPendingFocus(null);
+
+    expect(queryByTestId(container, "comment-rail-r1-editor")).not.toBeNull();
+    expect(queryByTestId(container, "comment-rail-r2")).not.toBeNull();
+    expect(
+      queryByTestId(container, "comment-rail-root-action-collapse-replies"),
+    ).not.toBeNull();
+
+    await click(getByTestId(container, "comment-rail-r1-action-cancel"));
+
+    expect(queryByTestId(container, "comment-rail-r1-editor")).toBeNull();
+    expect(queryByTestId(container, "comment-rail-r1")).toBeNull();
+    expect(queryByTestId(container, "comment-rail-r3")).not.toBeNull();
+    expect(
+      queryByTestId(container, "comment-rail-root-action-expand-replies"),
+    ).not.toBeNull();
+  });
+});
 
 function createAgentThread(): CriticComment[] {
   return [
@@ -124,6 +319,10 @@ describe("CommentEditorList approve action", () => {
       queryByTestId(container, "comment-rail-root-action-approve"),
     ).toBeNull();
 
+    await click(
+      getByTestId(container, "comment-rail-root-action-expand-replies"),
+    );
+
     expect(
       queryByTestId(container, "comment-rail-u1-action-approve"),
     ).toBeNull();
@@ -181,6 +380,21 @@ describe("CommentEditorList approve action", () => {
     await click(getByTestId(container, "comment-rail-a2-action-unapprove"));
 
     expect(onRevokeApproval).toHaveBeenCalledWith("a2");
+  });
+
+  it("approves a reply that only becomes visible after expanding the thread", async () => {
+    const { onApproveComment } = await renderList();
+
+    expect(queryByTestId(container, "comment-rail-a1")).toBeNull();
+    await click(
+      getByTestId(container, "comment-rail-root-action-expand-replies"),
+    );
+    await click(getByTestId(container, "comment-rail-a1-action-approve"));
+    await click(
+      getByTestId(container, "comment-rail-a1-action-approve-confirm"),
+    );
+
+    expect(onApproveComment).toHaveBeenCalledWith("a1");
   });
   it("offers no approval on a reply in a resolved thread", async () => {
     await act(async () => {
