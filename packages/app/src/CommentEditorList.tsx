@@ -65,6 +65,8 @@ interface CommentEditorListProps {
    */
   pendingApprovalCommentIds?: readonly string[];
   approvableCommentIds?: readonly string[];
+  /** Offer the approve check on agent replies (default true). */
+  approveAgentReplies?: boolean;
   pendingApprovalBadges?: Readonly<Record<string, PendingApprovalBadge>>;
   onApproveComment?: (commentId: string) => void;
   onRevokeApproval?: (commentId: string) => void;
@@ -100,6 +102,7 @@ type CommentApprovalState = "none" | "available" | "confirming" | "pending";
 interface CommentApprovalContextValue {
   pendingIds: ReadonlySet<string>;
   approvableIds: ReadonlySet<string>;
+  approveAgentReplies: boolean;
   badges: Readonly<Record<string, PendingApprovalBadge>>;
   confirmingId: string | null;
   setConfirmingId: (commentId: string | null) => void;
@@ -110,6 +113,7 @@ interface CommentApprovalContextValue {
 const CommentApprovalContext = createContext<CommentApprovalContextValue>({
   pendingIds: new Set(),
   approvableIds: new Set(),
+  approveAgentReplies: false,
   badges: {},
   confirmingId: null,
   setConfirmingId: () => {},
@@ -171,6 +175,7 @@ export function CommentEditorList({
   onAutoFocusComment,
   pendingApprovalCommentIds,
   approvableCommentIds,
+  approveAgentReplies = true,
   pendingApprovalBadges,
   onApproveComment,
   onRevokeApproval,
@@ -187,6 +192,7 @@ export function CommentEditorList({
     () => ({
       pendingIds: new Set(pendingApprovalCommentIds ?? []),
       approvableIds: new Set(approvableCommentIds ?? []),
+      approveAgentReplies,
       badges: pendingApprovalBadges ?? {},
       confirmingId: confirmingApprovalId,
       setConfirmingId: setConfirmingApprovalId,
@@ -195,6 +201,7 @@ export function CommentEditorList({
     }),
     [
       approvableCommentIds,
+      approveAgentReplies,
       confirmingApprovalId,
       onApproveComment,
       onRevokeApproval,
@@ -635,7 +642,10 @@ function CommentThreadNode({
     interactive &&
     !!approval.onApprove &&
     (approval.approvableIds.has(comment.id) ||
-      (depth > 0 && isAiAuthor && !isInResolvedThread));
+      (approval.approveAgentReplies &&
+        depth > 0 &&
+        isAiAuthor &&
+        !isInResolvedThread));
   const approvalState: CommentApprovalState = approval.pendingIds.has(
     comment.id,
   )

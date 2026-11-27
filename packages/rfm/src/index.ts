@@ -815,6 +815,120 @@ export function markRoughdraftResolved(
   )}${markdown.slice(metadata.endOffset)}`;
 }
 
+export type RoughdraftSuggestionDecision = "accept" | "reject" | "edit";
+
+export interface DecideRoughdraftSuggestionOptions {
+  targetId: string;
+  action: RoughdraftSuggestionDecision;
+  /** The text an edit leaves in the prose. Required for `edit`. */
+  text?: string;
+}
+
+const CRITICMARKUP_ESCAPE_PATTERN =
+  /\\|\{==|==\}|\{>>|<<\}|\{\+\+|\+\+\}|\{--|--\}|\{~~|~~\}|~>/g;
+
+function escapeCriticMarkupText(text: string): string {
+  return text.replace(CRITICMARKUP_ESCAPE_PATTERN, "\\$&");
+}
+
+/**
+ * Accepts, rejects or edits one suggestion mark, leaving plain prose: the
+ * same decision the review rail applies on "I'm done" (ported from
+ * kudzuweb/roughdraftplus #12). The mark's reply thread leaves with it, in
+ * the body and in the endmatter. Everything else keeps its bytes.
+ */
+export function decideRoughdraftSuggestion(
+  markdown: string,
+  options: DecideRoughdraftSuggestionOptions,
+): string {
+  const index = extractRoughdraftReviewIndex(markdown);
+  const target = index.items.find(
+    (item) => item.id === options.targetId && item.kind === "suggestion",
+  );
+  if (!target) {
+    throw new Error(`Suggestion not found: ${options.targetId}`);
+  }
+
+  const kind = target.suggestionKind;
+  let finalText: string;
+  if (options.action === "edit") {
+    if (kind === "deletion") {
+      throw new Error(
+        `A deletion has no text to edit: ${options.targetId}. Accept or reject it.`,
+      );
+    }
+    if (typeof options.text !== "string") {
+      throw new Error("An edit needs the text to leave in the prose.");
+    }
+    finalText = options.text;
+  } else if (kind === "addition") {
+    finalText = options.action === "accept" ? target.text : "";
+  } else if (kind === "deletion") {
+    finalText = options.action === "accept" ? "" : target.text;
+  } else {
+    finalText =
+      options.action === "accept"
+        ? (target.replacementText ?? target.text)
+        : (target.originalText ?? "");
+  }
+
+  // The mark's thread: every comment whose parent chain reaches the mark.
+  const threadIds = new Set<string>([target.id]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const item of index.items) {
+      if (
+        item.parentId &&
+        threadIds.has(item.parentId) &&
+        !threadIds.has(item.id)
+      ) {
+        threadIds.add(item.id);
+        grew = true;
+      }
+    }
+  }
+
+  // Inline replies follow the mark directly; take them with it.
+  let end = target.endOffset;
+  for (;;) {
+    const next = index.items.find(
+      (item) =>
+        item.offset === end && item.endOffset > end && threadIds.has(item.id),
+    );
+    if (!next) break;
+    end = next.endOffset;
+  }
+
+  // The endmatter is edited first: it is recognised as review endmatter by
+  // the references in the body, which the mark is about to take away. The
+  // body before it is not moved by that edit.
+  let updated = markdown;
+  const endmatter = parseRoughdraftEndmatter(markdown);
+  const comments = new Map(endmatter.comments);
+  const suggestions = new Map(endmatter.suggestions);
+  let endmatterChanged = suggestions.delete(target.id);
+  for (const id of threadIds) {
+    if (comments.delete(id)) endmatterChanged = true;
+  }
+  if (endmatterChanged) {
+    updated = writeRoughdraftEndmatter(markdown, { comments, suggestions });
+    if (updated.endsWith("\n---\n{}\n")) {
+      updated = updated.slice(0, -"\n---\n{}\n".length);
+    }
+  }
+
+  const before = updated.slice(0, target.offset);
+  let after = updated.slice(end);
+  const replacement = escapeCriticMarkupText(finalText);
+  // Removing a mark between two spaces would leave both.
+  if (replacement === "" && /[ \t]$/.test(before) && /^[ \t]/.test(after)) {
+    after = after.replace(/^[ \t]+/, "");
+  }
+
+  return `${before}${replacement}${after}`;
+}
+
 function createLineStarts(markdown: string): number[] {
   const lineStarts = [0];
 

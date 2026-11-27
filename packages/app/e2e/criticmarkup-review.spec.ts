@@ -391,39 +391,92 @@ test.describe("CriticMarkup review flows", () => {
     await expect(page.getByTestId("comment-thread-c2")).toBeInViewport();
   });
 
-  test("accepts and rejects suggested changes on disk @smoke", async ({
+  test("applies approved, rejected and edited marks on disk at Done Reviewing @smoke", async ({
     page,
+    request,
   }) => {
+    const relativePath = "suggestions.md";
     const filePath = writeProjectFile(
       projectDir,
-      "suggestions.md",
+      relativePath,
       [
         "# Suggestion Review",
         "",
-        'Keep {++clear wording++}{id="s1" by="user" at="2026-04-23T18:00:00.000Z"} here.',
+        'Keep {++clear wording++}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} here.',
         "",
-        'Remove {--drafty --}{id="s2" by="user" at="2026-04-23T18:01:00.000Z"}there.',
+        'Remove {~~drafty~>rough~~}{id="s2" by="AI" at="2026-04-23T18:01:00.000Z"}{>>Rough is closer.<<}{id="c1" by="user" at="2026-04-23T18:02:00.000Z" re="s2"} there.',
+        "",
+        'Then {~~old~>new~~}{id="s3" by="AI" at="2026-04-23T18:03:00.000Z"} ends.',
         "",
       ].join("\n"),
     );
+    const pendingWatch = request.post("/api/review-events/watch", {
+      data: {
+        projectPath: projectDir,
+        path: relativePath,
+        timeoutSeconds: 10,
+      },
+    });
 
     await openMarkdownFile(page, filePath);
     await expect(page.locator('[data-critic-change-id="s1"]')).toBeVisible();
+    const rail = page.getByTestId("document-review-rail");
 
-    await page.getByTestId("comment-rail-s1-action-accept").click();
+    await rail.getByTestId("comment-rail-s1-action-approve").click();
+    await expect(
+      rail.getByTestId("comment-rail-s1-approve-confirm"),
+    ).toContainText("Approve");
+    await rail.getByTestId("comment-rail-s1-action-approve-confirm").click();
+    await expect(
+      rail.getByTestId("comment-rail-s1-approval-pending"),
+    ).toHaveText("Approved");
+
+    await rail.getByTestId("comment-rail-s2-action-reject").click();
+    await expect(
+      rail.getByTestId("comment-rail-s2-approval-pending"),
+    ).toHaveText("Rejected");
+
+    await rail.getByTestId("comment-rail-s3-action-edit").click();
+    const editor = rail.getByTestId("comment-rail-s3-editor");
+    await expect(editor).toHaveValue("new");
+    await editor.fill("newer");
+    await rail.getByTestId("comment-rail-s3-action-save").click();
+    await expect(
+      rail.getByTestId("comment-rail-s3-approval-pending"),
+    ).toHaveText("Edited");
+    await expect(rail.getByTestId("suggestion-thread-s3")).toContainText(
+      '"newer"',
+    );
+
+    // Autosave debounces at 500ms; a pending decision must outlast that
+    // without touching the file.
+    await page.waitForTimeout(1200);
+    expect(readProjectFile(projectDir, relativePath)).toContain("{++");
+    expect(readProjectFile(projectDir, relativePath)).toContain("{~~");
+
+    await expect(page.getByTestId("review-handoff-button")).toBeVisible();
+    await page.getByTestId("review-handoff-button").click();
+    await expect(page.getByTestId("review-handoff-status")).toContainText(
+      "Your agent is now working",
+    );
+
     await expect
-      .poll(() => readProjectFile(projectDir, "suggestions.md"))
+      .poll(() => readProjectFile(projectDir, relativePath))
       .toContain("Keep clear wording here.");
+    const savedMarkdown = readProjectFile(projectDir, relativePath);
+    expect(savedMarkdown).toContain("Remove drafty there.");
+    expect(savedMarkdown).toContain("Then newer ends.");
+    expect(savedMarkdown).not.toContain("{++");
+    expect(savedMarkdown).not.toContain("{~~");
+    expect(savedMarkdown).not.toContain("Rough is closer.");
+    await expect(rail.getByTestId("suggestion-thread-s1")).toHaveCount(0);
+    await expect(rail.getByTestId("suggestion-thread-s2")).toHaveCount(0);
+    await expect(rail.getByTestId("suggestion-thread-s3")).toHaveCount(0);
 
-    await page.getByTestId("comment-rail-s2-action-reject").click();
-    await expect
-      .poll(() => readProjectFile(projectDir, "suggestions.md"))
-      .toContain("Remove drafty there.");
-    expect(readProjectFile(projectDir, "suggestions.md")).not.toContain("{++");
-    expect(readProjectFile(projectDir, "suggestions.md")).not.toContain("{--");
+    await pendingWatch;
 
-    logE2eEvent("criticmarkup.suggestions-applied", {
-      file: "suggestions.md",
+    logE2eEvent("criticmarkup.mark-decisions-applied", {
+      file: relativePath,
     });
   });
 });

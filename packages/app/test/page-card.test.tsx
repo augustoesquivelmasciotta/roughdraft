@@ -1974,6 +1974,154 @@ describe("PageCard editor integration", () => {
     expect(savedMarkdown).toContain("Newest answer");
   });
 
+  // Ported from kudzuweb/roughdraftplus #12 (PR #57): approve, reject or edit
+  // a suggestion from its rail card; the decision waits for "I'm done".
+  const suggestionsDoc = [
+    'Keep {++clear wording++}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} here.',
+    "",
+    'Remove {~~drafty~>rough~~}{id="s2" by="AI" at="2026-04-23T18:01:00.000Z"}{>>Rough is closer.<<}{id="c1" by="user" at="2026-04-23T18:02:00.000Z" re="s2"} there.',
+    "",
+    'Then {~~old~>new~~}{id="s3" by="AI" at="2026-04-23T18:03:00.000Z"} ends.',
+  ].join("\n");
+
+  async function clickTestId(rendered: RenderedPageCard, testId: string) {
+    await act(async () => {
+      getByTestId(rendered.container, testId).dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+  }
+
+  async function decideSuggestions(rendered: RenderedPageCard) {
+    await clickTestId(rendered, "comment-rail-s1-action-approve");
+    await clickTestId(rendered, "comment-rail-s1-action-approve-confirm");
+    await clickTestId(rendered, "comment-rail-s2-action-reject");
+    await clickTestId(rendered, "comment-rail-s3-action-edit");
+    const editor = getByTestId<HTMLTextAreaElement>(
+      rendered.container,
+      "comment-rail-s3-editor",
+    );
+    expect(editor.value).toBe("new");
+    await act(async () => {
+      const setValue = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value",
+      )?.set;
+      setValue?.call(editor, "newer");
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+      await Promise.resolve();
+    });
+    await clickTestId(rendered, "comment-rail-s3-action-save");
+  }
+
+  it("holds suggestion decisions until they are applied, then writes plain prose in one save", async () => {
+    const rendered = await renderPageCard({
+      page: {
+        id: "doc-suggestion-decisions-1",
+        title: "Doc Suggestion Decisions 1",
+        content: suggestionsDoc,
+      },
+      selected: true,
+    });
+    await flushAnimationFrame();
+    await flushReact();
+
+    vi.useFakeTimers();
+    await decideSuggestions(rendered);
+
+    for (const [changeId, label] of [
+      ["s1", "Approved"],
+      ["s2", "Rejected"],
+      ["s3", "Edited"],
+    ]) {
+      expect(
+        getByTestId(
+          rendered.container,
+          `comment-rail-${changeId}-approval-pending`,
+        ).textContent,
+      ).toBe(label);
+    }
+
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+    expect(rendered.onSave).not.toHaveBeenCalled();
+
+    await act(async () => {
+      rendered.getSaveController().applyPendingReviewDecisions();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await rendered.getSaveController().flushSave();
+    });
+
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+    expect(rendered.onSave.mock.calls[0]?.[1]).toBe(
+      "Keep clear wording here.\n\nRemove drafty there.\n\nThen newer ends.\n",
+    );
+  });
+
+  it("drops a suggestion decision the reviewer undid", async () => {
+    const rendered = await renderPageCard({
+      page: {
+        id: "doc-suggestion-decisions-undo-1",
+        title: "Doc Suggestion Decisions Undo 1",
+        content: suggestionsDoc,
+      },
+      selected: true,
+    });
+    await flushAnimationFrame();
+    await flushReact();
+
+    await clickTestId(rendered, "comment-rail-s2-action-reject");
+    await clickTestId(rendered, "comment-rail-s2-action-unreject");
+    expect(
+      queryByTestId(rendered.container, "comment-rail-s2-approval-pending"),
+    ).toBeNull();
+
+    await act(async () => {
+      rendered.getSaveController().applyPendingReviewDecisions();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await rendered.getSaveController().flushSave();
+    });
+
+    expect(rendered.onSave).not.toHaveBeenCalled();
+  });
+
+  it("applies suggestion decisions from code view", async () => {
+    const rendered = await renderPageCard({
+      page: {
+        id: "doc-suggestion-decisions-code-1",
+        title: "Doc Suggestion Decisions Code 1",
+        content: suggestionsDoc,
+      },
+      selected: true,
+    });
+    await flushAnimationFrame();
+    await flushReact();
+    await decideSuggestions(rendered);
+
+    await rendered.rerender({ editorViewMode: "code" });
+    expect(queryByTestId(rendered.container, "rich-text-editor")).toBeNull();
+
+    await act(async () => {
+      rendered.getSaveController().applyPendingReviewDecisions();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await rendered.getSaveController().flushSave();
+    });
+
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+    expect(rendered.onSave.mock.calls[0]?.[1]).toBe(
+      "Keep clear wording here.\n\nRemove drafty there.\n\nThen newer ends.\n",
+    );
+  });
+
   it("renders suggestion replies only inside the suggestion card", async () => {
     const commentText = "Looks good as an inserted phrase.";
     const rendered = await renderPageCard({

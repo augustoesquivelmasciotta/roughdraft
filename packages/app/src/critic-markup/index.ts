@@ -18,10 +18,13 @@ import {
   type TokenizerThis,
   type Tokens,
 } from "marked";
+import { Transform } from "@tiptap/pm/transform";
 import type TurndownService from "turndown";
 import {
+  applyCriticChangeDecision,
   createEditorExtensions,
   type CriticChangeAttrs,
+  type CriticChangeDecision,
   type CriticChangeKind,
 } from "../editor-extensions";
 import {
@@ -89,7 +92,12 @@ export interface CriticCommentThread {
   replies: CriticCommentThread[];
 }
 
-export type { CriticChangeAttrs, CriticChangeKind, DeletedCommentRecord };
+export type {
+  CriticChangeAttrs,
+  CriticChangeDecision,
+  CriticChangeKind,
+  DeletedCommentRecord,
+};
 
 type ChangeMetadataFormat = "attributes" | "reference";
 
@@ -2214,10 +2222,61 @@ export function editorStateToCriticMarkdown(
  * Review decisions the reviewer made in the rail that wait for "I'm done".
  * `approvedCommentIds` are agent replies the reviewer approved: approving one
  * resolves the thread it belongs to, which is this fork's Resolve applied at
- * the handoff (ported from kudzuweb/roughdraftplus #9).
+ * the handoff (ported from kudzuweb/roughdraftplus #9). `changeDecisions`
+ * accept, reject or edit a suggestion mark, which leaves plain prose and
+ * takes the mark's reply thread with it (roughdraftplus #12).
  */
 export interface PendingReviewDecisions {
   approvedCommentIds?: readonly string[];
+  changeDecisions?: readonly CriticChangeDecision[];
+}
+
+/**
+ * Every comment in a suggestion's own thread: replies to the mark and their
+ * descendants. They leave with the mark when it is decided.
+ */
+export function getSuggestionThreadCommentIds(
+  changeId: string,
+  comments: ReadonlyMap<string, CriticComment>,
+): string[] {
+  const replyIds = [...comments.values()]
+    .filter((comment) => comment.parentCommentId === changeId)
+    .map((comment) => comment.id);
+
+  return [
+    ...replyIds,
+    ...replyIds.flatMap((commentId) =>
+      getCommentDescendantIds(commentId, comments),
+    ),
+  ];
+}
+
+/** Drops these comment ids from every comment highlight in a document. */
+function removeCommentIdsFromDoc(
+  node: JSONContent,
+  commentIds: ReadonlySet<string>,
+): JSONContent {
+  const marks = node.marks?.flatMap((mark) => {
+    if (mark.type !== "commentRef") return [mark];
+
+    const currentIds = Array.isArray(mark.attrs?.commentIds)
+      ? (mark.attrs.commentIds as string[])
+      : [];
+    const nextIds = currentIds.filter((id) => !commentIds.has(id));
+
+    if (nextIds.length === currentIds.length) return [mark];
+    if (nextIds.length === 0) return [];
+    return [{ ...mark, attrs: { ...mark.attrs, commentIds: nextIds } }];
+  });
+  const content = node.content?.map((child) =>
+    removeCommentIdsFromDoc(child, commentIds),
+  );
+
+  return {
+    ...node,
+    ...(marks ? { marks } : {}),
+    ...(content ? { content } : {}),
+  };
 }
 
 /** The root comment of the thread a comment belongs to. */
@@ -2269,16 +2328,43 @@ export function applyPendingReviewDecisionsToCriticMarkdown(
     decisions.approvedCommentIds ?? [],
     comments,
   );
+  const transform = new Transform(getEditorSchema().nodeFromJSON(doc));
+  const removedCommentIds = new Set<string>();
+  let appliedDecisions = 0;
 
-  if (resolvedRootIds.length === 0) return markdown;
+  for (const decision of decisions.changeDecisions ?? []) {
+    if (!applyCriticChangeDecision(transform, decision)) continue;
+
+    appliedDecisions += 1;
+    for (const commentId of getSuggestionThreadCommentIds(
+      decision.changeId,
+      comments,
+    )) {
+      removedCommentIds.add(commentId);
+    }
+  }
+
+  if (resolvedRootIds.length === 0 && appliedDecisions === 0) return markdown;
 
   const nextComments = new Map(comments);
+  for (const commentId of removedCommentIds) nextComments.delete(commentId);
   for (const rootId of resolvedRootIds) {
     const root = nextComments.get(rootId);
     if (root) nextComments.set(rootId, { ...root, status: "resolved" });
   }
 
-  return editorStateToCriticMarkdown(doc, nextComments);
+  // The transformed document drops the parser's extras (frontmatter,
+  // endmatter, source snapshot); carry them over so untouched blocks keep
+  // their bytes.
+  const decidedDoc = {
+    ...doc,
+    ...removeCommentIdsFromDoc(
+      transform.doc.toJSON() as JSONContent,
+      removedCommentIds,
+    ),
+  };
+
+  return editorStateToCriticMarkdown(decidedDoc, nextComments);
 }
 
 export function createCriticComment(

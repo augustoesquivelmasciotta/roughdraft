@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   appendRoughdraftReply,
   appendRoughdraftDocumentComment,
+  decideRoughdraftSuggestion,
   extractRoughdraftReviewIndex,
   markRoughdraftResolved,
   validateRoughdraftMarkdown,
@@ -763,5 +764,98 @@ describe("escaped review delimiters", () => {
       { id: "c1", text: typedText },
       { id: "c2", parentId: "c1", text: "Noted." },
     ]);
+  });
+});
+
+// The MCP path for the rail's suggestion decisions (kudzuweb/roughdraftplus
+// #12): accept, reject or edit one mark into plain prose.
+describe("decideRoughdraftSuggestion", () => {
+  const meta = (id: string) =>
+    `{id="${id}" by="AI" at="2026-04-23T18:00:00.000Z"}`;
+  const doc = [
+    `Keep {++clear wording++}${meta("s1")} here.`,
+    "",
+    `Remove {~~drafty~>rough~~}${meta("s2")}{>>Rough is closer.<<}{id="c1" by="user" at="2026-04-23T18:02:00.000Z" re="s2"} there.`,
+    "",
+    `Drop {--this --}${meta("s3")}word.`,
+    "",
+    "Untouched   spacing.",
+    "",
+  ].join("\n");
+
+  it("accepts, rejects and edits marks into plain prose", () => {
+    expect(
+      decideRoughdraftSuggestion(doc, { targetId: "s1", action: "accept" }),
+    ).toContain("Keep clear wording here.\n");
+    expect(
+      decideRoughdraftSuggestion(doc, { targetId: "s1", action: "reject" }),
+    ).toContain("Keep here.\n");
+    expect(
+      decideRoughdraftSuggestion(doc, {
+        targetId: "s2",
+        action: "edit",
+        text: "coarse",
+      }),
+    ).toContain("Remove coarse there.\n");
+    expect(
+      decideRoughdraftSuggestion(doc, { targetId: "s3", action: "accept" }),
+    ).toContain("Drop word.\n");
+    expect(
+      decideRoughdraftSuggestion(doc, { targetId: "s3", action: "reject" }),
+    ).toContain("Drop this word.\n");
+  });
+
+  it("takes the mark's reply thread with it and leaves the rest byte for byte", () => {
+    const updated = decideRoughdraftSuggestion(doc, {
+      targetId: "s2",
+      action: "reject",
+    });
+
+    expect(updated).toBe(
+      doc.replace(/Remove .* there\./, "Remove drafty there."),
+    );
+    expect(
+      extractRoughdraftReviewIndex(updated).items.map((item) => item.id),
+    ).toEqual(["s1", "s3"]);
+  });
+
+  it("removes an endmatter-backed mark's entries", () => {
+    const referenced = [
+      "Keep {++clear wording++}{#s1}{>>Sure?<<}{#c1} here.",
+      "",
+      "---",
+      "comments:",
+      "  c1:",
+      "    by: user",
+      '    at: "2026-04-23T18:02:00.000Z"',
+      "    re: s1",
+      "suggestions:",
+      "  s1:",
+      "    by: AI",
+      '    at: "2026-04-23T18:00:00.000Z"',
+      "",
+    ].join("\n");
+
+    const updated = decideRoughdraftSuggestion(referenced, {
+      targetId: "s1",
+      action: "accept",
+    });
+
+    expect(updated.startsWith("Keep clear wording here.\n")).toBe(true);
+    expect(updated).not.toContain("s1:");
+    expect(updated).not.toContain("c1:");
+  });
+
+  it("rejects an edit of a deletion and an unknown id", () => {
+    expect(() =>
+      decideRoughdraftSuggestion(doc, {
+        targetId: "s3",
+        action: "edit",
+        text: "x",
+      }),
+    ).toThrow(/deletion has no text to edit/);
+    expect(() =>
+      decideRoughdraftSuggestion(doc, { targetId: "s9", action: "accept" }),
+    ).toThrow(/Suggestion not found/);
   });
 });

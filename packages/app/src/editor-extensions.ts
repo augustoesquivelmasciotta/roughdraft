@@ -15,6 +15,7 @@ import type {
   Node as ProseMirrorNode,
 } from "@tiptap/pm/model";
 import { Plugin, PluginKey } from "@tiptap/pm/state";
+import type { Transform } from "@tiptap/pm/transform";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
 import DOMPurify from "dompurify";
@@ -37,6 +38,7 @@ declare module "@tiptap/core" {
       unsetCriticChange: () => ReturnType;
       acceptCriticChange: (changeId: string) => ReturnType;
       rejectCriticChange: (changeId: string) => ReturnType;
+      editCriticChange: (changeId: string, text: string) => ReturnType;
     };
   }
 }
@@ -54,6 +56,16 @@ export interface CriticChangeAttrs {
   authorId?: string | null;
   createdAt: string;
 }
+
+/**
+ * A reviewer's ruling on one suggestion mark. Accept collapses the mark to
+ * its final text, reject restores the original text, and edit replaces the
+ * whole mark with what the reviewer typed. All three leave plain prose.
+ */
+export type CriticChangeDecision =
+  | { changeId: string; action: "accept" }
+  | { changeId: string; action: "reject" }
+  | { changeId: string; action: "edit"; text: string };
 
 export const SUGGESTED_PARAGRAPH_SENTINEL = "\u2060";
 
@@ -269,6 +281,143 @@ function isOnlyTextblockContent(
   );
 }
 
+function acceptCriticChangeInTransform(tr: Transform, changeId: string) {
+  const markType = tr.doc.type.schema.marks.criticChange;
+  if (!markType) return false;
+
+  const ranges = collectCriticChangeRanges(tr.doc, changeId);
+  if (ranges.length === 0) return false;
+
+  for (const range of [...ranges].reverse()) {
+    if (range.kind === "deletion" || range.kind === "substitution-old") {
+      tr.delete(range.from, range.to);
+    } else {
+      const sentinelPositions = findSuggestedParagraphSentinels(
+        tr.doc,
+        range.from,
+        range.to,
+      );
+      // Map through this range's own deletions only: in a chain the
+      // transform already carries earlier commands' steps, and the range
+      // was collected from the document those steps produced.
+      const stepsBefore = tr.steps.length;
+
+      for (const position of [...sentinelPositions].reverse()) {
+        tr.delete(position, position + SUGGESTED_PARAGRAPH_SENTINEL.length);
+      }
+
+      const mapping = tr.mapping.slice(stepsBefore);
+      tr.removeMark(
+        mapping.map(range.from, -1),
+        mapping.map(range.to, -1),
+        markType,
+      );
+    }
+  }
+
+  return true;
+}
+
+function rejectCriticChangeInTransform(tr: Transform, changeId: string) {
+  const markType = tr.doc.type.schema.marks.criticChange;
+  if (!markType) return false;
+
+  const ranges = collectCriticChangeRanges(tr.doc, changeId);
+  if (ranges.length === 0) return false;
+
+  for (const range of [...ranges].reverse()) {
+    if (range.kind === "addition" || range.kind === "substitution-new") {
+      const sentinelPositions = findSuggestedParagraphSentinels(
+        tr.doc,
+        range.from,
+        range.to,
+      );
+      if (
+        sentinelPositions.length > 0 &&
+        isOnlyTextblockContent(tr.doc, range.from, range.to)
+      ) {
+        const $from = tr.doc.resolve(range.from);
+        tr.delete($from.before(), $from.after());
+      } else {
+        tr.delete(range.from, range.to);
+      }
+    } else {
+      tr.removeMark(range.from, range.to, markType);
+    }
+  }
+
+  return true;
+}
+
+function editCriticChangeInTransform(
+  tr: Transform,
+  changeId: string,
+  text: string,
+) {
+  const schema = tr.doc.type.schema;
+  if (!schema.marks.criticChange) return false;
+
+  const ranges = collectCriticChangeRanges(tr.doc, changeId);
+  if (ranges.length === 0) return false;
+
+  // The rail editor trims what the reviewer types, so the mark's own edge
+  // whitespace is what keeps the edited words spaced from the prose.
+  const finalText = ranges
+    .filter(
+      (range) => range.kind === "addition" || range.kind === "substitution-new",
+    )
+    .map((range) => tr.doc.textBetween(range.from, range.to, "", " "))
+    .join("");
+  const leadingWhitespace =
+    finalText.trim().length === 0
+      ? finalText
+      : (finalText.match(/^\s*/)?.[0] ?? "");
+  const trailingWhitespace =
+    finalText.trim().length === 0 ? "" : (finalText.match(/\s*$/)?.[0] ?? "");
+  const replacement = `${/^\s/.test(text) ? "" : leadingWhitespace}${text}${
+    /\s$/.test(text) ? "" : trailingWhitespace
+  }`;
+
+  for (const range of [...ranges].reverse()) {
+    tr.delete(range.from, range.to);
+  }
+
+  if (replacement.length === 0) return true;
+
+  // Every later range was deleted first, so the first range still starts
+  // where it did.
+  const insertAt = ranges[0].from;
+  const proseMarks = tr.doc
+    .resolve(insertAt)
+    .marks()
+    .filter(
+      (mark) =>
+        mark.type.name !== "criticChange" && mark.type.name !== "commentRef",
+    );
+  tr.insert(insertAt, schema.text(replacement, proseMarks));
+
+  return true;
+}
+
+/**
+ * Applies one reviewer decision to a suggestion mark on a transform that
+ * need not belong to a mounted editor. Returns false when the document has
+ * no mark with that id, leaving the transform untouched.
+ */
+export function applyCriticChangeDecision(
+  tr: Transform,
+  decision: CriticChangeDecision,
+) {
+  switch (decision.action) {
+    case "accept":
+      return acceptCriticChangeInTransform(tr, decision.changeId);
+    case "reject":
+      return rejectCriticChangeInTransform(tr, decision.changeId);
+    case "edit":
+      return editCriticChangeInTransform(tr, decision.changeId, decision.text);
+  }
+}
+
 const CriticChange = Mark.create({
   name: "criticChange",
   priority: 1090,
@@ -350,78 +499,24 @@ const CriticChange = Mark.create({
       acceptCriticChange:
         (changeId) =>
         ({ state, dispatch }) => {
-          const markType = state.schema.marks.criticChange;
-          if (!markType) return false;
-
-          const ranges = collectCriticChangeRanges(state.doc, changeId);
-          if (ranges.length === 0) return false;
-
           const tr = state.tr;
-
-          for (const range of [...ranges].reverse()) {
-            if (
-              range.kind === "deletion" ||
-              range.kind === "substitution-old"
-            ) {
-              tr.delete(range.from, range.to);
-            } else {
-              const sentinelPositions = findSuggestedParagraphSentinels(
-                state.doc,
-                range.from,
-                range.to,
-              );
-
-              for (const position of [...sentinelPositions].reverse()) {
-                tr.delete(
-                  position,
-                  position + SUGGESTED_PARAGRAPH_SENTINEL.length,
-                );
-              }
-
-              const from = tr.mapping.map(range.from, -1);
-              const to = tr.mapping.map(range.to, -1);
-              tr.removeMark(from, to, markType);
-            }
-          }
-
+          if (!acceptCriticChangeInTransform(tr, changeId)) return false;
           if (dispatch) dispatch(tr);
           return true;
         },
       rejectCriticChange:
         (changeId) =>
         ({ state, dispatch }) => {
-          const markType = state.schema.marks.criticChange;
-          if (!markType) return false;
-
-          const ranges = collectCriticChangeRanges(state.doc, changeId);
-          if (ranges.length === 0) return false;
-
           const tr = state.tr;
-
-          for (const range of [...ranges].reverse()) {
-            if (
-              range.kind === "addition" ||
-              range.kind === "substitution-new"
-            ) {
-              const sentinelPositions = findSuggestedParagraphSentinels(
-                state.doc,
-                range.from,
-                range.to,
-              );
-              if (
-                sentinelPositions.length > 0 &&
-                isOnlyTextblockContent(state.doc, range.from, range.to)
-              ) {
-                const $from = state.doc.resolve(range.from);
-                tr.delete($from.before(), $from.after());
-              } else {
-                tr.delete(range.from, range.to);
-              }
-            } else {
-              tr.removeMark(range.from, range.to, markType);
-            }
-          }
-
+          if (!rejectCriticChangeInTransform(tr, changeId)) return false;
+          if (dispatch) dispatch(tr);
+          return true;
+        },
+      editCriticChange:
+        (changeId, text) =>
+        ({ state, dispatch }) => {
+          const tr = state.tr;
+          if (!editCriticChangeInTransform(tr, changeId, text)) return false;
           if (dispatch) dispatch(tr);
           return true;
         },

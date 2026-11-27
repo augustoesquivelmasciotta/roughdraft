@@ -1076,3 +1076,86 @@ describe("suggesting mode adding and replacing whitespace", () => {
     rejected.editor.destroy();
   });
 });
+
+function changeIds(editor: Editor): Set<string> {
+  const ids = new Set<string>();
+  editor.state.doc.descendants((node) => {
+    for (const mark of node.marks) {
+      if (mark.type.name === "criticChange") ids.add(mark.attrs.changeId);
+    }
+  });
+  return ids;
+}
+
+// Ported from kudzuweb/roughdraftplus #12 (PR #57): the editor commands the
+// rail's pending suggestion decisions apply on "I'm done".
+describe("editing a suggestion mark", () => {
+  it("replaces an insertion with the typed text as plain prose", () => {
+    const { editor, comments } = createEditorFromMarkdown(
+      'Keep {++clear wording++}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} here.\n',
+    );
+
+    expect(editor.commands.editCriticChange("s1", "crisp wording")).toBe(true);
+
+    expect(saveMarkdown(editor, comments)).toBe("Keep crisp wording here.\n");
+    expect(changeIds(editor).size).toBe(0);
+    editor.destroy();
+  });
+
+  it("replaces a substitution with the typed text as plain prose", () => {
+    const { editor, comments } = createEditorFromMarkdown(
+      'Use {~~old phrase~>new phrase~~}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} here.\n',
+    );
+
+    expect(editor.commands.editCriticChange("s1", "newer phrase")).toBe(true);
+
+    expect(saveMarkdown(editor, comments)).toBe("Use newer phrase here.\n");
+    expect(changeIds(editor).size).toBe(0);
+    editor.destroy();
+  });
+
+  it("keeps the prose formatting around the mark and does not inherit a neighbouring mark", () => {
+    const { editor, comments } = createEditorFromMarkdown(
+      'A **bold {++new++}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"}{++er++}{id="s2" by="AI" at="2026-04-23T18:01:00.000Z"} claim**.\n',
+    );
+
+    expect(editor.commands.editCriticChange("s1", "fresh")).toBe(true);
+
+    expect(saveMarkdown(editor, comments)).toBe(
+      'A **bold fresh**{++**er**++}{id="s2" by="AI" at="2026-04-23T18:01:00.000Z"} **claim**.\n',
+    );
+    expect([...changeIds(editor)]).toEqual(["s2"]);
+    editor.destroy();
+  });
+
+  it("applies several decisions on one chain without earlier steps shifting later positions", () => {
+    const { editor, comments } = createEditorFromMarkdown(
+      'Keep {++clear wording++}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} and {~~old~>new~~}{id="s2" by="AI" at="2026-04-23T18:01:00.000Z"} and {~~a~>b~~}{id="s3" by="AI" at="2026-04-23T18:02:00.000Z"} here.\n',
+    );
+
+    editor
+      .chain()
+      .acceptCriticChange("s1")
+      .rejectCriticChange("s2")
+      .editCriticChange("s3", "c")
+      .run();
+
+    expect(saveMarkdown(editor, comments)).toBe(
+      "Keep clear wording and old and c here.\n",
+    );
+    editor.destroy();
+  });
+
+  it("returns false for an unknown change id and leaves the document alone", () => {
+    const { editor, comments } = createEditorFromMarkdown(
+      'Keep {++clear wording++}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} here.\n',
+    );
+
+    expect(editor.commands.editCriticChange("s9", "anything")).toBe(false);
+
+    expect(saveMarkdown(editor, comments)).toBe(
+      'Keep {++clear wording++}{id="s1" by="AI" at="2026-04-23T18:00:00.000Z"} here.\n',
+    );
+    editor.destroy();
+  });
+});
