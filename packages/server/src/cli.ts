@@ -6,6 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
+  diffRoughdraftDocuments,
   type RfmDiagnostic,
   validateRoughdraftMarkdown,
 } from "@roughdraft/rfm";
@@ -54,6 +55,7 @@ const KNOWN_COMMANDS = [
   "watch",
   "reply",
   "tabs",
+  "changes",
   "mcp",
   "doctor",
   "help",
@@ -205,6 +207,8 @@ interface ParsedCommandOptions {
   noWatch: boolean;
   printUrl: boolean;
   port?: string;
+  /** What to compare against (`open`, `tabs add`, `changes`). */
+  since?: string;
   /** Tab window to act in (the `tabs` subcommands). */
   window?: string;
   replay: boolean;
@@ -329,6 +333,7 @@ function parseCommandOptions(
     allowAll?: boolean;
     allowOpen?: boolean;
     allowPort?: boolean;
+    allowSince?: boolean;
     allowWatch?: boolean;
     allowWindow?: boolean;
   },
@@ -398,6 +403,19 @@ function parseCommandOptions(
     if (arg.startsWith("--label=")) {
       if (!options.allowOpen) throw new Error(`Unknown flag: --label`);
       parsed.label = arg.slice("--label=".length);
+      continue;
+    }
+
+    if (arg === "--since" || arg.startsWith("--since=")) {
+      if (!options.allowSince) throw new Error(`Unknown flag: --since`);
+      if (arg === "--since") {
+        const next = takeFlagValue(args, index, arg);
+        parsed.since = next.value;
+        index = next.nextIndex;
+      } else {
+        parsed.since = arg.slice("--since=".length);
+      }
+      if (!parsed.since.trim()) throw new Error("--since requires a value.");
       continue;
     }
 
@@ -1006,6 +1024,7 @@ function printHelp(log: (message: string) => void) {
   log("  stop               Stop the managed background server");
   log("  watch <path>...    Wait for a Done Reviewing event (or new comments)");
   log("  tabs               List the window's tabs and queue; add, focus, close, release");
+  log("  changes <path>     List what changed in a document since a baseline");
   log("  reply <path>       Reply to a comment in a document");
   log("  mcp                Start the experimental stdio MCP server");
   log("  doctor [path]      Diagnose setup or validate Markdown");
@@ -1046,7 +1065,7 @@ function printCommandHelp(
   if (command === "open") {
     log("Usage:");
     log(
-      "  roughdraft open <path> [<path>...] [--now] [--label <text>] [--no-open] [--no-watch] [--loop] [--comments] [--print-url] [--port <port>]",
+      "  roughdraft open <path> [<path>...] [--now] [--label <text>] [--since <x>] [--no-open] [--no-watch] [--loop] [--comments] [--print-url] [--port <port>]",
     );
     log("");
     log(
@@ -1107,6 +1126,9 @@ function printCommandHelp(
     );
     log(
       "  --label <text>       Name this session; the document header shows who opened it",
+    );
+    log(
+      "  --since <x>          Color what changed since x: last-review (default), a file, or a git ref",
     );
     log("  --timeout <seconds>  Maximum watch time; omitted means no timeout");
     log("  --replay             Allow watch to return retained older events");
@@ -1292,7 +1314,7 @@ function printCommandHelp(
   if (command === "tabs") {
     log("Usage:");
     log("  roughdraft tabs [--json]");
-    log("  roughdraft tabs add <path> [--label <text>] [--window <id>] [--json]");
+    log("  roughdraft tabs add <path> [--label <text>] [--since <x>] [--window <id>] [--json]");
     log("  roughdraft tabs focus <path> [--window <id>] [--json]");
     log("  roughdraft tabs close <path> [--window <id>] [--json]");
     log("  roughdraft tabs release [--json]");
@@ -1313,9 +1335,36 @@ function printCommandHelp(
     log("Flags:");
     log("  --window <id>        Act in this window (default: the newest live one)");
     log("  --label <text>       Session label for add");
+    log("  --since <x>          Baseline for add: last-review, a file, or a git ref");
     log("  --json               Print machine-readable output");
     log("  --state-file <path>  Server state file");
     log("  --state-dir <dir>    Directory containing server.json");
+    return;
+  }
+
+  if (command === "changes") {
+    log("Usage:");
+    log("  roughdraft changes <path> [--since <x>] [--json]");
+    log("");
+    log(
+      "Lists what is new, changed or removed in a document since a baseline: the",
+    );
+    log(
+      "same comparison the page colors. Review marks and comments are not content.",
+    );
+    log("");
+    log("Flags:");
+    log(
+      "  --since <x>          last-review (default: the document at the last",
+    );
+    log(
+      "                       Done Reviewing, or at first open), a file path, or a git ref",
+    );
+    log(
+      "  --json               Print the diff plus {source, label}",
+    );
+    log("");
+    log("Exit 0 with the changes listed (or none), 1 when there is no baseline.");
     return;
   }
 
@@ -1488,12 +1537,14 @@ function buildTargetUrl(
   baseUrl: string,
   openPath: string,
   sessionLabel: string | null = null,
+  since: string | null = null,
 ): string {
   const url = new URL(baseUrl);
 
   url.pathname = "/";
   url.searchParams.set("path", openPath);
   if (sessionLabel) url.searchParams.set("label", sessionLabel);
+  if (since) url.searchParams.set("since", since);
   return url.toString();
 }
 
@@ -3075,7 +3126,11 @@ async function runTabs(
 ): Promise<number> {
   let options: ParsedCommandOptions;
   try {
-    options = parseCommandOptions(args, { allowOpen: true, allowWindow: true });
+    options = parseCommandOptions(args, {
+      allowOpen: true,
+      allowSince: true,
+      allowWindow: true,
+    });
   } catch (error) {
     deps.error(error instanceof Error ? error.message : "Invalid usage.");
     return USAGE_ERROR;
@@ -3235,6 +3290,7 @@ async function runTabs(
         {
           path: target.openPath,
           ...(options.label?.trim() ? { label: options.label.trim() } : {}),
+          ...(options.since?.trim() ? { since: options.since.trim() } : {}),
         },
       ],
       now: true,
@@ -3306,6 +3362,127 @@ async function runTabs(
       : `${target.openPath} is not open in a Roughdraft window.`,
   );
   return ok ? 0 : 1;
+}
+
+const CHANGES_USAGE =
+  "Usage: roughdraft changes <path> [--since <x>] [--json]";
+
+/** `roughdraft changes <path>`: the document compared with a baseline. */
+async function runChanges(
+  deps: CliDependencies,
+  args: string[],
+  globalJson: boolean,
+): Promise<number> {
+  let options: ParsedCommandOptions;
+  try {
+    options = parseCommandOptions(args, { allowSince: true });
+  } catch (error) {
+    deps.error(error instanceof Error ? error.message : "Invalid usage.");
+    return USAGE_ERROR;
+  }
+  if (options.help) {
+    printCommandHelp("changes", deps.log);
+    return 0;
+  }
+  if (options.positionals.length !== 1) {
+    deps.error(CHANGES_USAGE);
+    return USAGE_ERROR;
+  }
+  const json = globalJson || options.json;
+  deps = applyCliEnvOverrides(deps, options);
+
+  const absolutePath = path.resolve(deps.cwd, options.positionals[0] ?? "");
+  if (!isMarkdownPath(absolutePath)) {
+    deps.error(`Roughdraft can only read .md files: ${absolutePath}`);
+    return 1;
+  }
+  if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+    deps.error(`Markdown file not found: ${absolutePath}`);
+    return 1;
+  }
+
+  const projectDir = path.dirname(absolutePath);
+  const ensured = await ensureServerRunning(deps, { projectDir });
+  const baseUrl = buildPublicBaseUrl(ensured.server.port);
+  const url = new URL("/api/document-baseline", baseUrl);
+  url.searchParams.set("projectPath", projectDir);
+  url.searchParams.set("path", path.basename(absolutePath));
+  url.searchParams.set("since", options.since?.trim() || "last-review");
+
+  let baseline: { source: string; label: string; content: string } | null = null;
+  let failure = "";
+  try {
+    const response = await deps.fetchImpl(url, {
+      signal: AbortSignal.timeout(TABS_API_TIMEOUT_MS),
+    });
+    if (response.ok) {
+      const payload = (await response.json()) as Partial<{
+        source: string;
+        label: string;
+        content: string;
+      }>;
+      if (typeof payload.content === "string") {
+        baseline = {
+          source: String(payload.source ?? "last-review"),
+          label: String(payload.label ?? ""),
+          content: payload.content,
+        };
+      }
+    } else {
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: unknown;
+      };
+      failure =
+        typeof payload.error === "string"
+          ? payload.error
+          : `The server answered ${response.status}.`;
+    }
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+  }
+
+  if (!baseline) {
+    const message = failure || "There is no baseline for this document.";
+    if (json) emitJson(deps.log, { baseline: null, error: message });
+    else deps.error(message);
+    return 1;
+  }
+
+  const diff = diffRoughdraftDocuments(
+    baseline.content,
+    fs.readFileSync(absolutePath, "utf-8"),
+  );
+  if (json) {
+    emitJson(deps.log, {
+      ...diff,
+      source: baseline.source,
+      label: baseline.label,
+    });
+    return 0;
+  }
+
+  deps.log(`Baseline: ${baseline.label || baseline.source}`);
+  if (diff.changes.length === 0) {
+    deps.log("No changes.");
+    return 0;
+  }
+  const { added, changed, removed } = diff.summary;
+  deps.log(
+    `${diff.changes.length} change${diff.changes.length === 1 ? "" : "s"}: ${added} added, ${changed} changed, ${removed} removed`,
+  );
+  for (const change of diff.changes) {
+    const where = `line ${change.line}`;
+    if (change.kind === "added") {
+      deps.log(`  ${where}: added: ${change.newText}`);
+    } else if (change.kind === "removed") {
+      deps.log(`  ${where}: removed: ${change.oldText}`);
+    } else {
+      deps.log(`  ${where}: changed`);
+      deps.log(`    was: ${change.oldText}`);
+      deps.log(`    now: ${change.newText}`);
+    }
+  }
+  return 0;
 }
 
 const REPLY_USAGE =
@@ -3985,6 +4162,7 @@ export async function runCli(
         options = parseCommandOptions(rest, {
           allowOpen: true,
           allowPort: true,
+          allowSince: true,
           allowWatch: true,
         });
       } catch (error) {
@@ -4056,6 +4234,7 @@ export async function runCli(
 
       const { projectDir, openPath } = resolvedTargets[0] as ResolvedTargetPath;
       const sessionLabel = options.label?.trim() || null;
+      const since = options.since?.trim() || null;
 
       const remoteHost =
         typeof deps.env.ROUGHDRAFT_HOST === "string"
@@ -4094,7 +4273,7 @@ export async function runCli(
         baseUrl = buildPublicBaseUrl(result.server.port);
       }
 
-      const targetUrl = buildTargetUrl(baseUrl, openPath, sessionLabel);
+      const targetUrl = buildTargetUrl(baseUrl, openPath, sessionLabel, since);
       if (!several) {
         warnBeforeReusingAnotherSessionsTab(
           deps,
@@ -4116,6 +4295,7 @@ export async function runCli(
               tabs: resolvedTargets.map((entry) => ({
                 path: entry.openPath,
                 ...(sessionLabel ? { label: sessionLabel } : {}),
+                ...(since ? { since } : {}),
               })),
               ...(options.now ? { now: true } : {}),
               orcaTarget: resolveOrcaTarget(deps.env),
@@ -4140,7 +4320,7 @@ export async function runCli(
               if (entry.status !== "single-page") continue;
               openMode = await openSingleDocument(deps, {
                 baseUrl,
-                targetUrl: buildTargetUrl(baseUrl, entry.path, sessionLabel),
+                targetUrl: buildTargetUrl(baseUrl, entry.path, sessionLabel, since),
                 openPath: entry.path,
                 sessionLabel,
               });
@@ -4176,7 +4356,7 @@ export async function runCli(
 
       if (options.printUrl) {
         for (const entry of resolvedTargets) {
-          deps.log(buildTargetUrl(baseUrl, entry.openPath, sessionLabel));
+          deps.log(buildTargetUrl(baseUrl, entry.openPath, sessionLabel, since));
         }
         return 0;
       }
@@ -4308,6 +4488,10 @@ export async function runCli(
 
     if (command === "tabs") {
       return runTabs(deps, rest, parsed.global.json);
+    }
+
+    if (command === "changes") {
+      return runChanges(deps, rest, parsed.global.json);
     }
 
     return USAGE_ERROR;

@@ -9,6 +9,7 @@ import {
   extractRoughdraftReviewIndex,
 } from "@roughdraft/rfm";
 import express, { type Express, type Request, type Response } from "express";
+import { resolveDocumentBaseline } from "./document-baseline.js";
 import {
   hasNonLoopbackHost,
   isLoopbackHost,
@@ -859,6 +860,35 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       changed: snapshot.content !== current,
       startedAt: snapshot.startedAt,
     });
+  });
+
+  app.get("/api/document-baseline", async (req, res) => {
+    const target = markdownPathFromRequest(req, res);
+    if (!target) return;
+
+    const since =
+      typeof req.query.since === "string" ? req.query.since.trim() : "";
+    if (!since || since === "last-review") {
+      const current = fs.readFileSync(target.absolutePath, "utf-8");
+      const snapshot = reviewRounds.ensure(target.absolutePath, current);
+      res.json({
+        source: "last-review",
+        label: `last review (${snapshot.startedAt})`,
+        content: snapshot.content,
+      });
+      return;
+    }
+
+    const resolved = await resolveDocumentBaseline({
+      projectDir: target.projectDir,
+      documentPath: target.absolutePath,
+      since,
+    });
+    if (!resolved.ok) {
+      res.status(resolved.status).json({ error: resolved.error });
+      return;
+    }
+    res.json(resolved.baseline);
   });
 
   app.post("/api/review-round/restore", (req, res) => {

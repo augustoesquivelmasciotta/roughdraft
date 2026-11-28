@@ -473,6 +473,87 @@ describe("mcp", () => {
       ]);
     });
 
+    it("passes since to add_tab", async () => {
+      const { calls, fetchImpl } = recordingFetch({
+        "/api/tabs/open": { results: [{ path: documentPath, status: "added" }] },
+      });
+
+      await callTool(
+        "roughdraft_add_tab",
+        { path: documentPath, since: "main" },
+        env(),
+        fetchImpl,
+      );
+
+      expect(calls[0]?.body).toMatchObject({
+        tabs: [{ path: documentPath, since: "main" }],
+      });
+    });
+
+    describe("roughdraft_get_changes", () => {
+      function baselineFetch(status: number, payload: unknown) {
+        const urls: URL[] = [];
+        const fetchImpl: typeof fetch = async (input) => {
+          urls.push(new URL(String(input)));
+          return new Response(JSON.stringify(payload), {
+            status,
+            headers: { "Content-Type": "application/json" },
+          });
+        };
+        return { urls, fetchImpl };
+      }
+
+      it("diffs the file on disk against the baseline the server returns", async () => {
+        fs.writeFileSync(documentPath, "# Draft\n\nNew paragraph.\n");
+        const { urls, fetchImpl } = baselineFetch(200, {
+          source: "git",
+          label: "git HEAD",
+          content: "# Draft\n",
+        });
+
+        const result = (await callTool(
+          "roughdraft_get_changes",
+          { path: documentPath, since: "HEAD" },
+          env(),
+          fetchImpl,
+        )) as {
+          source: string;
+          label: string;
+          changes: Array<{ kind: string; newText: string }>;
+          summary: { added: number };
+        };
+
+        expect(urls[0]?.pathname).toBe("/api/document-baseline");
+        expect(Object.fromEntries(urls[0]?.searchParams ?? [])).toEqual({
+          projectPath: projectDir,
+          path: "draft.md",
+          since: "HEAD",
+        });
+        expect(result.source).toBe("git");
+        expect(result.label).toBe("git HEAD");
+        expect(result.summary.added).toBe(1);
+        expect(result.changes).toMatchObject([
+          { kind: "added", newText: "New paragraph." },
+        ]);
+      });
+
+      it("asks for last-review by default and fails with the server's reason when there is no baseline", async () => {
+        const { urls, fetchImpl } = baselineFetch(404, {
+          error: "No baseline for nope",
+        });
+
+        await expect(
+          callTool(
+            "roughdraft_get_changes",
+            { path: documentPath },
+            env(),
+            fetchImpl,
+          ),
+        ).rejects.toThrow("No baseline for nope");
+        expect(urls[0]?.searchParams.get("since")).toBe("last-review");
+      });
+    });
+
     it("rejects open_tabs without paths", async () => {
       await expect(
         callTool("roughdraft_open_tabs", {}, env(), recordingFetch({}).fetchImpl),

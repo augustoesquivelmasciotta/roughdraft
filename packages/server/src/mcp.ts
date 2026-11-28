@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   decideRoughdraftSuggestion,
+  diffRoughdraftDocuments,
   extractRoughdraftReviewIndex,
   markRoughdraftResolved,
 } from "@roughdraft/rfm";
@@ -93,6 +94,20 @@ const tools: ToolDefinition[] = [
         batchWindowSeconds: { type: "number" },
         includeComments: { type: "boolean" },
         afterSequence: { type: "number" },
+      },
+    },
+  },
+  {
+    name: "roughdraft_get_changes",
+    description:
+      "What is new, changed or removed in a Markdown file since a baseline, the same comparison the page colors (the CLI's `roughdraft changes`). `since` is `last-review` (default: the document at the last Done Reviewing, or at first open), a file path, or a git ref. Returns {changes, summary, source, label}; each change has kind, line, oldText, newText. Review marks and comments are not content. Fails when there is no baseline.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: {
+        path: { type: "string" },
+        since: { type: "string" },
       },
     },
   },
@@ -422,6 +437,43 @@ export async function callTool(
     return {
       allDone: documents.every((entry) => !entry.timedOut),
       documents,
+    };
+  }
+
+  if (name === "roughdraft_get_changes") {
+    const documentPath = requireDocumentPath({ documentPath: args.path });
+    const since = typeof args.since === "string" ? args.since.trim() : "";
+    const server = await requireServer(env, fetchImpl, documentPath);
+    const url = new URL("/api/document-baseline", server.url);
+    url.searchParams.set("projectPath", path.dirname(documentPath));
+    url.searchParams.set("path", path.basename(documentPath));
+    url.searchParams.set("since", since || "last-review");
+    const response = await fetchImpl(url, {
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: unknown;
+      };
+      throw new Error(
+        typeof payload.error === "string"
+          ? payload.error
+          : `Roughdraft has no baseline for this document (${response.status}).`,
+      );
+    }
+    const baseline = (await response.json()) as {
+      source: string;
+      label: string;
+      content: string;
+    };
+    return {
+      documentPath,
+      ...diffRoughdraftDocuments(
+        baseline.content,
+        fs.readFileSync(documentPath, "utf8"),
+      ),
+      source: baseline.source,
+      label: baseline.label,
     };
   }
 

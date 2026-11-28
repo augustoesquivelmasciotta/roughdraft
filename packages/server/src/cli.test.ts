@@ -2110,7 +2110,7 @@ describe("cli", () => {
 
       expect(exitCode).toBe(0);
       expect(test.logs).toContain(
-        "  roughdraft open <path> [<path>...] [--now] [--label <text>] [--no-open] [--no-watch] [--loop] [--comments] [--print-url] [--port <port>]",
+        "  roughdraft open <path> [<path>...] [--now] [--label <text>] [--since <x>] [--no-open] [--no-watch] [--loop] [--comments] [--print-url] [--port <port>]",
       );
       expect(test.logs.join("\n")).toContain("  --loop ");
     });
@@ -2484,7 +2484,7 @@ describe("cli", () => {
 
     expect(exitCode).toBe(0);
     expect(test.logs).toContain(
-      "  roughdraft open <path> [<path>...] [--now] [--label <text>] [--no-open] [--no-watch] [--loop] [--comments] [--print-url] [--port <port>]",
+      "  roughdraft open <path> [<path>...] [--now] [--label <text>] [--since <x>] [--no-open] [--no-watch] [--loop] [--comments] [--print-url] [--port <port>]",
     );
     expect(test.logs).toContain(
       "  --no-watch           Open the file without waiting",
@@ -3366,6 +3366,149 @@ describe("cli", () => {
         expectedOpenUrl(`http://localhost:${port}`, a),
         expectedOpenUrl(`http://localhost:${port}`, b),
       ]);
+    });
+
+    describe("--since and changes", () => {
+      function recordFetch(test: ReturnType<typeof createTestDependencies>) {
+        const calls: Array<{ url: URL; body: unknown }> = [];
+        const real = test.deps.fetchImpl;
+        const deps = {
+          ...test.deps,
+          fetchImpl: (async (input, init) => {
+            calls.push({
+              url: new URL(String(input)),
+              body: init?.body ? JSON.parse(String(init.body)) : undefined,
+            });
+            return real(input, init);
+          }) as typeof fetch,
+        };
+        return { calls, deps };
+      }
+
+      it("puts since in the page URL of a single document", async () => {
+        const test = createTestDependencies();
+        const a = write("a.md");
+
+        expect(
+          await runCli(["open", a, "--print-url", "--since", "HEAD~1"], test.deps),
+        ).toBe(0);
+
+        const url = new URL(test.logs[0] ?? "");
+        expect(url.searchParams.get("path")).toBe(a);
+        expect(url.searchParams.get("since")).toBe("HEAD~1");
+      });
+
+      it("sends since for each tab in the tabs/open body and keeps it in the window URL", async () => {
+        const test = createTestDependencies();
+        const { calls, deps } = recordFetch(test);
+        const a = write("a.md");
+        const b = write("b.md");
+
+        expect(
+          await runCli(
+            ["open", a, b, "--no-watch", "--json", "--since=main"],
+            deps,
+          ),
+        ).toBe(0);
+
+        const openCall = calls.find((call) => call.url.pathname === "/api/tabs/open");
+        expect(openCall?.body).toMatchObject({
+          tabs: [
+            { path: a, since: "main" },
+            { path: b, since: "main" },
+          ],
+        });
+        const windowUrl = new URL(
+          parseOnlyJsonLog<{ url: string }>(test.logs).url,
+        );
+        expect(windowUrl.searchParams.getAll("since")).toEqual([
+          `main\n${a}`,
+          `main\n${b}`,
+        ]);
+      });
+
+      it("sends since with tabs add", async () => {
+        const test = createTestDependencies();
+        const { calls, deps } = recordFetch(test);
+        const a = write("a.md");
+
+        expect(
+          await runCli(["tabs", "add", a, "--since", "v1", "--no-open"], deps),
+        ).toBe(0);
+
+        const openCall = calls.find((call) => call.url.pathname === "/api/tabs/open");
+        expect(openCall?.body).toMatchObject({ tabs: [{ path: a, since: "v1" }] });
+      });
+
+      it("lists the changes since the last review in plain words", async () => {
+        const test = createTestDependencies();
+        const a = path.join(projectDir, "plan.md");
+        fs.writeFileSync(a, "# Plan\n\nFirst paragraph.\n\nSecond paragraph.\n");
+
+        expect(await runCli(["changes", a], test.deps)).toBe(0);
+        expect(test.logs.at(-1)).toBe("No changes.");
+
+        fs.writeFileSync(
+          a,
+          "# Plan\n\nFirst paragraph, edited.\n\nSecond paragraph.\n\nThird paragraph.\n",
+        );
+        test.logs.length = 0;
+        expect(await runCli(["changes", a], test.deps)).toBe(0);
+
+        const output = test.logs.join("\n");
+        expect(output).toContain("Baseline: last review");
+        expect(output).toContain("2 changes: 1 added, 1 changed, 0 removed");
+        expect(output).toContain("was: First paragraph.");
+        expect(output).toContain("now: First paragraph, edited.");
+        expect(output).toContain("added: Third paragraph.");
+      });
+
+      it("prints the diff and the baseline source as JSON, against a file", async () => {
+        const test = createTestDependencies();
+        const a = path.join(projectDir, "plan.md");
+        const old = path.join(projectDir, "plan-old.md");
+        fs.writeFileSync(old, "# Plan\n\nKept.\n\nGone.\n");
+        fs.writeFileSync(a, "# Plan\n\nKept.\n\nNew.\n");
+
+        const exitCode = await runCli(
+          ["changes", a, "--since", "plan-old.md", "--json"],
+          test.deps,
+        );
+
+        const payload = parseOnlyJsonLog<{
+          source: string;
+          label: string;
+          summary: { total: number };
+          changes: Array<{ kind: string; oldText: string; newText: string }>;
+        }>(test.logs);
+        expect(exitCode).toBe(0);
+        expect(payload).toMatchObject({ source: "file", label: "plan-old.md" });
+        expect(payload.summary.total).toBe(1);
+        expect(payload.changes).toMatchObject([
+          { kind: "changed", oldText: "Gone.", newText: "New." },
+        ]);
+      });
+
+      it("exits 1 with the reason when there is no baseline", async () => {
+        const test = createTestDependencies();
+        const a = path.join(projectDir, "plan.md");
+        fs.writeFileSync(a, "# Plan\n");
+
+        const exitCode = await runCli(
+          ["changes", a, "--since", "no-such-ref"],
+          test.deps,
+        );
+
+        expect(exitCode).toBe(1);
+        expect(test.errors.join("\n")).toContain("no-such-ref");
+      });
+
+      it("needs one path", async () => {
+        const test = createTestDependencies();
+
+        expect(await runCli(["changes"], test.deps)).toBe(2);
+        expect(test.errors[0]).toContain("Usage: roughdraft changes");
+      });
     });
 
     it("refuses --loop and --comments with several files", async () => {
