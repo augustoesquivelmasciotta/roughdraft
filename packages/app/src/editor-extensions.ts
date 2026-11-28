@@ -1,4 +1,4 @@
-import { Extension, Mark, Node, mergeAttributes } from "@tiptap/core";
+import { Extension, Mark, mergeAttributes, Node } from "@tiptap/core";
 import Code from "@tiptap/extension-code";
 import CodeBlock from "@tiptap/extension-code-block";
 import Image from "@tiptap/extension-image";
@@ -24,6 +24,8 @@ import type { Transform } from "@tiptap/pm/transform";
 import { Decoration, DecorationSet, type EditorView } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
 import DOMPurify from "dompurify";
+import { alertVariants } from "./components/ui/alert";
+import { ChangeHighlight } from "./editor-change-highlight";
 import { SectionFolding } from "./editor-folding";
 import {
   decodeRawMarkdownBlock,
@@ -32,7 +34,6 @@ import {
   rawMarkdownBlockTypeAttribute,
   toHtml,
 } from "./markdown";
-import { alertVariants } from "./components/ui/alert";
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
@@ -1332,6 +1333,7 @@ export function createEditorExtensions(placeholder: string) {
     CommentHighlight,
     CriticChangeHighlight,
     SectionFolding,
+    ChangeHighlight,
     MarkdownImage.configure({
       allowBase64: true,
       inline: false,

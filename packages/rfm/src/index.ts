@@ -1,3 +1,5 @@
+export * from "./diff.js";
+
 export type RfmDiagnosticSeverity = "error" | "warning";
 
 export interface RfmDiagnostic {

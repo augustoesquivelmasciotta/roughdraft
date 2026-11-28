@@ -317,3 +317,290 @@ describe("ReviewEventQueue done-signal", () => {
     expect(emitted.event).toMatchObject({ done: false, doneReason: null });
   });
 });
+
+describe("ReviewEventQueue comment events", () => {
+  const documentPath = "/tmp/project/draft.md";
+
+  function commentInput(text = "Why this?") {
+    return {
+      documentPath,
+      projectPath: path.dirname(documentPath),
+      relativePath: path.basename(documentPath),
+      version: "v2",
+      comments: [
+        {
+          id: "c1",
+          kind: "comment" as const,
+          parentId: null,
+          text,
+          anchorText: "the claim",
+          author: "user",
+        },
+      ],
+    };
+  }
+
+  it("never wakes or feeds a waiter that did not ask for comments", async () => {
+    vi.useFakeTimers();
+    const queue = new ReviewEventQueue();
+    const waiting = queue.wait({
+      documentPath,
+      timeoutMs: 10_000,
+      batchWindowMs: 0,
+    });
+    let settled = false;
+    void waiting.then(() => {
+      settled = true;
+    });
+
+    const emitted = queue.emitComments(commentInput());
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(emitted.delivered).toBe(false);
+    expect(settled).toBe(false);
+
+    queue.emit(eventInput(documentPath));
+    await vi.advanceTimersByTimeAsync(0);
+    const result = await waiting;
+
+    expect(result.events.map((event) => event.type)).toEqual([
+      "review.completed",
+    ]);
+    vi.useRealTimers();
+  });
+
+  it("does not replay retained comment events to a plain waiter", async () => {
+    const queue = new ReviewEventQueue();
+    queue.emitComments(commentInput());
+
+    const result = await queue.wait({ timeoutMs: 0 });
+
+    expect(result.events).toEqual([]);
+  });
+
+  it("wakes a comments waiter after the 3 second batch window with every comment", async () => {
+    vi.useFakeTimers();
+    const queue = new ReviewEventQueue();
+    const waiting = queue.wait({
+      documentPath,
+      timeoutMs: 60_000,
+      includeComments: true,
+    });
+
+    queue.emitComments(commentInput("first"));
+    await vi.advanceTimersByTimeAsync(2_000);
+    queue.emitComments(commentInput("second"));
+    await vi.advanceTimersByTimeAsync(999);
+    let settled = false;
+    void waiting.then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await waiting;
+
+    expect(result.timedOut).toBe(false);
+    expect(result.events.map((event) => event.type)).toEqual([
+      "comment.added",
+      "comment.added",
+    ]);
+    expect(
+      result.events.map((event) =>
+        event.type === "comment.added" ? event.comments[0]?.text : null,
+      ),
+    ).toEqual(["first", "second"]);
+    vi.useRealTimers();
+  });
+
+  it("lets Done Reviewing cut a comment batch short", async () => {
+    vi.useFakeTimers();
+    const queue = new ReviewEventQueue();
+    const waiting = queue.wait({
+      documentPath,
+      timeoutMs: 60_000,
+      includeComments: true,
+    });
+
+    queue.emitComments(commentInput());
+    await vi.advanceTimersByTimeAsync(100);
+    queue.emit(eventInput(documentPath));
+    await vi.advanceTimersByTimeAsync(250);
+    const result = await waiting;
+
+    expect(result.events.map((event) => event.type)).toEqual([
+      "comment.added",
+      "review.completed",
+    ]);
+    vi.useRealTimers();
+  });
+
+  it("honors an explicit batch window for comments", async () => {
+    vi.useFakeTimers();
+    const queue = new ReviewEventQueue();
+    const waiting = queue.wait({
+      documentPath,
+      timeoutMs: 60_000,
+      includeComments: true,
+      batchWindowMs: 100,
+    });
+
+    queue.emitComments(commentInput());
+    await vi.advanceTimersByTimeAsync(100);
+
+    await expect(waiting).resolves.toMatchObject({ timedOut: false });
+    vi.useRealTimers();
+  });
+
+  it("keeps the document watched for 30 seconds after a comments waiter returns", async () => {
+    vi.useFakeTimers();
+    const queue = new ReviewEventQueue();
+    const waiting = queue.wait({
+      documentPath,
+      timeoutMs: 60_000,
+      includeComments: true,
+      batchWindowMs: 0,
+    });
+    expect(queue.isDocumentWatched(documentPath)).toBe(true);
+
+    queue.emitComments(commentInput());
+    await vi.advanceTimersByTimeAsync(0);
+    await waiting;
+
+    expect(queue.waiterCountForDocument(documentPath)).toBe(0);
+    expect(queue.isDocumentWatched(documentPath)).toBe(true);
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(queue.isDocumentWatched(documentPath)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_001);
+    expect(queue.isDocumentWatched(documentPath)).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it("gives no grace after Done Reviewing or a timeout", async () => {
+    vi.useFakeTimers();
+    const queue = new ReviewEventQueue();
+
+    const timedOut = queue.wait({
+      documentPath,
+      timeoutMs: 1_000,
+      includeComments: true,
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await timedOut;
+    expect(queue.isDocumentWatched(documentPath)).toBe(false);
+
+    const waiting = queue.wait({
+      documentPath,
+      timeoutMs: 60_000,
+      includeComments: true,
+      batchWindowMs: 0,
+    });
+    queue.emitComments(commentInput());
+    queue.emit(eventInput(documentPath));
+    await vi.advanceTimersByTimeAsync(250);
+    await waiting;
+    expect(queue.isDocumentWatched(documentPath)).toBe(false);
+    vi.useRealTimers();
+  });
+});
+
+describe("ReviewEventQueue comment catch-up", () => {
+  const documentPath = "/tmp/project/draft.md";
+  const comment = (text: string) => ({
+    documentPath,
+    projectPath: path.dirname(documentPath),
+    relativePath: path.basename(documentPath),
+    version: "v2",
+    comments: [
+      {
+        id: text,
+        kind: "comment" as const,
+        parentId: null,
+        text,
+        anchorText: null,
+        author: "user",
+      },
+    ],
+  });
+  const fromNow = (queue: ReviewEventQueue, extra = {}) =>
+    queue.wait({
+      documentPath,
+      afterSequence: queue.latestSequence(),
+      timeoutMs: 0,
+      batchWindowMs: 0,
+      includeComments: true,
+      catchUpComments: true,
+      ...extra,
+    });
+
+  it("delivers a comment saved between two waits to the second, once", async () => {
+    const queue = new ReviewEventQueue();
+    await fromNow(queue); // first watch: starts from now, sets the mark
+    queue.emitComments(comment("while-replying"));
+
+    const second = await fromNow(queue);
+    const third = await fromNow(queue);
+
+    expect(second.events).toMatchObject([
+      { type: "comment.added", comments: [{ id: "while-replying" }] },
+    ]);
+    expect(third.events).toEqual([]);
+  });
+
+  it("does not hand a comment again after a parked waiter received it", async () => {
+    const queue = new ReviewEventQueue();
+    await fromNow(queue);
+    const parked = queue.wait({
+      documentPath,
+      afterSequence: queue.latestSequence(),
+      timeoutMs: 5_000,
+      batchWindowMs: 0,
+      includeComments: true,
+      catchUpComments: true,
+    });
+    queue.emitComments(comment("live"));
+    expect((await parked).events).toHaveLength(1);
+
+    expect((await fromNow(queue)).events).toEqual([]);
+  });
+
+  it("does not replay comments written before the first comments waiter", async () => {
+    const queue = new ReviewEventQueue();
+    queue.emitComments(comment("before-anyone-watched"));
+
+    expect((await fromNow(queue)).events).toEqual([]);
+  });
+
+  it("leaves plain waiters and explicit afterSequence alone", async () => {
+    const queue = new ReviewEventQueue();
+    await fromNow(queue);
+    queue.emitComments(comment("c-a"));
+    queue.emitComments(comment("c-b"));
+
+    const plain = await queue.wait({
+      documentPath,
+      afterSequence: queue.latestSequence(),
+      timeoutMs: 0,
+    });
+    const explicit = await fromNow(queue, {
+      afterSequence: 0,
+      catchUpComments: false,
+    });
+
+    expect(plain.events).toEqual([]);
+    expect(explicit.events.map((event) => event.sequence)).toEqual([1, 2]);
+  });
+
+  it("keeps marks per document", async () => {
+    const queue = new ReviewEventQueue();
+    await fromNow(queue);
+    queue.emitComments({
+      ...comment("elsewhere"),
+      documentPath: "/tmp/project/other.md",
+      relativePath: "other.md",
+    });
+
+    expect((await fromNow(queue)).events).toEqual([]);
+  });
+});

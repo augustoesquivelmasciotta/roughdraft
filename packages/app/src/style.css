@@ -196,6 +196,72 @@
     cursor: pointer;
   }
 
+  /* Change highlighting: colors what changed since the baseline. Decorations
+     only; they are never part of the document. */
+  .tiptap .rd-change-block {
+    position: relative;
+  }
+
+  .tiptap .rd-change-block::before {
+    content: "";
+    position: absolute;
+    top: 0.1em;
+    bottom: 0.1em;
+    left: -0.8rem;
+    width: 3px;
+    border-radius: 2px;
+    background-color: var(--rd-change-bar);
+    pointer-events: none;
+  }
+
+  .tiptap .rd-change-block.rd-change-current::before {
+    width: 5px;
+    left: -0.9rem;
+    background-color: var(--rd-change-bar-current);
+  }
+
+  .tiptap .rd-change-word {
+    background-color: var(--rd-change-tint);
+    border-radius: 0.2em;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+  }
+
+  .tiptap .rd-change-word--added {
+    background-color: var(--rd-change-tint-added);
+  }
+
+  .tiptap .rd-change-removed {
+    display: inline-block;
+    width: 0.4rem;
+    height: 1.05em;
+    margin: 0 0.1rem;
+    vertical-align: text-bottom;
+    border-left: 2px solid var(--rd-change-removed);
+    border-radius: 1px;
+    cursor: help;
+  }
+
+  .tiptap .rd-change-removed.rd-change-current {
+    border-left-width: 4px;
+  }
+
+  .tiptap {
+    --rd-change-bar: #d9a441;
+    --rd-change-bar-current: #b7791f;
+    --rd-change-tint: rgb(250 204 21 / 0.28);
+    --rd-change-tint-added: rgb(250 204 21 / 0.16);
+    --rd-change-removed: #dc2626;
+  }
+
+  .dark .tiptap {
+    --rd-change-bar: #b7791f;
+    --rd-change-bar-current: #f6c453;
+    --rd-change-tint: rgb(250 204 21 / 0.22);
+    --rd-change-tint-added: rgb(250 204 21 / 0.12);
+    --rd-change-removed: #f87171;
+  }
+
   /* Read-only previews of raw markdown blocks, such as <details> sections. */
   .tiptap .rd-raw-block {
     @apply my-4;

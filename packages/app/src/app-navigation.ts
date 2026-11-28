@@ -8,6 +8,7 @@ export type DocumentEditorViewMode = "rich-text" | "code";
 export const ROUGHDRAFT_FLAVORED_MARKDOWN_PATH =
   "/roughdraft-flavored-markdown";
 export const PREVIEW_PATH = "/preview";
+export const TAB_WINDOW_PATH = "/tabs";
 
 function normalizePathSeparators(value: string) {
   return value.replace(/\\/g, "/");
@@ -15,9 +16,11 @@ function normalizePathSeparators(value: string) {
 
 export function isReservedAppPath(pathname: string) {
   const normalizedPathname = normalizePathSeparators(pathname);
-  return [ROUGHDRAFT_FLAVORED_MARKDOWN_PATH, PREVIEW_PATH].includes(
-    normalizedPathname,
-  );
+  return [
+    ROUGHDRAFT_FLAVORED_MARKDOWN_PATH,
+    PREVIEW_PATH,
+    TAB_WINDOW_PATH,
+  ].includes(normalizedPathname);
 }
 
 function getRawPathFromLocation(): string | null {
@@ -212,6 +215,17 @@ export function buildLocationForDocumentEditorViewMode(
 export function getSessionLabelFromLocation(): string | null {
   const searchParams = new URLSearchParams(window.location.search);
   return searchParams.get("label")?.trim() || null;
+}
+
+/**
+ * What this page compares the document against to color what changed: the
+ * `since` URL param (a file path or a git ref), or null for the last review.
+ */
+export function getChangesSinceFromLocation(): string | null {
+  const since = new URLSearchParams(window.location.search)
+    .get("since")
+    ?.trim();
+  return since && since !== "last-review" ? since : null;
 }
 
 export function syncSessionLabelInUrl(sessionLabel: string | null) {

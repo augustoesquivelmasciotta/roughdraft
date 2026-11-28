@@ -2,6 +2,7 @@ import {
   type BackendInfo,
   type CompleteReviewOptions,
   type CompleteReviewResult,
+  type DocumentBaseline,
   type MarkdownFileChangeEvent,
   MarkdownFileConflictError,
   type Page,
@@ -205,6 +206,34 @@ export class ApiBackend implements StorageBackend {
     return payload.changed === true;
   }
 
+  async getDocumentBaseline(
+    relativePath: string,
+    since?: string | null,
+  ): Promise<DocumentBaseline | null> {
+    const res = await fetch(
+      this.buildUrl("/api/document-baseline", {
+        path: relativePath,
+        since: since?.trim() || "last-review",
+      }),
+    );
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      throw new Error(
+        `Failed to read the baseline of ${relativePath}: ${res.status}`,
+      );
+    }
+    const payload = (await res.json()) as Partial<DocumentBaseline>;
+    if (typeof payload.content !== "string") return null;
+    return {
+      source:
+        payload.source === "file" || payload.source === "git"
+          ? payload.source
+          : "last-review",
+      label: typeof payload.label === "string" ? payload.label : "",
+      content: payload.content,
+    };
+  }
+
   async restoreReviewRound(relativePath: string): Promise<Page> {
     const res = await fetch(
       this.buildUrl("/api/review-round/restore", { path: relativePath }),
@@ -225,16 +254,8 @@ export class ApiBackend implements StorageBackend {
     return (await res.json()) as Page;
   }
 
-  async closeOrcaTab(pageUrl: string): Promise<boolean> {
-    const res = await fetch("/api/orca/close-tab", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: pageUrl }),
-    });
-    if (!res.ok) return false;
-
-    const payload = (await res.json()) as { closed?: unknown };
-    return payload.closed === true;
+  closeOrcaTab(pageUrl: string): Promise<boolean> {
+    return closeOrcaTabOnServer(pageUrl);
   }
 
   async saveAsset(file: File): Promise<StoredAsset> {
@@ -270,4 +291,20 @@ export class ApiBackend implements StorageBackend {
   async openProject(path: string): Promise<void> {
     this.updateProjectInfo(path);
   }
+}
+
+/**
+ * Asks the local server to close the Orca browser tab showing `pageUrl`.
+ * Resolves false when no single Orca tab shows the page.
+ */
+export async function closeOrcaTabOnServer(pageUrl: string): Promise<boolean> {
+  const res = await fetch("/api/orca/close-tab", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: pageUrl }),
+  });
+  if (!res.ok) return false;
+
+  const payload = (await res.json()) as { closed?: unknown };
+  return payload.closed === true;
 }

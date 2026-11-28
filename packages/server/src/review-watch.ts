@@ -33,6 +33,8 @@ export interface ReviewWatchTarget {
   projectPath: string;
   path: string;
   batchWindowSeconds: number;
+  /** Also wake on `comment.added` events (new reviewer comments and replies). */
+  includeComments?: boolean;
 }
 
 export interface ReviewWatchPayload {

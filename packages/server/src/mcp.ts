@@ -2,11 +2,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  appendRoughdraftReply,
   decideRoughdraftSuggestion,
+  diffRoughdraftDocuments,
   extractRoughdraftReviewIndex,
   markRoughdraftResolved,
 } from "@roughdraft/rfm";
+import { resolveOrcaTarget } from "./orca.js";
+import { replyToComment } from "./review-comments.js";
+import { DEFAULT_COMMENT_BATCH_WINDOW_MS } from "./review-events.js";
 import { waitForReviewEvents } from "./review-watch.js";
 
 interface JsonRpcRequest {
@@ -71,17 +74,114 @@ const tools: ToolDefinition[] = [
   {
     name: "roughdraft_watch_review_events",
     description:
-      "Block until Roughdraft receives Done Reviewing for a Markdown file. Overall handoff comments are persisted as document-level YAML endmatter comments before the event is emitted. Omit timeoutSeconds to wait indefinitely; long waits are split into bounded polls.",
+      "Block until Roughdraft receives Done Reviewing for a Markdown file. Overall handoff comments are persisted as document-level YAML endmatter comments before the event is emitted. Omit timeoutSeconds to wait indefinitely; long waits are split into bounded polls. With includeComments it also returns as soon as the reviewer writes new comments or replies (comment.added events, gathered over a 3 second window), so you can answer each in its thread with roughdraft_reply_to_comment and call this tool again while the reviewer keeps reading. A comment written between two calls is returned by the next one at once. afterSequence returns only events after that sequence instead.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["documentPath"],
       properties: {
-        documentPath: { type: "string" },
+        documentPath: {
+          type: "string",
+          description: "The file to watch. Give this or paths.",
+        },
+        paths: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Watch several files at once: the call returns when every one is done (or on the timeout), with one entry per file.",
+        },
         projectPath: { type: "string" },
         timeoutSeconds: { type: "number" },
         batchWindowSeconds: { type: "number" },
+        includeComments: { type: "boolean" },
+        afterSequence: { type: "number" },
       },
+    },
+  },
+  {
+    name: "roughdraft_get_changes",
+    description:
+      "What is new, changed or removed in a Markdown file since a baseline, the same comparison the page colors (the CLI's `roughdraft changes`). `since` is `last-review` (default: the document at the last Done Reviewing, or at first open), a file path, or a git ref. Returns {changes, summary, source, label}; each change has kind, line, oldText, newText. Review marks and comments are not content. Fails when there is no baseline.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: {
+        path: { type: "string" },
+        since: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "roughdraft_open_tabs",
+    description:
+      "Open Markdown files as tabs of the one Roughdraft window (the same as `roughdraft open a.md b.md --no-watch`). A file opened while a batch is running waits in a queue and appears with the next batch (every 2 hours by default); `now` adds it at once. With no batch in the last 2 hours the files open at once and start a batch. Each file comes back with a status: added, focused, queued (with releaseAt), open-window or single-page (a plain single-document page already shows it). Wait for the reviews with roughdraft_watch_review_events and paths.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["paths"],
+      properties: {
+        paths: { type: "array", items: { type: "string" }, minItems: 1 },
+        now: { type: "boolean" },
+        label: { type: "string" },
+        since: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "roughdraft_list_tabs",
+    description:
+      "List the Roughdraft tab windows with their tabs (done, open threads) and the queue of documents waiting for the next batch, with the release time.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+    },
+  },
+  {
+    name: "roughdraft_add_tab",
+    description:
+      "Add one Markdown file as a tab at once, skipping the batch queue. windowId picks the window (default: the newest live one).",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: {
+        path: { type: "string" },
+        label: { type: "string" },
+        since: { type: "string" },
+        windowId: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "roughdraft_focus_tab",
+    description: "Bring one tab of a Roughdraft window forward.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: { path: { type: "string" }, windowId: { type: "string" } },
+    },
+  },
+  {
+    name: "roughdraft_close_tab",
+    description:
+      "Close one tab of a Roughdraft window, or drop a document from the queue when it has not appeared yet.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: { path: { type: "string" }, windowId: { type: "string" } },
+    },
+  },
+  {
+    name: "roughdraft_release_queued_tabs",
+    description:
+      "Open the next batch now: the queued documents join the live window, or a new window opens holding them.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
     },
   },
   {
@@ -291,12 +391,190 @@ export async function callTool(
     };
   }
 
+  if (
+    name === "roughdraft_watch_review_events" &&
+    Array.isArray(args.paths) &&
+    args.paths.length > 0
+  ) {
+    const documentPaths = args.paths.map((entry) =>
+      requireDocumentPath({ documentPath: entry }),
+    );
+    const server = readServerState(env);
+    if (!server) {
+      throw new Error("Roughdraft is not running. Start it before watching.");
+    }
+    const timeoutSeconds =
+      typeof args.timeoutSeconds === "number" ? args.timeoutSeconds : undefined;
+    const documents = await Promise.all(
+      documentPaths.map(async (documentPath) => {
+        const projectPath = path.dirname(documentPath);
+        const payload = await waitForReviewEvents({
+          fetchImpl,
+          serverUrl: server.url,
+          target: {
+            projectPath,
+            path: path.relative(projectPath, documentPath),
+            batchWindowSeconds:
+              typeof args.batchWindowSeconds === "number"
+                ? args.batchWindowSeconds
+                : 0.25,
+          },
+          timeoutSeconds,
+          fromNow: true,
+        });
+        const latest = (payload.events ?? []).at(-1) as
+          | { doneReason?: string | null }
+          | undefined;
+        const doneReason = latest?.doneReason ?? null;
+        return {
+          documentPath,
+          ...payload,
+          done: doneReason !== null,
+          doneReason,
+        };
+      }),
+    );
+    return {
+      allDone: documents.every((entry) => !entry.timedOut),
+      documents,
+    };
+  }
+
+  if (name === "roughdraft_get_changes") {
+    const documentPath = requireDocumentPath({ documentPath: args.path });
+    const since = typeof args.since === "string" ? args.since.trim() : "";
+    const server = await requireServer(env, fetchImpl, documentPath);
+    const url = new URL("/api/document-baseline", server.url);
+    url.searchParams.set("projectPath", path.dirname(documentPath));
+    url.searchParams.set("path", path.basename(documentPath));
+    url.searchParams.set("since", since || "last-review");
+    const response = await fetchImpl(url, {
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: unknown;
+      };
+      throw new Error(
+        typeof payload.error === "string"
+          ? payload.error
+          : `Roughdraft has no baseline for this document (${response.status}).`,
+      );
+    }
+    const baseline = (await response.json()) as {
+      source: string;
+      label: string;
+      content: string;
+    };
+    return {
+      documentPath,
+      ...diffRoughdraftDocuments(
+        baseline.content,
+        fs.readFileSync(documentPath, "utf8"),
+      ),
+      source: baseline.source,
+      label: baseline.label,
+    };
+  }
+
+  if (name === "roughdraft_open_tabs") {
+    if (!Array.isArray(args.paths) || args.paths.length === 0) {
+      throw new Error("paths is required.");
+    }
+    const documentPaths = args.paths.map((entry) =>
+      requireDocumentPath({ documentPath: entry }),
+    );
+    const server = await requireServer(env, fetchImpl, documentPaths[0]);
+    const label = typeof args.label === "string" ? args.label.trim() : "";
+    const since = typeof args.since === "string" ? args.since.trim() : "";
+    return tabsApi(server, fetchImpl, "POST", "/api/tabs/open", {
+      tabs: documentPaths.map((documentPath) => ({
+        path: documentPath,
+        ...(label ? { label } : {}),
+        ...(since ? { since } : {}),
+      })),
+      ...(args.now === true ? { now: true } : {}),
+      open: true,
+      orcaTarget: resolveOrcaTarget(env),
+    });
+  }
+
+  if (name === "roughdraft_list_tabs") {
+    const server = readServerState(env);
+    if (!server) {
+      return {
+        running: false,
+        windows: [],
+        queue: { items: [], releaseAt: null, batchOpenedAt: null },
+      };
+    }
+    return {
+      running: true,
+      ...((await tabsApi(server, fetchImpl, "GET", "/api/tabs")) as object),
+    };
+  }
+
+  if (name === "roughdraft_add_tab") {
+    const documentPath = requireDocumentPath({ documentPath: args.path });
+    const server = await requireServer(env, fetchImpl, documentPath);
+    const label = typeof args.label === "string" ? args.label.trim() : "";
+    const since = typeof args.since === "string" ? args.since.trim() : "";
+    return tabsApi(server, fetchImpl, "POST", "/api/tabs/open", {
+      tabs: [
+        {
+          path: documentPath,
+          ...(label ? { label } : {}),
+          ...(since ? { since } : {}),
+        },
+      ],
+      now: true,
+      open: true,
+      ...(typeof args.windowId === "string" && args.windowId
+        ? { windowId: args.windowId }
+        : {}),
+      orcaTarget: resolveOrcaTarget(env),
+    });
+  }
+
+  if (name === "roughdraft_focus_tab" || name === "roughdraft_close_tab") {
+    const targetPath = path.resolve(requireString(args, "path"));
+    const server = readServerState(env);
+    if (!server) throw new Error("Roughdraft is not running.");
+    return tabsApi(
+      server,
+      fetchImpl,
+      "POST",
+      name === "roughdraft_focus_tab" ? "/api/tabs/focus" : "/api/tabs/close",
+      {
+        path: targetPath,
+        ...(typeof args.windowId === "string" && args.windowId
+          ? { windowId: args.windowId }
+          : {}),
+      },
+    );
+  }
+
+  if (name === "roughdraft_release_queued_tabs") {
+    const server = readServerState(env);
+    if (!server) throw new Error("Roughdraft is not running.");
+    return tabsApi(server, fetchImpl, "POST", "/api/tabs/release", {
+      open: true,
+    });
+  }
+
   if (name === "roughdraft_watch_review_events") {
     const documentPath = requireDocumentPath(args);
     const projectPath =
       typeof args.projectPath === "string"
         ? path.resolve(args.projectPath)
         : path.dirname(documentPath);
+    const includeComments = args.includeComments === true;
+    const afterSequence =
+      typeof args.afterSequence === "number" &&
+      Number.isInteger(args.afterSequence) &&
+      args.afterSequence >= 0
+        ? args.afterSequence
+        : undefined;
     const server = readServerState(env);
     if (!server) {
       throw new Error("Roughdraft is not running. Start it before watching.");
@@ -313,19 +591,23 @@ export async function callTool(
         batchWindowSeconds:
           typeof args.batchWindowSeconds === "number"
             ? args.batchWindowSeconds
-            : 0.25,
+            : includeComments
+              ? DEFAULT_COMMENT_BATCH_WINDOW_MS / 1000
+              : 0.25,
+        ...(includeComments ? { includeComments: true } : {}),
       },
       timeoutSeconds:
         typeof args.timeoutSeconds === "number"
           ? args.timeoutSeconds
           : undefined,
-      fromNow: true,
+      fromNow: afterSequence === undefined,
+      afterSequence,
     });
     // Same done-signal `roughdraft open --loop` reports: the newest event
     // of the round decides it.
-    const latest = (payload.events ?? []).at(-1) as
-      | { doneReason?: string | null }
-      | undefined;
+    const latest = (payload.events ?? [])
+      .filter((event) => (event as { type?: string }).type !== "comment.added")
+      .at(-1) as { doneReason?: string | null } | undefined;
     const doneReason = latest?.doneReason ?? null;
     return { ...payload, done: doneReason !== null, doneReason };
   }
@@ -334,14 +616,12 @@ export async function callTool(
     const documentPath = requireDocumentPath(args);
     const parentId = requireString(args, "parentId");
     const message = requireString(args, "message");
-    const markdown = fs.readFileSync(documentPath, "utf8");
-    const updated = appendRoughdraftReply(markdown, {
+    const result = replyToComment(documentPath, {
       parentId,
       message,
-      author: typeof args.author === "string" ? args.author : "AI",
+      author: typeof args.author === "string" ? args.author : undefined,
     });
-    fs.writeFileSync(documentPath, updated);
-    return { ok: true, documentPath };
+    return { ok: true, documentPath, id: result.id, parentId };
   }
 
   if (name === "roughdraft_mark_resolved") {
@@ -374,6 +654,47 @@ export async function callTool(
   }
 
   throw new Error(`Unknown tool: ${name}`);
+}
+
+/** The running server, started when it is not running (the CLI's own start). */
+async function requireServer(
+  env: NodeJS.ProcessEnv,
+  fetchImpl: typeof fetch,
+  documentPath: string | undefined,
+): Promise<{ url: string; port: number }> {
+  const running = readServerState(env);
+  if (running) return running;
+  const { createCliDependencies, ensureServerRunning } = await import(
+    "./cli.js"
+  );
+  const result = await ensureServerRunning(
+    createCliDependencies({ env, fetchImpl }),
+    documentPath ? { projectDir: path.dirname(documentPath) } : undefined,
+  );
+  return { url: result.server.url, port: result.server.port };
+}
+
+async function tabsApi(
+  server: { url: string },
+  fetchImpl: typeof fetch,
+  method: "GET" | "POST",
+  route: string,
+  body?: unknown,
+): Promise<unknown> {
+  const response = await fetchImpl(new URL(route, server.url), {
+    method,
+    ...(body === undefined
+      ? {}
+      : {
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Roughdraft ${route} failed: ${response.status}`);
+  }
+  return response.json();
 }
 
 function writeMessage(output: NodeJS.WriteStream, value: unknown): void {

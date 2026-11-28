@@ -838,6 +838,8 @@ describe("review handoff watcher affordance", () => {
     document.body.appendChild(container);
     root = createRoot(container);
     setupDomMocks();
+    // A delivered Done Reviewing closes the window; jsdom must not tear down.
+    vi.spyOn(window, "close").mockImplementation(() => {});
     (
       globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
     ).IS_REACT_ACT_ENVIRONMENT = true;
@@ -857,7 +859,9 @@ describe("review handoff watcher affordance", () => {
     getWatcherCount,
     onCompleteReview = async () => ({ delivered: false }),
     closeOrcaTab,
+    documentContent,
   }: {
+    documentContent?: string;
     getWatcherCount: () => number;
     onCompleteReview?: (
       options?: CompleteReviewOptions,
@@ -867,7 +871,7 @@ describe("review handoff watcher affordance", () => {
     await act(async () => {
       root.render(
         <DocumentWorkspace
-          documentPage={createPage()}
+          documentPage={createPage(documentContent)}
           activeDocumentPath="test.md"
           documentFilenameLabel="test.md"
           documentEditorViewMode="rich-text"
@@ -1180,6 +1184,7 @@ describe("review handoff watcher affordance", () => {
     await renderWorkspace({
       getWatcherCount: () => watcherCount,
       onCompleteReview,
+      closeOrcaTab: async () => true,
     });
 
     const doneReviewingButton = getByTestId<HTMLButtonElement>(
@@ -1190,6 +1195,11 @@ describe("review handoff watcher affordance", () => {
 
     expect(onCompleteReview).toHaveBeenCalledTimes(1);
     expect(container.textContent).toContain("Sent");
+    // A delivered handoff closes the window instead of showing the popup.
+    expect(closeWindow).toHaveBeenCalledTimes(1);
+    expect(queryByTestId(document.body, "review-handoff-status")).toBeNull();
+
+    await click(getByTestId(container, "review-handoff-button"));
     expect(document.body.textContent).toContain("Nice one!");
     expect(document.body.textContent).toContain(
       "Your agent is now working in the background on this, in all likelihood. If our signal didn't make it, just click here to copy a line you can send it to keep going.",
@@ -1246,7 +1256,7 @@ describe("review handoff watcher affordance", () => {
 
     await click(getByTestId(document.body, "review-handoff-close-window"));
 
-    expect(closeWindow).toHaveBeenCalled();
+    expect(closeWindow).toHaveBeenCalledTimes(2);
   });
 
   async function handOffAndCloseWindow(
@@ -1263,8 +1273,8 @@ describe("review handoff watcher affordance", () => {
       },
       closeOrcaTab,
     });
+    // The handoff itself closes the window: no button to click.
     await click(getByTestId(container, "review-handoff-button"));
-    await click(getByTestId(document.body, "review-handoff-close-window"));
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 250));
     });
@@ -1290,6 +1300,143 @@ describe("review handoff watcher affordance", () => {
       getByTestId(document.body, "review-handoff-close-window-hint")
         .textContent,
     ).toBe("Close this tab from the tab bar.");
+  });
+
+  it("closes the plain window without showing the popup after a delivered handoff", async () => {
+    const closeWindow = vi.spyOn(window, "close").mockImplementation(() => {});
+    const closeOrcaTab = vi
+      .fn<NonNullable<StorageBackend["closeOrcaTab"]>>()
+      .mockResolvedValue(true);
+    await renderWorkspace({
+      getWatcherCount: () => 1,
+      onCompleteReview: async () => ({ delivered: true }),
+      closeOrcaTab,
+    });
+
+    await click(getByTestId(container, "review-handoff-button"));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    });
+
+    expect(closeWindow).toHaveBeenCalledTimes(1);
+    expect(closeOrcaTab).toHaveBeenCalledWith(window.location.href);
+    expect(queryByTestId(document.body, "review-handoff-status")).toBeNull();
+  });
+
+  it.each([
+    ["undelivered", async () => ({ delivered: false })],
+    [
+      "failed",
+      async (): Promise<CompleteReviewResult> => {
+        throw new Error("boom");
+      },
+    ],
+  ])("keeps the popup and closes nothing when the handoff is %s", async (_name, onCompleteReview) => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const closeWindow = vi.spyOn(window, "close").mockImplementation(() => {});
+    const closeOrcaTab = vi
+      .fn<NonNullable<StorageBackend["closeOrcaTab"]>>()
+      .mockResolvedValue(true);
+    await renderWorkspace({
+      getWatcherCount: () => 1,
+      onCompleteReview,
+      closeOrcaTab,
+    });
+
+    await click(getByTestId(container, "review-handoff-button"));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    });
+
+    expect(getByTestId(document.body, "review-handoff-status")).toBeDefined();
+    expect(closeWindow).not.toHaveBeenCalled();
+    expect(closeOrcaTab).not.toHaveBeenCalled();
+  });
+
+  describe("inside a tab window", () => {
+    const originalParent = Object.getOwnPropertyDescriptor(window, "parent");
+    let postMessage: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      postMessage = vi.fn();
+      Object.defineProperty(window, "parent", {
+        configurable: true,
+        value: { postMessage },
+      });
+      window.history.replaceState(null, "", "/?path=%2Fdocs%2Fa.md&embedded=1");
+    });
+
+    afterEach(() => {
+      if (originalParent)
+        Object.defineProperty(window, "parent", originalParent);
+    });
+
+    it("tells the tab window instead of closing, with no popup, after a delivered handoff", async () => {
+      const closeWindow = vi
+        .spyOn(window, "close")
+        .mockImplementation(() => {});
+      const closeOrcaTab = vi
+        .fn<NonNullable<StorageBackend["closeOrcaTab"]>>()
+        .mockResolvedValue(true);
+      await renderWorkspace({
+        getWatcherCount: () => 1,
+        onCompleteReview: async () => ({ delivered: true }),
+        closeOrcaTab,
+      });
+
+      await click(getByTestId(container, "review-handoff-button"));
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      });
+
+      expect(postMessage).toHaveBeenCalledWith(
+        { type: "roughdraft:review-delivered", path: "/docs/a.md" },
+        window.location.origin,
+      );
+      expect(closeWindow).not.toHaveBeenCalled();
+      expect(closeOrcaTab).not.toHaveBeenCalled();
+      expect(queryByTestId(document.body, "review-handoff-status")).toBeNull();
+    });
+
+    it("reports its open thread count to the tab window", async () => {
+      await renderWorkspace({
+        getWatcherCount: () => 0,
+        documentContent: [
+          "Some {==selected text==}{>>A question<<}{#c1} here.",
+          "",
+          "---",
+          "comments:",
+          "  c1:",
+          "    by: Reviewer",
+          '    at: "2026-04-28T12:00:00.000Z"',
+          "",
+        ].join("\n"),
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+
+      expect(postMessage).toHaveBeenCalledWith(
+        { type: "roughdraft:tab-state", path: "/docs/a.md", openThreads: 1 },
+        window.location.origin,
+      );
+    });
+
+    it("posts nothing and shows the popup when the handoff is undelivered", async () => {
+      await renderWorkspace({
+        getWatcherCount: () => 1,
+        onCompleteReview: async () => ({ delivered: false }),
+      });
+
+      await click(getByTestId(container, "review-handoff-button"));
+
+      expect(
+        postMessage.mock.calls.some(
+          ([message]) => message?.type === "roughdraft:review-delivered",
+        ),
+      ).toBe(false);
+      expect(getByTestId(document.body, "review-handoff-status")).toBeDefined();
+    });
   });
 
   // Why: when the browser queued the handoff request forever (its 6

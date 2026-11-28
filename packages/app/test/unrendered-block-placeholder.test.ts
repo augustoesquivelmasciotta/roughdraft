@@ -51,7 +51,7 @@ describe("raw block types", () => {
         "",
         "- item",
         "",
-        "    indented code",
+        "      indented code",
         "",
       ].join("\n"),
     );

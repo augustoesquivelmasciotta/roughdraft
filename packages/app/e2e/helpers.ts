@@ -38,7 +38,23 @@ export async function openMarkdownFile(
   const params = new URLSearchParams({ path: absolutePath });
   if (editor) params.set("editor", editor);
 
+  await installCloseWindowRecorder(page);
   await page.goto(`/?${params.toString()}`);
+}
+
+/**
+ * A delivered Done Reviewing closes the window. A test page must survive it,
+ * so `window.close` only counts its calls, like an Orca tab that ignores it;
+ * the count is `window.__roughdraftCloseCalls`.
+ */
+export async function installCloseWindowRecorder(page: Page) {
+  await page.addInitScript(() => {
+    const target = window as unknown as { __roughdraftCloseCalls?: number };
+    target.__roughdraftCloseCalls = 0;
+    window.close = () => {
+      target.__roughdraftCloseCalls = (target.__roughdraftCloseCalls ?? 0) + 1;
+    };
+  });
 }
 
 export function codeEditor(page: Page) {

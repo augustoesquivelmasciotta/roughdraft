@@ -239,6 +239,46 @@ test.describe("review handoff", () => {
     });
   });
 
+  test("closes the window after a delivered handoff without the Close window popup", async ({
+    page,
+    request,
+  }) => {
+    const filePath = writeProjectFile(
+      projectDir,
+      "close-on-done.md",
+      ["# Close On Done", "", "Review then close.", ""].join("\n"),
+    );
+
+    pendingWatch = request.post("/api/review-events/watch", {
+      data: {
+        projectPath: projectDir,
+        path: "close-on-done.md",
+        timeoutSeconds: 10,
+      },
+    });
+
+    await openMarkdownFile(page, filePath);
+    await page.getByTestId("review-handoff-button").click();
+
+    await expect(page.getByTestId("review-handoff-button")).toHaveText("Sent");
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as unknown as { __roughdraftCloseCalls?: number })
+              .__roughdraftCloseCalls,
+        ),
+      )
+      .toBe(1);
+    // This test server has no Orca tab to close, so the page is still here
+    // and shows how to close it; the success popup never appeared before that.
+    await expect(
+      page.getByTestId("review-handoff-close-window-hint"),
+    ).toBeVisible();
+
+    await pendingWatch;
+  });
+
   test("reopens the sent handoff status from the muted primary button", async ({
     page,
     request,

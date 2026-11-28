@@ -135,11 +135,31 @@ function protectRawHtmlBlocks(markdown: string): string {
   );
 }
 
+// Width of a line's leading whitespace in columns (a tab counts to the next
+// multiple of 4), or -1 for a blank line.
+function leadingColumns(line: string): number {
+  let columns = 0;
+  for (const char of line) {
+    if (char === " ") columns += 1;
+    else if (char === "\t") columns += 4 - (columns % 4);
+    else return columns;
+  }
+  return -1;
+}
+
+// CommonMark: inside a list item, indented code starts 4 columns past the
+// item's content column. Less than that is ordinary item content (a paragraph
+// or a nested list), so only the deeper blocks are protected.
 function protectIndentedCodeAfterLists(markdown: string): string {
   return transformOutsideFencedCode(markdown, (segment) =>
     segment.replace(
-      /^(?:[-*+]|\d+[.)]) [^\r\n]*(?:\r?\n)[ \t]*(?:\r?\n)(?:(?: {4}|\t)[^\r\n]*(?:\r?\n|$))+/gm,
-      (raw) => createRawMarkdownBlock(raw, "indented-code"),
+      /^([-*+]|\d+[.)])( +)[^\r\n]*(?:\r?\n)[ \t]*(?:\r?\n)((?:(?: {4}|\t)[^\r\n]*(?:\r?\n|$))+)/gm,
+      (raw, marker: string, spaces: string, block: string) => {
+        const contentColumn = marker.length + Math.min(spaces.length, 4);
+        const firstLine = block.match(/[^\r\n]*/)?.[0] ?? "";
+        if (leadingColumns(firstLine) < contentColumn + 4) return raw;
+        return createRawMarkdownBlock(raw, "indented-code");
+      },
     ),
   );
 }

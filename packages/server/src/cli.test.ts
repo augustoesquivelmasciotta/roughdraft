@@ -3,7 +3,10 @@ import { createServer as createHttpServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateRoughdraftMarkdown } from "@roughdraft/rfm";
+import {
+  extractRoughdraftReviewIndex,
+  validateRoughdraftMarkdown,
+} from "@roughdraft/rfm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createCliDependencies,
@@ -102,6 +105,14 @@ describe("cli", () => {
     return url.toString();
   }
 
+  // A plain `open` shows the document as a tab of a tab window.
+  function expectedTabWindowUrl(baseUrl: string, documentPath: string) {
+    const origin = new URL(baseUrl).origin;
+    return new RegExp(
+      `^${origin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/tabs\\?window=[^&]+&tab=${encodeURIComponent(documentPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+    );
+  }
+
   function parseOnlyJsonLog<T>(logs: string[]): T {
     expect(logs).toHaveLength(1);
     return JSON.parse(logs[0] ?? "{}") as T;
@@ -189,6 +200,9 @@ describe("cli", () => {
           projectDir: nextProjectDir,
           serverRoot,
           staticDirPath: nextProjectDir,
+          // Keeps the tab queue out of the real ~/.roughdraft and opens nothing.
+          stateDir: path.join(tempDir, "app-state"),
+          openTabWindow: async () => true,
         });
         const started = await listenOnLoopbackServers(port, app);
         runningPids.add(pid);
@@ -259,8 +273,8 @@ describe("cli", () => {
 
     expect(exitCode).toBe(0);
     expect(test.getSpawnCount()).toBe(1);
-    expect(test.getLastOpenedUrl()).toBe(
-      expectedOpenUrl(`http://localhost:${persisted.port}`, documentPath),
+    expect(test.getLastOpenedUrl()).toMatch(
+      expectedTabWindowUrl(`http://localhost:${persisted.port}`, documentPath),
     );
     expect(fs.existsSync(getServerStateFilePath(test.deps.env))).toBeTruthy();
   });
@@ -493,8 +507,8 @@ describe("cli", () => {
 
       expect(exitCode).toBe(0);
       expect(payload.openMode).toBe("orca-tab");
-      expect(payload.url).toBe(
-        expectedOpenUrl(
+      expect(payload.url).toMatch(
+        expectedTabWindowUrl(
           `http://localhost:${readPersistedPort(test.deps.env)}`,
           documentPath,
         ),
@@ -531,6 +545,15 @@ describe("cli", () => {
           )}&editor=code`,
         },
       ]);
+
+      // The plain page the Orca tab shows polls for open requests, so the
+      // server knows a page already shows the file and no tab window is made.
+      await ensureServerRunning(test.deps, { projectDir });
+      await fetch(
+        `http://127.0.0.1:${readPersistedPort(test.deps.env)}/api/open-requests/poll?${new URLSearchParams(
+          { clientId: "orca-draft", path: documentPath },
+        )}`,
+      );
 
       const exitCode = await runCli(["open", documentPath, "--no-watch"], {
         ...test.deps,
@@ -986,13 +1009,15 @@ describe("cli", () => {
     }>(test.logs);
 
     expect(exitCode).toBe(0);
-    expect(payload).toEqual({
+    expect(payload).toMatchObject({
       opened: true,
-      url: expectedOpenUrl(`http://localhost:${persisted.port}`, documentPath),
       serverUrl: `http://localhost:${persisted.port}`,
       path: documentPath,
       openMode: "disabled",
     });
+    expect(payload.url).toMatch(
+      expectedTabWindowUrl(`http://localhost:${persisted.port}`, documentPath),
+    );
   });
 
   it("prefers the live dev frontend URL when it matches this checkout", async () => {
@@ -1209,8 +1234,8 @@ describe("cli", () => {
 
     expect(exitCode).toBe(0);
     expect(test.getSpawnCount()).toBe(1);
-    expect(test.getLastOpenedUrl()).toBe(
-      expectedOpenUrl(`http://localhost:${persisted.port}`, documentPath),
+    expect(test.getLastOpenedUrl()).toMatch(
+      expectedTabWindowUrl(`http://localhost:${persisted.port}`, documentPath),
     );
   });
 
@@ -2085,7 +2110,7 @@ describe("cli", () => {
 
       expect(exitCode).toBe(0);
       expect(test.logs).toContain(
-        "  roughdraft open <path> [--label <text>] [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
+        "  roughdraft open <path> [<path>...] [--now] [--label <text>] [--since <x>] [--no-open] [--no-watch] [--loop] [--comments] [--print-url] [--port <port>]",
       );
       expect(test.logs.join("\n")).toContain("  --loop ");
     });
@@ -2459,7 +2484,7 @@ describe("cli", () => {
 
     expect(exitCode).toBe(0);
     expect(test.logs).toContain(
-      "  roughdraft open <path> [--label <text>] [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
+      "  roughdraft open <path> [<path>...] [--now] [--label <text>] [--since <x>] [--no-open] [--no-watch] [--loop] [--comments] [--print-url] [--port <port>]",
     );
     expect(test.logs).toContain(
       "  --no-watch           Open the file without waiting",
@@ -2725,6 +2750,878 @@ describe("cli", () => {
     expect(spawnedPort).toBe(ROUGHDRAFT_DEFAULT_PORT + 1);
     expect(spawnedProjectDir).toBe(projectDir);
     expect(result.server.port).toBe(ROUGHDRAFT_DEFAULT_PORT + 1);
+  });
+  async function waitForWatcher(
+    test: ReturnType<typeof createTestDependencies>,
+  ): Promise<number> {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const stateFile = getServerStateFilePath(test.deps.env);
+      if (fs.existsSync(stateFile)) {
+        const { port } = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
+          port: number;
+        };
+        try {
+          const status = (await (
+            await fetch(
+              `http://localhost:${port}/api/review-events/status?${new URLSearchParams(
+                { projectPath: projectDir, path: "draft.md" },
+              )}`,
+            )
+          ).json()) as { watcherCount?: number };
+          if ((status.watcherCount ?? 0) > 0) return port;
+        } catch {}
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("The watcher never registered.");
+  }
+
+  const COMMENT_DOCUMENT = [
+    "# Draft",
+    "",
+    "Keep {==the claim==}{>>Why this?<<}{#c1} here.",
+    "",
+    "---",
+    "comments:",
+    "  c1:",
+    "    by: user",
+    '    at: "2026-11-28T10:00:00.000Z"',
+    "",
+  ].join("\n");
+
+  it("prints one JSON line per new comment from watch --comments --json", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, COMMENT_DOCUMENT);
+
+    const watchPromise = runCli(
+      [
+        "watch",
+        documentPath,
+        "--comments",
+        "--json",
+        "--timeout",
+        "5",
+        "--batch-window",
+        "0",
+      ],
+      test.deps,
+    );
+    const port = await waitForWatcher(test);
+
+    const saved = await fetch(
+      `http://localhost:${port}/api/markdown-file?${new URLSearchParams({
+        projectPath: projectDir,
+        path: "draft.md",
+      })}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content: COMMENT_DOCUMENT.replace(
+            "here.",
+            "here and {==more==}{>>Cut this<<}{#c2}.",
+          ).replace(
+            '    at: "2026-11-28T10:00:00.000Z"\n',
+            '    at: "2026-11-28T10:00:00.000Z"\n  c2:\n    by: user\n    at: "2026-11-28T10:05:00.000Z"\n',
+          ),
+        }),
+      },
+    );
+    expect(saved.status).toBe(200);
+
+    const exitCode = await watchPromise;
+
+    expect(exitCode).toBe(0);
+    expect(test.logs).toHaveLength(1);
+    expect(JSON.parse(test.logs[0] ?? "{}")).toMatchObject({
+      type: "comment.added",
+      path: documentPath,
+      id: "c2",
+      kind: "comment",
+      parentId: null,
+      text: "Cut this",
+      anchorText: "more",
+    });
+  });
+
+  it("returns the review.completed line from watch --comments --json on Done Reviewing", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, COMMENT_DOCUMENT);
+
+    const watchPromise = runCli(
+      [
+        "watch",
+        documentPath,
+        "--comments",
+        "--json",
+        "--timeout",
+        "5",
+        "--batch-window",
+        "0",
+      ],
+      test.deps,
+    );
+    const port = await waitForWatcher(test);
+    await fetch(`http://localhost:${port}/api/review-events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectPath: projectDir,
+        path: "draft.md",
+        overallComment: "Listo",
+      }),
+    });
+
+    expect(await watchPromise).toBe(0);
+    expect(test.logs).toHaveLength(1);
+    expect(JSON.parse(test.logs[0] ?? "{}")).toMatchObject({
+      type: "review.completed",
+      path: documentPath,
+      done: true,
+    });
+  });
+
+  it("exits 1 with a timedOut line when watch --comments hears nothing", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, COMMENT_DOCUMENT);
+
+    const exitCode = await runCli(
+      ["watch", documentPath, "--comments", "--json", "--timeout", "0.2"],
+      test.deps,
+    );
+
+    expect(exitCode).toBe(1);
+    expect(test.logs.map((line) => JSON.parse(line))).toEqual([
+      { timedOut: true, events: [] },
+    ]);
+  });
+
+  it("asks the server for comment events only with --comments", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, COMMENT_DOCUMENT);
+    const bodies: Array<Record<string, unknown>> = [];
+    const deps = {
+      ...test.deps,
+      fetchImpl: async (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        if (
+          String(input).endsWith("/api/review-events/watch") &&
+          typeof init?.body === "string"
+        ) {
+          bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+        }
+        return test.deps.fetchImpl(input, init);
+      },
+    };
+
+    await runCli(["watch", documentPath, "--timeout", "0.1"], deps);
+    await runCli(
+      ["watch", documentPath, "--comments", "--timeout", "0.1"],
+      deps,
+    );
+
+    expect(bodies[0]).not.toHaveProperty("includeComments");
+    expect(bodies[0]?.batchWindowSeconds).toBe(0.25);
+    expect(bodies[1]).toMatchObject({
+      includeComments: true,
+      batchWindowSeconds: 3,
+    });
+  });
+
+  it("sends --after as a literal cursor and rejects a bad one", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, COMMENT_DOCUMENT);
+    const bodies: Array<Record<string, unknown>> = [];
+    const deps = {
+      ...test.deps,
+      fetchImpl: async (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        if (
+          String(input).endsWith("/api/review-events/watch") &&
+          typeof init?.body === "string"
+        ) {
+          bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+        }
+        return test.deps.fetchImpl(input, init);
+      },
+    };
+
+    await runCli(
+      ["watch", documentPath, "--comments", "--after", "4", "--timeout", "0.1"],
+      deps,
+    );
+    await runCli(
+      ["open", documentPath, "--comments", "--after=5", "--timeout", "0.1"],
+      deps,
+    );
+
+    expect(bodies[0]).toMatchObject({ fromNow: false, afterSequence: 4 });
+    expect(bodies[1]).toMatchObject({ fromNow: false, afterSequence: 5 });
+    expect(
+      await runCli(["watch", documentPath, "--after", "x"], test.deps),
+    ).toBe(2);
+  });
+
+  it("passes --comments from open through to the watch", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, COMMENT_DOCUMENT);
+    const bodies: Array<Record<string, unknown>> = [];
+    const deps = {
+      ...test.deps,
+      fetchImpl: async (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        if (
+          String(input).endsWith("/api/review-events/watch") &&
+          typeof init?.body === "string"
+        ) {
+          bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+        }
+        return test.deps.fetchImpl(input, init);
+      },
+    };
+
+    await runCli(
+      ["open", documentPath, "--comments", "--json", "--timeout", "0.1"],
+      deps,
+    );
+
+    expect(bodies[0]).toMatchObject({ includeComments: true });
+    expect(
+      await runCli(["open", documentPath, "--comments", "--no-watch"], deps),
+    ).toBe(2);
+  });
+
+  it("replies to a comment with the reply command", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, COMMENT_DOCUMENT);
+
+    const exitCode = await runCli(
+      ["reply", documentPath, "--to", "c1", "--json", "Moved", "it", "above."],
+      test.deps,
+    );
+
+    expect(exitCode).toBe(0);
+    const payload = parseOnlyJsonLog<{
+      replied: boolean;
+      id: string;
+      parentId: string;
+    }>(test.logs);
+    expect(payload).toMatchObject({ replied: true, parentId: "c1" });
+    const reply = extractRoughdraftReviewIndex(
+      fs.readFileSync(documentPath, "utf8"),
+    ).items.find((item) => item.id === payload.id);
+    expect(reply).toMatchObject({
+      kind: "reply",
+      parentId: "c1",
+      text: "Moved it above.",
+      author: "AI",
+    });
+  });
+
+  it("lets reply set the author and rejects bad usage", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, COMMENT_DOCUMENT);
+
+    expect(
+      await runCli(
+        ["reply", documentPath, "--to", "c1", "--by", "Claude", "Noted."],
+        test.deps,
+      ),
+    ).toBe(0);
+    expect(
+      extractRoughdraftReviewIndex(
+        fs.readFileSync(documentPath, "utf8"),
+      ).items.find((item) => item.kind === "reply")?.author,
+    ).toBe("Claude");
+
+    expect(await runCli(["reply", documentPath, "Noted."], test.deps)).toBe(2);
+    expect(await runCli(["reply", documentPath, "--to", "c1"], test.deps)).toBe(
+      2,
+    );
+    expect(
+      await runCli(["reply", documentPath, "--to", "nope", "x"], test.deps),
+    ).toBe(1);
+    expect(test.errors.at(-1)).toMatch(/not found/);
+  });
+
+  it("documents --comments and reply in help", async () => {
+    const watchHelp = createTestDependencies();
+    await runCli(["watch", "--help"], watchHelp.deps);
+    expect(watchHelp.logs.join("\n")).toContain("--comments");
+
+    const replyHelp = createTestDependencies();
+    await runCli(["reply", "--help"], replyHelp.deps);
+    expect(replyHelp.logs.join("\n")).toContain("--to <id>");
+
+    const topHelp = createTestDependencies();
+    await runCli(["--help"], topHelp.deps);
+    expect(topHelp.logs.join("\n")).toContain("reply <path>");
+  });
+
+  describe("tab windows and the batch queue", () => {
+    function portOf(env: NodeJS.ProcessEnv) {
+      return (
+        JSON.parse(fs.readFileSync(getServerStateFilePath(env), "utf8")) as {
+          port: number;
+        }
+      ).port;
+    }
+
+    function write(name: string) {
+      const filePath = path.join(projectDir, name);
+      fs.writeFileSync(filePath, `# ${name}\n`);
+      return filePath;
+    }
+
+    // Stands in for the tab window's page: it polls with its tabs.
+    async function pollWindow(port: number, windowId: string, paths: string[]) {
+      const response = await fetch(
+        `http://localhost:${port}/api/tab-windows/poll`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            windowId,
+            tabs: paths.map((tabPath) => ({
+              path: tabPath,
+              label: null,
+              active: false,
+              done: false,
+              openThreads: 0,
+            })),
+          }),
+        },
+      );
+      return (await response.json()) as {
+        commands: unknown[];
+        queue: { count: number; releaseAt: string | null };
+      };
+    }
+
+    function windowIdFromUrl(url: string) {
+      return new URL(url).searchParams.get("window") as string;
+    }
+
+    it("opens several files as tabs of one window", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+      const b = write("b.md");
+
+      const exitCode = await runCli(
+        ["open", a, b, "--no-watch", "--json"],
+        test.deps,
+      );
+
+      const payload = parseOnlyJsonLog<{
+        opened: boolean;
+        url: string;
+        tabs: Array<{ path: string; status: string }>;
+      }>(test.logs);
+      expect(exitCode).toBe(0);
+      expect(payload.opened).toBe(true);
+      expect(payload.tabs.map((tab) => [tab.path, tab.status])).toEqual([
+        [a, "open-window"],
+        [b, "open-window"],
+      ]);
+      const url = new URL(payload.url);
+      expect(url.pathname).toBe("/tabs");
+      expect(url.searchParams.getAll("tab")).toEqual([a, b]);
+      expect(test.getLastOpenedUrl()).toBe(payload.url);
+    });
+
+    it("queues a file opened during a batch and says when it appears", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+      const b = write("b.md");
+      await runCli(["open", a, "--no-watch", "--json"], test.deps);
+      test.logs.length = 0;
+
+      const exitCode = await runCli(["open", b, "--no-watch"], test.deps);
+
+      expect(exitCode).toBe(0);
+      expect(test.logs).toHaveLength(1);
+      expect(test.logs[0]).toMatch(
+        /^Queued for the next batch at \d{2}:\d{2}\.$/,
+      );
+    });
+
+    it("prints a queued file as JSON, then keeps watching it", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+      const b = write("b.md");
+      await runCli(["open", a, "--no-watch", "--json"], test.deps);
+      test.logs.length = 0;
+
+      const exitCode = await runCli(
+        ["open", b, "--json", "--timeout", "0.3", "--batch-window", "0"],
+        test.deps,
+      );
+
+      expect(exitCode).toBe(1);
+      expect(JSON.parse(test.logs[0] ?? "{}")).toEqual({
+        queued: true,
+        releaseAt: expect.any(String),
+        path: b,
+      });
+      expect(JSON.parse(test.logs.slice(1).join("\n"))).toMatchObject({
+        timedOut: true,
+      });
+    });
+
+    it("adds a file at once with --now and focuses one already open", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+      const b = write("b.md");
+      const first = parseOnlyJsonLog<{ url: string }>(
+        await (async () => {
+          await runCli(["open", a, "--no-watch", "--json"], test.deps);
+          return test.logs;
+        })(),
+      );
+      const port = portOf(test.deps.env);
+      const windowId = windowIdFromUrl(first.url);
+      await pollWindow(port, windowId, [a]);
+      test.logs.length = 0;
+
+      expect(await runCli(["open", b, "--now", "--no-watch"], test.deps)).toBe(
+        0,
+      );
+      expect(test.logs).toEqual([`Added to the open Roughdraft window: ${b}.`]);
+      const polled = await pollWindow(port, windowId, [a]);
+      expect(polled.commands).toMatchObject([
+        { type: "add", tabs: [{ path: b }] },
+      ]);
+
+      test.logs.length = 0;
+      expect(await runCli(["open", a, "--no-watch"], test.deps)).toBe(0);
+      expect(test.logs[0]).toContain("focused");
+      expect((await pollWindow(port, windowId, [a])).commands).toEqual([
+        { type: "focus", path: a },
+      ]);
+    });
+
+    it("lists tabs and the queue, releases the queue, focuses and closes", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+      const b = write("b.md");
+      await runCli(["open", a, "--no-watch", "--json"], test.deps);
+      const first = JSON.parse(test.logs[0] ?? "{}") as { url: string };
+      const port = portOf(test.deps.env);
+      const windowId = windowIdFromUrl(first.url);
+      await pollWindow(port, windowId, [a]);
+      await runCli(["open", b, "--no-watch"], test.deps);
+
+      test.logs.length = 0;
+      expect(await runCli(["tabs", "--json"], test.deps)).toBe(0);
+      const listing = JSON.parse(test.logs.join("\n")) as {
+        running: boolean;
+        windows: Array<{ id: string; tabs: Array<{ path: string }> }>;
+        queue: { items: Array<{ path: string }>; releaseAt: string };
+      };
+      expect(listing.running).toBe(true);
+      expect(listing.windows).toMatchObject([
+        { id: windowId, tabs: [{ path: a }] },
+      ]);
+      expect(listing.queue.items.map((item) => item.path)).toEqual([b]);
+
+      test.logs.length = 0;
+      expect(await runCli(["tabs"], test.deps)).toBe(0);
+      expect(test.logs.join("\n")).toMatch(
+        new RegExp(`Window ${windowId}[\\s\\S]*${a}[\\s\\S]*Queue: 1 waiting`),
+      );
+
+      test.logs.length = 0;
+      expect(await runCli(["tabs", "release", "--json"], test.deps)).toBe(0);
+      expect(JSON.parse(test.logs[0] ?? "{}")).toEqual({
+        released: 1,
+        windowId,
+      });
+      expect((await pollWindow(port, windowId, [a])).commands).toMatchObject([
+        { type: "add", tabs: [{ path: b }] },
+      ]);
+      await pollWindow(port, windowId, [a, b]);
+
+      test.logs.length = 0;
+      expect(await runCli(["tabs", "focus", a, "--json"], test.deps)).toBe(0);
+      expect(JSON.parse(test.logs[0] ?? "{}")).toMatchObject({
+        path: a,
+        focused: true,
+      });
+      test.logs.length = 0;
+      expect(await runCli(["tabs", "close", b], test.deps)).toBe(0);
+      expect(test.logs).toEqual([`Closed ${b}.`]);
+      expect((await pollWindow(port, windowId, [a, b])).commands).toEqual([
+        { type: "focus", path: a },
+        { type: "close", path: b },
+      ]);
+
+      test.logs.length = 0;
+      expect(await runCli(["tabs", "release"], test.deps)).toBe(0);
+      expect(test.logs).toEqual(["Nothing is queued."]);
+    });
+
+    it("adds a tab with `tabs add` and opens the window when none is live", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+
+      const exitCode = await runCli(["tabs", "add", a, "--json"], test.deps);
+
+      const payload = JSON.parse(test.logs[0] ?? "{}") as {
+        status: string;
+        url: string;
+      };
+      expect(exitCode).toBe(0);
+      expect(payload.status).toBe("open-window");
+      expect(test.getLastOpenedUrl()).toBe(payload.url);
+    });
+
+    it("reports that Roughdraft is not running for tabs", async () => {
+      const test = createTestDependencies();
+
+      expect(await runCli(["tabs", "--json"], test.deps)).toBe(0);
+      expect(JSON.parse(test.logs[0] ?? "{}")).toMatchObject({
+        running: false,
+        windows: [],
+      });
+      test.logs.length = 0;
+      expect(await runCli(["tabs", "close", write("a.md")], test.deps)).toBe(1);
+    });
+
+    it("rejects a bad tabs usage", async () => {
+      const test = createTestDependencies();
+
+      expect(await runCli(["tabs", "wat"], test.deps)).toBe(2);
+      expect(await runCli(["tabs", "add"], test.deps)).toBe(2);
+      expect(test.errors[0]).toContain("Usage: roughdraft tabs");
+    });
+
+    it("keeps today's single-document output for --print-url and --no-open", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+
+      expect(await runCli(["open", a, "--print-url"], test.deps)).toBe(0);
+      const port = portOf(test.deps.env);
+      expect(test.logs).toEqual([
+        expectedOpenUrl(`http://localhost:${port}`, a),
+      ]);
+
+      test.logs.length = 0;
+      expect(
+        await runCli(
+          ["open", a, "--no-open", "--no-watch", "--json"],
+          test.deps,
+        ),
+      ).toBe(0);
+      expect(JSON.parse(test.logs[0] ?? "{}")).toEqual({
+        opened: true,
+        url: expectedOpenUrl(`http://localhost:${port}`, a),
+        serverUrl: `http://localhost:${port}`,
+        path: a,
+        openMode: "disabled",
+      });
+      const listing = await fetch(`http://localhost:${port}/api/tabs`);
+      expect((await listing.json()) as { windows: unknown[] }).toMatchObject({
+        windows: [],
+      });
+    });
+
+    it("keeps today's output when ROUGHDRAFT_NO_OPEN=1", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+
+      const exitCode = await runCli(["open", a, "--no-watch"], {
+        ...test.deps,
+        env: { ...test.deps.env, ROUGHDRAFT_NO_OPEN: "1" },
+      });
+
+      const port = portOf(test.deps.env);
+      expect(exitCode).toBe(0);
+      expect(test.logs).toContain(
+        `Roughdraft is running at ${expectedOpenUrl(`http://localhost:${port}`, a)}`,
+      );
+    });
+
+    it("prints one URL per file for several paths with --print-url", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+      const b = write("b.md");
+
+      expect(await runCli(["open", a, b, "--print-url"], test.deps)).toBe(0);
+
+      const port = portOf(test.deps.env);
+      expect(test.logs).toEqual([
+        expectedOpenUrl(`http://localhost:${port}`, a),
+        expectedOpenUrl(`http://localhost:${port}`, b),
+      ]);
+    });
+
+    describe("--since and changes", () => {
+      function recordFetch(test: ReturnType<typeof createTestDependencies>) {
+        const calls: Array<{ url: URL; body: unknown }> = [];
+        const real = test.deps.fetchImpl;
+        const deps = {
+          ...test.deps,
+          fetchImpl: (async (input, init) => {
+            calls.push({
+              url: new URL(String(input)),
+              body: init?.body ? JSON.parse(String(init.body)) : undefined,
+            });
+            return real(input, init);
+          }) as typeof fetch,
+        };
+        return { calls, deps };
+      }
+
+      it("puts since in the page URL of a single document", async () => {
+        const test = createTestDependencies();
+        const a = write("a.md");
+
+        expect(
+          await runCli(
+            ["open", a, "--print-url", "--since", "HEAD~1"],
+            test.deps,
+          ),
+        ).toBe(0);
+
+        const url = new URL(test.logs[0] ?? "");
+        expect(url.searchParams.get("path")).toBe(a);
+        expect(url.searchParams.get("since")).toBe("HEAD~1");
+      });
+
+      it("sends since for each tab in the tabs/open body and keeps it in the window URL", async () => {
+        const test = createTestDependencies();
+        const { calls, deps } = recordFetch(test);
+        const a = write("a.md");
+        const b = write("b.md");
+
+        expect(
+          await runCli(
+            ["open", a, b, "--no-watch", "--json", "--since=main"],
+            deps,
+          ),
+        ).toBe(0);
+
+        const openCall = calls.find(
+          (call) => call.url.pathname === "/api/tabs/open",
+        );
+        expect(openCall?.body).toMatchObject({
+          tabs: [
+            { path: a, since: "main" },
+            { path: b, since: "main" },
+          ],
+        });
+        const windowUrl = new URL(
+          parseOnlyJsonLog<{ url: string }>(test.logs).url,
+        );
+        expect(windowUrl.searchParams.getAll("since")).toEqual([
+          `main\n${a}`,
+          `main\n${b}`,
+        ]);
+      });
+
+      it("sends since with tabs add", async () => {
+        const test = createTestDependencies();
+        const { calls, deps } = recordFetch(test);
+        const a = write("a.md");
+
+        expect(
+          await runCli(["tabs", "add", a, "--since", "v1", "--no-open"], deps),
+        ).toBe(0);
+
+        const openCall = calls.find(
+          (call) => call.url.pathname === "/api/tabs/open",
+        );
+        expect(openCall?.body).toMatchObject({
+          tabs: [{ path: a, since: "v1" }],
+        });
+      });
+
+      it("lists the changes since the last review in plain words", async () => {
+        const test = createTestDependencies();
+        const a = path.join(projectDir, "plan.md");
+        fs.writeFileSync(
+          a,
+          "# Plan\n\nFirst paragraph.\n\nSecond paragraph.\n",
+        );
+
+        expect(await runCli(["changes", a], test.deps)).toBe(0);
+        expect(test.logs.at(-1)).toBe("No changes.");
+
+        fs.writeFileSync(
+          a,
+          "# Plan\n\nFirst paragraph, edited.\n\nSecond paragraph.\n\nThird paragraph.\n",
+        );
+        test.logs.length = 0;
+        expect(await runCli(["changes", a], test.deps)).toBe(0);
+
+        const output = test.logs.join("\n");
+        expect(output).toContain("Baseline: last review");
+        expect(output).toContain("2 changes: 1 added, 1 changed, 0 removed");
+        expect(output).toContain("was: First paragraph.");
+        expect(output).toContain("now: First paragraph, edited.");
+        expect(output).toContain("added: Third paragraph.");
+      });
+
+      it("prints the diff and the baseline source as JSON, against a file", async () => {
+        const test = createTestDependencies();
+        const a = path.join(projectDir, "plan.md");
+        const old = path.join(projectDir, "plan-old.md");
+        fs.writeFileSync(old, "# Plan\n\nKept.\n\nGone.\n");
+        fs.writeFileSync(a, "# Plan\n\nKept.\n\nNew.\n");
+
+        const exitCode = await runCli(
+          ["changes", a, "--since", "plan-old.md", "--json"],
+          test.deps,
+        );
+
+        const payload = parseOnlyJsonLog<{
+          source: string;
+          label: string;
+          summary: { total: number };
+          changes: Array<{ kind: string; oldText: string; newText: string }>;
+        }>(test.logs);
+        expect(exitCode).toBe(0);
+        expect(payload).toMatchObject({ source: "file", label: "plan-old.md" });
+        expect(payload.summary.total).toBe(1);
+        expect(payload.changes).toMatchObject([
+          { kind: "changed", oldText: "Gone.", newText: "New." },
+        ]);
+      });
+
+      it("exits 1 with the reason when there is no baseline", async () => {
+        const test = createTestDependencies();
+        const a = path.join(projectDir, "plan.md");
+        fs.writeFileSync(a, "# Plan\n");
+
+        const exitCode = await runCli(
+          ["changes", a, "--since", "no-such-ref"],
+          test.deps,
+        );
+
+        expect(exitCode).toBe(1);
+        expect(test.errors.join("\n")).toContain("no-such-ref");
+      });
+
+      it("needs one path", async () => {
+        const test = createTestDependencies();
+
+        expect(await runCli(["changes"], test.deps)).toBe(2);
+        expect(test.errors[0]).toContain("Usage: roughdraft changes");
+      });
+    });
+
+    it("refuses --loop and --comments with several files", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+      const b = write("b.md");
+
+      expect(await runCli(["open", a, b, "--loop"], test.deps)).toBe(2);
+      expect(await runCli(["watch", a, b, "--comments"], test.deps)).toBe(2);
+    });
+
+    async function postReviewDone(port: number, name: string) {
+      await fetch(`http://localhost:${port}/api/review-events`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectPath: projectDir,
+          path: name,
+          overallComment: `${name} is done`,
+        }),
+      });
+    }
+
+    async function waitForServerState(env: NodeJS.ProcessEnv) {
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        if (fs.existsSync(getServerStateFilePath(env))) return portOf(env);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error("server never started");
+    }
+
+    it("watches several files: one line per file as each finishes, then allDone", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+      const b = write("b.md");
+
+      const watching = runCli(
+        ["watch", a, b, "--json", "--timeout", "5", "--batch-window", "0"],
+        test.deps,
+      );
+      const port = await waitForServerState(test.deps.env);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await postReviewDone(port, "b.md");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await postReviewDone(port, "a.md");
+
+      expect(await watching).toBe(0);
+      const lines = test.logs.map(
+        (line) => JSON.parse(line) as Record<string, unknown>,
+      );
+      expect(lines.map((line) => line.path)).toEqual([b, a, undefined]);
+      expect(lines[0]).toMatchObject({ timedOut: false });
+      expect(lines[2]).toEqual({ allDone: true });
+    });
+
+    it("exits 1 and lists what is pending when several files time out", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+      const b = write("b.md");
+
+      const watching = runCli(
+        ["watch", a, b, "--json", "--timeout", "1", "--batch-window", "0"],
+        test.deps,
+      );
+      const port = await waitForServerState(test.deps.env);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await postReviewDone(port, "a.md");
+
+      expect(await watching).toBe(1);
+      const lines = test.logs.map(
+        (line) => JSON.parse(line) as Record<string, unknown>,
+      );
+      expect(lines).toContainEqual(
+        expect.objectContaining({ path: a, timedOut: false }),
+      );
+      expect(lines).toContainEqual(
+        expect.objectContaining({ path: b, timedOut: true }),
+      );
+      expect(lines.at(-1)).toEqual({ allDone: false, pending: [b] });
+    });
+
+    it("prints a human line per file for a several-file watch", async () => {
+      const test = createTestDependencies();
+      const a = write("a.md");
+      const b = write("b.md");
+
+      const watching = runCli(
+        ["watch", a, b, "--timeout", "5", "--batch-window", "0"],
+        test.deps,
+      );
+      const port = await waitForServerState(test.deps.env);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await postReviewDone(port, "a.md");
+      await postReviewDone(port, "b.md");
+
+      expect(await watching).toBe(0);
+      expect(test.logs).toContain(`Review completed for ${a}.`);
+      expect(test.logs).toContain(`Review completed for ${b}.`);
+      expect(test.logs.at(-1)).toBe("All 2 reviews completed.");
+    });
   });
 });
 
