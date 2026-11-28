@@ -131,9 +131,8 @@ describe("tab window", () => {
 
     expect(tabButton(A).textContent).toContain("a.md");
     expect(tabButton(B).textContent).toContain("b.md");
-    expect(getByTestId(container, "tab-window-progress").textContent).toBe(
-      "0 of 2 done",
-    );
+    // The user asked for no counts in the strip (2026-11-28).
+    expect(queryByTestId(container, "tab-window-progress")).toBeNull();
     expect(queryByTestId(container, "tab-window-waiting")).toBeNull();
   });
 
@@ -220,13 +219,13 @@ describe("tab window", () => {
     expect(queryByTestId(container, `tab-window-open-${A}`)).toBeNull();
   });
 
-  it("shows a muted waiting label when the queue has items", async () => {
+  it("says nothing about queued documents while the queue has items", async () => {
     queue = { count: 3, releaseAt: "2026-11-28T18:00:00.000Z" };
     await renderTabWindow(`?window=w1&tab=${encodeURIComponent(A)}`);
+    await advance(1500);
 
-    const waiting = getByTestId(container, "tab-window-waiting");
-    expect(waiting.textContent).toBe("3 waiting");
-    expect(waiting.className).not.toContain("animate");
+    expect(queryByTestId(container, "tab-window-waiting")).toBeNull();
+    expect(container.textContent).not.toMatch(/waiting|queued/i);
   });
 
   it("closes a tab with its x button and keeps the others", async () => {
@@ -285,17 +284,11 @@ describe("tab window", () => {
     expect(queryByTestId(container, `tab-window-done-${A}`)).not.toBeNull();
     expect(tabButton(B).getAttribute("data-active")).toBe("true");
     expect(frame(B)).not.toBeNull();
-    expect(getByTestId(container, "tab-window-progress").textContent).toBe(
-      "1 of 3 done",
-    );
 
     await advance(TAB_DONE_LINGER_MS + 10);
 
     expect(queryByTestId(container, `tab-window-tab-${A}`)).toBeNull();
     expect(frame(A)).toBeNull();
-    expect(getByTestId(container, "tab-window-progress").textContent).toBe(
-      "1 of 3 done",
-    );
     expect(closeWindow).not.toHaveBeenCalled();
   });
 
@@ -309,9 +302,6 @@ describe("tab window", () => {
     await advance(TAB_DONE_LINGER_MS + 300);
 
     expect(closeWindow).toHaveBeenCalledTimes(1);
-    expect(getByTestId(container, "tab-window-progress").textContent).toBe(
-      "2 of 2 done",
-    );
   });
 
   it("polls every 1.5 seconds with the state of its tabs", async () => {
@@ -361,9 +351,6 @@ describe("tab window", () => {
     await advance(1500);
 
     expect(queryByTestId(container, `tab-window-tab-${A}`)).toBeNull();
-    expect(getByTestId(container, "tab-window-progress").textContent).toBe(
-      "0 of 2 done",
-    );
   });
 
   it("keeps the URL in step with the tabs and the active tab", async () => {
