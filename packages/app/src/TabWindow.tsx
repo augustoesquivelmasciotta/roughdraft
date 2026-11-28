@@ -13,7 +13,6 @@ import {
   pollTabWindow,
   TAB_WINDOW_POLL_INTERVAL_MS,
   type TabWindowCommand,
-  type TabWindowQueueState,
 } from "./tab-window-client";
 
 /** How long a finished tab shows its check mark before it goes away. */
@@ -135,11 +134,6 @@ export function TabWindow() {
   const [activated, setActivated] = useState<string[]>(
     initial.active ? [initial.active] : [],
   );
-  const [finishedPaths, setFinishedPaths] = useState<string[]>([]);
-  const [queue, setQueue] = useState<TabWindowQueueState>({
-    count: 0,
-    releaseAt: null,
-  });
   const [closeFailed, setCloseFailed] = useState(false);
 
   const tabsRef = useRef(tabs);
@@ -156,15 +150,10 @@ export function TabWindow() {
     );
   }, []);
 
-  const removeTab = useCallback((path: string, finished: boolean) => {
+  const removeTab = useCallback((path: string, _finished: boolean) => {
     const remaining = tabsRef.current.filter((tab) => tab.path !== path);
     tabsRef.current = remaining;
     setTabs(remaining);
-    if (finished) {
-      setFinishedPaths((current) =>
-        current.includes(path) ? current : [...current, path],
-      );
-    }
     setActivated((current) => current.filter((item) => item !== path));
     if (activePathRef.current === path) {
       const next =
@@ -222,9 +211,6 @@ export function TabWindow() {
           }));
           tabsRef.current = [...tabsRef.current, ...entries];
           setTabs(tabsRef.current);
-          setFinishedPaths((current) =>
-            current.filter((path) => !entries.some((e) => e.path === path)),
-          );
           const first = entries[0];
           if (first && !activePathRef.current) activate(first.path);
         } else if (command.type === "focus") {
@@ -259,7 +245,6 @@ export function TabWindow() {
           })),
         );
         if (!stopped) {
-          setQueue(result.queue);
           applyCommands(result.commands);
         }
       } catch (error) {
@@ -348,15 +333,6 @@ export function TabWindow() {
     };
   }, [tabs.length]);
 
-  const doneCount =
-    tabs.filter((tab) => tab.done).length +
-    finishedPaths.filter((path) => !tabs.some((tab) => tab.path === path))
-      .length;
-  const totalCount =
-    tabs.length +
-    finishedPaths.filter((path) => !tabs.some((tab) => tab.path === path))
-      .length;
-
   return (
     <main
       data-testid="tab-window"
@@ -420,16 +396,6 @@ export function TabWindow() {
             </div>
           );
         })}
-        <div className="ml-auto flex shrink-0 items-center gap-3 pl-3 text-xs text-stone-500 dark:text-slate-400">
-          {queue.count > 0 ? (
-            <span data-testid="tab-window-waiting">{queue.count} waiting</span>
-          ) : null}
-          {totalCount > 0 ? (
-            <span data-testid="tab-window-progress">
-              {doneCount} of {totalCount} done
-            </span>
-          ) : null}
-        </div>
       </div>
       <div className="relative min-h-0 flex-1">
         {tabs.length === 0 ? (

@@ -101,9 +101,7 @@ test.describe("tab window, change highlighting and live comments", () => {
     await expect(
       page.getByTestId(`tab-window-frame-${secondPath}`),
     ).toBeVisible();
-    await expect(page.getByTestId("tab-window-progress")).toContainText(
-      "1 of 2 done",
-    );
+    await expect(page.getByTestId("tab-window-progress")).toHaveCount(0);
 
     const payload = (await (
       (await pendingWatch) as { json: () => Promise<WatchPayload> }
