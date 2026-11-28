@@ -1,3 +1,4 @@
+import type { Editor } from "@tiptap/core";
 import {
   AlertTriangle,
   Check,
@@ -16,6 +17,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DocumentEditorViewMode } from "./app-navigation";
+import { ChangeHighlightControls } from "./ChangeHighlightControls";
 import { getNavigatorPlatform, isApplePlatform } from "./comment-shortcuts";
 import { RemoteSessionBanner } from "./components/RemoteSessionBanner";
 import { Button } from "./components/ui/button";
@@ -48,14 +50,22 @@ import {
   type DocumentSaveState,
   PageCard,
 } from "./PageCard";
-import { readLastHandoffAt, writeLastHandoffAt } from "./review-navigation";
 import { RobotsHighFiveToy } from "./RobotsHighFiveToy";
+import { readLastHandoffAt, writeLastHandoffAt } from "./review-navigation";
 import {
   type CompleteReviewOptions,
   type Page,
   REVIEW_HANDOFF_TIMEOUT_MS,
   type StorageBackend,
 } from "./storage";
+import {
+  getTabPathFromLocation,
+  isEmbeddedInTabWindow,
+  postToTabWindow,
+  REVIEW_DELIVERED_MESSAGE,
+  TAB_STATE_MESSAGE,
+} from "./tab-protocol";
+import { useChangeHighlight } from "./use-change-highlight";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
 import { markdownHasTable } from "./wide-layout";
 
@@ -479,6 +489,16 @@ interface DocumentWorkspaceProps {
   ) => Promise<{ delivered: boolean }>;
   /** Throws the reviewer's changes of this round away. Absent in the preview. */
   onDiscardReviewChanges?: () => void | Promise<void>;
+  /**
+   * Whether a delivered Done Reviewing closes the window (or tells the tab
+   * window to close the tab). Off in the preview, which has nothing to close.
+   */
+  closeOnDelivered?: boolean;
+  /**
+   * What to color changes against: a file path or git ref; null for the last
+   * review (the `since` URL param).
+   */
+  changesSince?: string | null;
   backend: StorageBackend | null;
 }
 
@@ -506,6 +526,8 @@ export function DocumentWorkspace({
   onOverwriteDocumentOnDisk,
   onCompleteReview,
   onDiscardReviewChanges,
+  closeOnDelivered = true,
+  changesSince = null,
   backend,
 }: DocumentWorkspaceProps) {
   const [documentInteractionMode, setDocumentInteractionMode] =
@@ -535,6 +557,7 @@ export function DocumentWorkspace({
   const [copiedFileAction, setCopiedFileAction] =
     useState<FileCopyAction | null>(null);
   const [reviewRoundChanged, setReviewRoundChanged] = useState(false);
+  const [highlightEditor, setHighlightEditor] = useState<Editor | null>(null);
   const [discardArmed, setDiscardArmed] = useState(false);
   const [overallComment, setOverallComment] = useState("");
   const [closeWindowFailed, setCloseWindowFailed] = useState(false);
@@ -543,6 +566,13 @@ export function DocumentWorkspace({
   const [lastHandoffAt, setLastHandoffAt] = useState<string | null>(() =>
     readLastHandoffAt(documentCopyPath ?? activeDocumentPath),
   );
+  const changeHighlight = useChangeHighlight({
+    editor: highlightEditor,
+    backend,
+    path: activeDocumentPath,
+    since: changesSince,
+    refreshKey: lastHandoffAt,
+  });
   const handoffShortcutLabel = getReviewHandoffShortcutLabel(
     getNavigatorPlatform(),
   );
@@ -743,6 +773,22 @@ export function DocumentWorkspace({
     };
   }, [documentPage]);
 
+  const handleCloseWindow = useCallback(async () => {
+    window.close();
+    // Why: an Orca browser tab, like any tab the page did not open, ignores
+    // window.close(). If the page is still here, ask the local server to close
+    // the Orca tab showing it, and otherwise say how to close it.
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
+    const closed = await (
+      backend?.closeOrcaTab?.(window.location.href) ?? Promise.resolve(false)
+    ).catch(() => false);
+    if (!closed) {
+      setCloseWindowFailed(true);
+      // The popup carries the "close this tab from the tab bar" hint.
+      setReviewHandoffPopoverOpen(true);
+    }
+  }, [backend]);
+
   const handleCompleteReview = useCallback(
     async (options?: CompleteReviewOptions) => {
       if (!activeDocumentPath || reviewHandoffState === "notifying") return;
@@ -780,7 +826,17 @@ export function DocumentWorkspace({
           setReviewWatcherCount(0);
           setReviewHandoffState("notified");
           setOverallComment("");
-          setReviewHandoffPopoverOpen(true);
+          if (!closeOnDelivered) {
+            setReviewHandoffPopoverOpen(true);
+          } else if (isEmbeddedInTabWindow()) {
+            // The tab window removes this tab and brings the next one forward.
+            postToTabWindow({
+              type: REVIEW_DELIVERED_MESSAGE,
+              path: getTabPathFromLocation() ?? activeDocumentPath,
+            });
+          } else {
+            void handleCloseWindow();
+          }
         } else {
           setReviewWatcherCount(0);
           setReviewHandoffState("undelivered");
@@ -796,23 +852,25 @@ export function DocumentWorkspace({
     },
     [
       activeDocumentPath,
+      closeOnDelivered,
       documentCopyPath,
+      handleCloseWindow,
       onCompleteReview,
       reviewHandoffState,
     ],
   );
 
-  const handleCloseWindow = useCallback(async () => {
-    window.close();
-    // Why: an Orca browser tab, like any tab the page did not open, ignores
-    // window.close(). If the page is still here, ask the local server to close
-    // the Orca tab showing it, and otherwise say how to close it.
-    await new Promise((resolve) => window.setTimeout(resolve, 150));
-    const closed = await (
-      backend?.closeOrcaTab?.(window.location.href) ?? Promise.resolve(false)
-    ).catch(() => false);
-    if (!closed) setCloseWindowFailed(true);
-  }, [backend]);
+  const handleOpenThreadCountChange = useCallback(
+    (openThreads: number) => {
+      if (!isEmbeddedInTabWindow()) return;
+      postToTabWindow({
+        type: TAB_STATE_MESSAGE,
+        path: getTabPathFromLocation() ?? activeDocumentPath ?? "",
+        openThreads,
+      });
+    },
+    [activeDocumentPath],
+  );
 
   const handleDocumentDirtyStateChange = useCallback(
     (isDirty: boolean) => {
@@ -1498,7 +1556,15 @@ export function DocumentWorkspace({
                     </div>
                   </PopoverContent>
                 </Popover>
-                <div className="ml-auto inline-flex h-[1.25rem] shrink-0 items-center">
+                <div className="ml-auto inline-flex h-[1.25rem] shrink-0 items-center gap-1">
+                  {documentEditorViewMode === "rich-text" ? (
+                    <ChangeHighlightControls
+                      view={changeHighlight.view}
+                      onToggle={changeHighlight.toggleVisible}
+                      onNext={changeHighlight.next}
+                      onPrevious={changeHighlight.previous}
+                    />
+                  ) : null}
                   <Select<DocumentInteractionMode>
                     value={documentInteractionMode}
                     onValueChange={(value) => {
@@ -1585,6 +1651,8 @@ export function DocumentWorkspace({
               saveBlocked={documentDiskChangeState !== "clean"}
               forceResetKey={documentForceResetKey}
               lastHandoffAt={lastHandoffAt}
+              onEditorReady={setHighlightEditor}
+              onOpenThreadCountChange={handleOpenThreadCountChange}
             />
           ) : null
         ) : (

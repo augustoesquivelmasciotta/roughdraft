@@ -76,6 +76,15 @@ export interface StorageBackend {
   getReviewWatchStatus?(relativePath: string): Promise<ReviewWatchStatus>;
   /** Whether the document differs from how it was when this review round started. */
   getReviewRoundChanged?(relativePath: string): Promise<boolean>;
+  /**
+   * The text the document is compared against to show what changed: the last
+   * review (`since` absent or "last-review"), a file path or a git ref.
+   * Resolves null when there is no baseline.
+   */
+  getDocumentBaseline?(
+    relativePath: string,
+    since?: string | null,
+  ): Promise<DocumentBaseline | null>;
   /** Puts the document back to how it was when this review round started. */
   restoreReviewRound?(relativePath: string): Promise<Page>;
   /**
@@ -87,4 +96,11 @@ export interface StorageBackend {
   saveAsset(file: File): Promise<StoredAsset>;
   resolveFileUrl(path: string): string | null;
   openProject(path: string): Promise<void>;
+}
+
+export interface DocumentBaseline {
+  source: "last-review" | "file" | "git";
+  /** What the baseline is, for a tooltip: "last review", a file name, a ref. */
+  label: string;
+  content: string;
 }

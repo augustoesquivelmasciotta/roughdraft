@@ -125,6 +125,8 @@ interface PageCardProps {
   forceResetKey?: string | null;
   /** When the reviewer last clicked "I'm done" on this document. */
   lastHandoffAt?: string | null;
+  /** Reports how many review threads are open, on mount and whenever it changes. */
+  onOpenThreadCountChange?: (count: number) => void;
 }
 
 interface PageCardEditorSurfaceProps {
@@ -146,6 +148,7 @@ interface PageCardEditorSurfaceProps {
   saveBlocked?: boolean;
   forceResetKey?: string | null;
   lastHandoffAt?: string | null;
+  onOpenThreadCountChange?: (count: number) => void;
 }
 
 interface RichTextEditorSurfaceProps {
@@ -161,6 +164,7 @@ interface RichTextEditorSurfaceProps {
   onEditorReady?: (editor: Editor | null) => void;
   onCommentRailPresenceChange?: (hasCommentRailSpace: boolean) => void;
   lastHandoffAt?: string | null;
+  onOpenThreadCountChange?: (count: number) => void;
   /** Decisions waiting for "I'm done"; kept above the editor so a view switch or reload keeps them. */
   pendingReviewDecisions: Required<PendingReviewDecisions>;
   onPendingReviewDecisionsChange: Dispatch<
@@ -786,6 +790,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   onEditorReady,
   onCommentRailPresenceChange,
   lastHandoffAt = null,
+  onOpenThreadCountChange,
   pendingReviewDecisions,
   onPendingReviewDecisionsChange,
   onApplyPendingReviewDecisionsChange,
@@ -2293,6 +2298,9 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const openThreadCount = navigationTargets.filter(
     (target) => target.isOpen,
   ).length;
+  useEffect(() => {
+    onOpenThreadCountChange?.(openThreadCount);
+  }, [onOpenThreadCountChange, openThreadCount]);
   const newThreadCount = navigationTargets.filter(
     (target) => target.isNew,
   ).length;
@@ -2728,6 +2736,7 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
   saveBlocked = false,
   forceResetKey = null,
   lastHandoffAt = null,
+  onOpenThreadCountChange,
 }: PageCardEditorSurfaceProps) {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inFlightSaveRef = useRef<Promise<ManualSaveResult> | null>(null);
@@ -3037,6 +3046,7 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       backend={backend}
       onEditorReady={onEditorReady}
       lastHandoffAt={lastHandoffAt}
+      onOpenThreadCountChange={onOpenThreadCountChange}
       pendingReviewDecisions={pendingReviewDecisions}
       onPendingReviewDecisionsChange={setPendingReviewDecisions}
       onApplyPendingReviewDecisionsChange={
@@ -3065,6 +3075,7 @@ export function PageCard({
   saveBlocked,
   forceResetKey,
   lastHandoffAt,
+  onOpenThreadCountChange,
 }: PageCardProps) {
   const [saveState, setSaveState] = useState<DocumentSaveState>("saved");
 
@@ -3093,6 +3104,7 @@ export function PageCard({
         saveBlocked={saveBlocked}
         forceResetKey={forceResetKey}
         lastHandoffAt={lastHandoffAt}
+        onOpenThreadCountChange={onOpenThreadCountChange}
       />
     </div>
   );

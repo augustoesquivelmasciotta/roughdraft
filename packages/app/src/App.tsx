@@ -26,6 +26,7 @@ import {
   type DocumentEditorViewMode,
   formatDocumentTitle,
   formatWorkspacePathForDisplay,
+  getChangesSinceFromLocation,
   getDocumentEditorViewModeFromLocation,
   getPathLeaf,
   getRequestedPathState,
@@ -35,6 +36,7 @@ import {
   ROUGHDRAFT_FLAVORED_MARKDOWN_PATH,
   syncRequestedPathInUrl,
   syncSessionLabelInUrl,
+  TAB_WINDOW_PATH,
   withoutSessionLabel,
 } from "./app-navigation";
 import { Button } from "./components/ui/button";
@@ -69,6 +71,7 @@ import {
   type Page,
   type StorageBackend,
 } from "./storage";
+import { TabWindow } from "./TabWindow";
 import { UpdateNotice } from "./UpdateNotice";
 import { fetchUpdateStatus, type UpdateStatus } from "./update-status";
 
@@ -1477,6 +1480,7 @@ export function PreviewPage() {
         onKeepEditingWithoutAutosave={() => {}}
         onOverwriteDocumentOnDisk={() => {}}
         onCompleteReview={handleCompletePreviewReview}
+        closeOnDelivered={false}
         backend={backend}
       />
     </main>
@@ -1484,6 +1488,13 @@ export function PreviewPage() {
 }
 
 export function App() {
+  // The pathname never changes during a page's life, so the hooks of the
+  // branch that renders keep a stable order.
+  if (window.location.pathname === TAB_WINDOW_PATH) return <TabWindow />;
+  return <DocumentApp />;
+}
+
+function DocumentApp() {
   const initialRequestedPathState = getRequestedPathState();
   const [requestedPathState] = useState(initialRequestedPathState);
   const isRoughdraftFlavoredMarkdownRoute =
@@ -2016,6 +2027,7 @@ export function App() {
         onOverwriteDocumentOnDisk={handleOverwriteDocumentOnDisk}
         onCompleteReview={handleCompleteReview}
         onDiscardReviewChanges={handleDiscardReviewChanges}
+        changesSince={getChangesSinceFromLocation()}
         backend={backend}
       />
     </main>
