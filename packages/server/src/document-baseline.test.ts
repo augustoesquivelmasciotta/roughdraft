@@ -112,7 +112,11 @@ describe("GET /api/document-baseline", () => {
     fs.symlinkSync(secret, path.join(projectDir, "link.md"));
     const app = makeApp();
 
-    for (const since of [secret, "../" + path.basename(outsideDir), "link.md"]) {
+    for (const since of [
+      secret,
+      `../${path.basename(outsideDir)}`,
+      "link.md",
+    ]) {
       const response = await baseline(app, since);
       expect(response.status, since).toBeGreaterThanOrEqual(400);
     }
@@ -161,7 +165,12 @@ describe("GET /api/document-baseline", () => {
     git("commit", "-q", "-m", "one");
     const app = makeApp();
 
-    for (const since of ["--output=/tmp/x", "-p", "HEAD:draft.md", "HEAD draft"]) {
+    for (const since of [
+      "--output=/tmp/x",
+      "-p",
+      "HEAD:draft.md",
+      "HEAD draft",
+    ]) {
       const response = await baseline(app, since);
       expect(response.status, since).toBe(400);
     }

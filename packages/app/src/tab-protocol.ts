@@ -25,10 +25,7 @@ export function readTabMessage(event: MessageEvent): TabMessage | null {
   if (!data || typeof data !== "object" || typeof data.path !== "string") {
     return null;
   }
-  if (
-    data.type === TAB_STATE_MESSAGE &&
-    typeof data.openThreads === "number"
-  ) {
+  if (data.type === TAB_STATE_MESSAGE && typeof data.openThreads === "number") {
     return {
       type: TAB_STATE_MESSAGE,
       path: data.path,

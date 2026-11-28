@@ -119,7 +119,8 @@ async function readGitBaseline(
       .relative(root, fs.realpathSync(documentPath))
       .split(path.sep)
       .join("/");
-    if (relative.startsWith("..")) return notFound("the document is not in a git repository.");
+    if (relative.startsWith(".."))
+      return notFound("the document is not in a git repository.");
     const { stdout } = await execFileAsync(
       "git",
       ["-C", root, "show", `${ref}:${relative}`],

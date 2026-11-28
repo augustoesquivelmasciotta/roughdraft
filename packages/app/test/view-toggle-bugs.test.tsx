@@ -1367,7 +1367,8 @@ describe("review handoff watcher affordance", () => {
     });
 
     afterEach(() => {
-      if (originalParent) Object.defineProperty(window, "parent", originalParent);
+      if (originalParent)
+        Object.defineProperty(window, "parent", originalParent);
     });
 
     it("tells the tab window instead of closing, with no popup, after a delivered handoff", async () => {

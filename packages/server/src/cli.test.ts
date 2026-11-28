@@ -3200,9 +3200,7 @@ describe("cli", () => {
       expect(await runCli(["open", b, "--now", "--no-watch"], test.deps)).toBe(
         0,
       );
-      expect(test.logs).toEqual([
-        `Added to the open Roughdraft window: ${b}.`,
-      ]);
+      expect(test.logs).toEqual([`Added to the open Roughdraft window: ${b}.`]);
       const polled = await pollWindow(port, windowId, [a]);
       expect(polled.commands).toMatchObject([
         { type: "add", tabs: [{ path: b }] },
@@ -3323,7 +3321,10 @@ describe("cli", () => {
 
       test.logs.length = 0;
       expect(
-        await runCli(["open", a, "--no-open", "--no-watch", "--json"], test.deps),
+        await runCli(
+          ["open", a, "--no-open", "--no-watch", "--json"],
+          test.deps,
+        ),
       ).toBe(0);
       expect(JSON.parse(test.logs[0] ?? "{}")).toEqual({
         opened: true,
@@ -3390,7 +3391,10 @@ describe("cli", () => {
         const a = write("a.md");
 
         expect(
-          await runCli(["open", a, "--print-url", "--since", "HEAD~1"], test.deps),
+          await runCli(
+            ["open", a, "--print-url", "--since", "HEAD~1"],
+            test.deps,
+          ),
         ).toBe(0);
 
         const url = new URL(test.logs[0] ?? "");
@@ -3411,7 +3415,9 @@ describe("cli", () => {
           ),
         ).toBe(0);
 
-        const openCall = calls.find((call) => call.url.pathname === "/api/tabs/open");
+        const openCall = calls.find(
+          (call) => call.url.pathname === "/api/tabs/open",
+        );
         expect(openCall?.body).toMatchObject({
           tabs: [
             { path: a, since: "main" },
@@ -3436,14 +3442,21 @@ describe("cli", () => {
           await runCli(["tabs", "add", a, "--since", "v1", "--no-open"], deps),
         ).toBe(0);
 
-        const openCall = calls.find((call) => call.url.pathname === "/api/tabs/open");
-        expect(openCall?.body).toMatchObject({ tabs: [{ path: a, since: "v1" }] });
+        const openCall = calls.find(
+          (call) => call.url.pathname === "/api/tabs/open",
+        );
+        expect(openCall?.body).toMatchObject({
+          tabs: [{ path: a, since: "v1" }],
+        });
       });
 
       it("lists the changes since the last review in plain words", async () => {
         const test = createTestDependencies();
         const a = path.join(projectDir, "plan.md");
-        fs.writeFileSync(a, "# Plan\n\nFirst paragraph.\n\nSecond paragraph.\n");
+        fs.writeFileSync(
+          a,
+          "# Plan\n\nFirst paragraph.\n\nSecond paragraph.\n",
+        );
 
         expect(await runCli(["changes", a], test.deps)).toBe(0);
         expect(test.logs.at(-1)).toBe("No changes.");
@@ -4144,5 +4157,4 @@ describe("runCli open in remote mode", () => {
       await remote.close();
     }
   });
-
 });

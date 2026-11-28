@@ -71,7 +71,11 @@ describe("TabWindowRegistry", () => {
     const response = registry.open({ tabs: [{ path: "/docs/a.md" }] });
 
     expect(response.results).toEqual([
-      { path: "/docs/a.md", status: "open-window", windowId: response.windowId },
+      {
+        path: "/docs/a.md",
+        status: "open-window",
+        windowId: response.windowId,
+      },
     ]);
     expect(response.url).toBe(
       buildTabWindowUrl(response.windowId as string, [{ path: "/docs/a.md" }]),
@@ -436,7 +440,11 @@ describe("TabWindowRegistry", () => {
     registry.poll("reloaded", [tabState("/docs/a.md", { openThreads: 2 })]);
 
     expect(registry.list().windows).toMatchObject([
-      { id: "reloaded", live: true, tabs: [{ path: "/docs/a.md", openThreads: 2 }] },
+      {
+        id: "reloaded",
+        live: true,
+        tabs: [{ path: "/docs/a.md", openThreads: 2 }],
+      },
     ]);
   });
 

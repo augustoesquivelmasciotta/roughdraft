@@ -336,14 +336,22 @@ describe("mcp", () => {
 
       const result = await callTool(
         "roughdraft_open_tabs",
-        { paths: [documentPath, second], now: true, label: "plan", since: "HEAD~1" },
+        {
+          paths: [documentPath, second],
+          now: true,
+          label: "plan",
+          since: "HEAD~1",
+        },
         env(),
         fetchImpl,
       );
 
       expect(result).toEqual(answer);
       expect(calls).toHaveLength(1);
-      expect(calls[0]).toMatchObject({ method: "POST", path: "/api/tabs/open" });
+      expect(calls[0]).toMatchObject({
+        method: "POST",
+        path: "/api/tabs/open",
+      });
       expect(calls[0]?.body).toMatchObject({
         tabs: [
           { path: documentPath, label: "plan", since: "HEAD~1" },
@@ -361,9 +369,9 @@ describe("mcp", () => {
       };
       const { calls, fetchImpl } = recordingFetch({ "/api/tabs": listing });
 
-      expect(await callTool("roughdraft_list_tabs", {}, env(), fetchImpl)).toEqual(
-        { running: true, ...listing },
-      );
+      expect(
+        await callTool("roughdraft_list_tabs", {}, env(), fetchImpl),
+      ).toEqual({ running: true, ...listing });
       expect(calls[0]).toMatchObject({ method: "GET", path: "/api/tabs" });
 
       fs.rmSync(stateFile);
@@ -374,7 +382,9 @@ describe("mcp", () => {
 
     it("adds one tab at once", async () => {
       const { calls, fetchImpl } = recordingFetch({
-        "/api/tabs/open": { results: [{ path: documentPath, status: "added" }] },
+        "/api/tabs/open": {
+          results: [{ path: documentPath, status: "added" }],
+        },
       });
 
       await callTool(
@@ -399,7 +409,12 @@ describe("mcp", () => {
       });
 
       expect(
-        await callTool("roughdraft_focus_tab", { path: documentPath }, env(), fetchImpl),
+        await callTool(
+          "roughdraft_focus_tab",
+          { path: documentPath },
+          env(),
+          fetchImpl,
+        ),
       ).toEqual({ focused: true });
       expect(
         await callTool(
@@ -459,7 +474,11 @@ describe("mcp", () => {
         fetchImpl,
       )) as {
         allDone: boolean;
-        documents: Array<{ documentPath: string; done: boolean; timedOut: boolean }>;
+        documents: Array<{
+          documentPath: string;
+          done: boolean;
+          timedOut: boolean;
+        }>;
       };
 
       expect(bodies.map((body) => body.path).sort()).toEqual([
@@ -475,7 +494,9 @@ describe("mcp", () => {
 
     it("passes since to add_tab", async () => {
       const { calls, fetchImpl } = recordingFetch({
-        "/api/tabs/open": { results: [{ path: documentPath, status: "added" }] },
+        "/api/tabs/open": {
+          results: [{ path: documentPath, status: "added" }],
+        },
       });
 
       await callTool(
@@ -556,7 +577,12 @@ describe("mcp", () => {
 
     it("rejects open_tabs without paths", async () => {
       await expect(
-        callTool("roughdraft_open_tabs", {}, env(), recordingFetch({}).fetchImpl),
+        callTool(
+          "roughdraft_open_tabs",
+          {},
+          env(),
+          recordingFetch({}).fetchImpl,
+        ),
       ).rejects.toThrow("paths is required");
     });
   });

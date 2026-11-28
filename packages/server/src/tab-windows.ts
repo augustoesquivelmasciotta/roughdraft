@@ -223,7 +223,10 @@ export class TabWindowRegistry {
   private readonly queueFile: string;
   private readonly openWindow: OpenTabWindow | null;
   private readonly isShownByPlainPage: (path: string) => boolean;
-  private readonly schedule: (callback: () => void, delayMs: number) => () => void;
+  private readonly schedule: (
+    callback: () => void,
+    delayMs: number,
+  ) => () => void;
   private readonly log: (message: string) => void;
   private readonly windows = new Map<string, TabWindow>();
   /** Normalized path to the last time a tab window reported it. */
@@ -260,7 +263,9 @@ export class TabWindowRegistry {
         typeof parsed.batchOpenedAt === "string"
           ? Date.parse(parsed.batchOpenedAt)
           : Number.NaN;
-      this.batchOpenedAt = Number.isFinite(batchOpenedAt) ? batchOpenedAt : null;
+      this.batchOpenedAt = Number.isFinite(batchOpenedAt)
+        ? batchOpenedAt
+        : null;
       this.queued = Array.isArray(parsed.queued)
         ? parsed.queued.flatMap((item): QueuedTab[] =>
             item && typeof item.path === "string" && item.path
@@ -334,8 +339,11 @@ export class TabWindowRegistry {
     const orcaTarget = request.orcaTarget ?? null;
 
     const resultByPath = new Map<string, TabOpenResult>();
-    const toAdd: { path: string; label: string | null; since: string | null }[] =
-      [];
+    const toAdd: {
+      path: string;
+      label: string | null;
+      since: string | null;
+    }[] = [];
 
     for (const tab of inputs.values()) {
       const holder = this.findHolder(tab.path, now);
@@ -367,7 +375,10 @@ export class TabWindowRegistry {
       }
 
       if (this.isShownByPlainPage(tab.path) && !this.recentlyHeld(tab.path)) {
-        resultByPath.set(normalizePath(tab.path), { path: tab.path, status: "single-page" });
+        resultByPath.set(normalizePath(tab.path), {
+          path: tab.path,
+          status: "single-page",
+        });
         continue;
       }
 
@@ -432,7 +443,10 @@ export class TabWindowRegistry {
   poll(
     windowId: string,
     reported: TabState[],
-  ): { commands: TabCommand[]; queue: { count: number; releaseAt: string | null } } {
+  ): {
+    commands: TabCommand[];
+    queue: { count: number; releaseAt: string | null };
+  } {
     const now = this.now();
 
     let window = this.windows.get(windowId);
@@ -460,8 +474,7 @@ export class TabWindowRegistry {
         label: cleanLabel(tab.label) ?? before?.label ?? null,
         active: tab.active === true,
         done: tab.done === true,
-        openThreads:
-          typeof tab.openThreads === "number" ? tab.openThreads : 0,
+        openThreads: typeof tab.openThreads === "number" ? tab.openThreads : 0,
         since: before?.since ?? null,
         addedAt: before?.addedAt ?? now,
         confirmed: true,
@@ -490,7 +503,7 @@ export class TabWindowRegistry {
     const window = windowId
       ? this.liveWindow(windowId, now)
       : this.findHolder(targetPath, now);
-    if (!window || !window.tabs.some((tab) => samePath(tab.path, targetPath))) {
+    if (!window?.tabs.some((tab) => samePath(tab.path, targetPath))) {
       return { focused: false };
     }
     window.pending.push({ type: "focus", path: targetPath });
@@ -659,7 +672,9 @@ export class TabWindowRegistry {
   }
 
   private batchIsIdle(now: number): boolean {
-    return this.batchOpenedAt === null || now - this.batchOpenedAt >= this.batchMs;
+    return (
+      this.batchOpenedAt === null || now - this.batchOpenedAt >= this.batchMs
+    );
   }
 
   private releaseAtMs(): number | null {

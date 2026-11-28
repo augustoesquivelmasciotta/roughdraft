@@ -1023,7 +1023,9 @@ function printHelp(log: (message: string) => void) {
   log("  status [<path>]    Show server status, or a document's open threads");
   log("  stop               Stop the managed background server");
   log("  watch <path>...    Wait for a Done Reviewing event (or new comments)");
-  log("  tabs               List the window's tabs and queue; add, focus, close, release");
+  log(
+    "  tabs               List the window's tabs and queue; add, focus, close, release",
+  );
   log("  changes <path>     List what changed in a document since a baseline");
   log("  reply <path>       Reply to a comment in a document");
   log("  mcp                Start the experimental stdio MCP server");
@@ -1258,9 +1260,7 @@ function printCommandHelp(
     log(
       '{path, timedOut, events}) and then {"allDone":true}. Exit 0 when every file',
     );
-    log(
-      "is done, 1 on a timeout. --comments and --after need a single file.",
-    );
+    log("is done, 1 on a timeout. --comments and --after need a single file.");
     log("");
     log(
       "With --comments it also returns when the reviewer writes new comments or",
@@ -1314,7 +1314,9 @@ function printCommandHelp(
   if (command === "tabs") {
     log("Usage:");
     log("  roughdraft tabs [--json]");
-    log("  roughdraft tabs add <path> [--label <text>] [--since <x>] [--window <id>] [--json]");
+    log(
+      "  roughdraft tabs add <path> [--label <text>] [--since <x>] [--window <id>] [--json]",
+    );
     log("  roughdraft tabs focus <path> [--window <id>] [--json]");
     log("  roughdraft tabs close <path> [--window <id>] [--json]");
     log("  roughdraft tabs release [--json]");
@@ -1326,16 +1328,24 @@ function printCommandHelp(
       "waits in a queue while a batch is running and joins at the next batch.",
     );
     log("");
-    log("  (no action)  Lists the window's tabs and the queue with its release time");
+    log(
+      "  (no action)  Lists the window's tabs and the queue with its release time",
+    );
     log("  add          Adds a tab at once, skipping the queue");
     log("  focus        Brings a tab forward");
-    log("  close        Closes a tab, or drops a queued document from the queue");
+    log(
+      "  close        Closes a tab, or drops a queued document from the queue",
+    );
     log("  release      Opens the next batch now: the queue joins the window");
     log("");
     log("Flags:");
-    log("  --window <id>        Act in this window (default: the newest live one)");
+    log(
+      "  --window <id>        Act in this window (default: the newest live one)",
+    );
     log("  --label <text>       Session label for add");
-    log("  --since <x>          Baseline for add: last-review, a file, or a git ref");
+    log(
+      "  --since <x>          Baseline for add: last-review, a file, or a git ref",
+    );
     log("  --json               Print machine-readable output");
     log("  --state-file <path>  Server state file");
     log("  --state-dir <dir>    Directory containing server.json");
@@ -1360,11 +1370,11 @@ function printCommandHelp(
     log(
       "                       Done Reviewing, or at first open), a file path, or a git ref",
     );
-    log(
-      "  --json               Print the diff plus {source, label}",
-    );
+    log("  --json               Print the diff plus {source, label}");
     log("");
-    log("Exit 0 with the changes listed (or none), 1 when there is no baseline.");
+    log(
+      "Exit 0 with the changes listed (or none), 1 when there is no baseline.",
+    );
     return;
   }
 
@@ -3017,7 +3027,9 @@ async function runWatchMany(
   options: MultiWatchOptions,
   json: boolean,
 ): Promise<number> {
-  const targets = targetPaths.map((targetPath) => resolveTargetPath(targetPath));
+  const targets = targetPaths.map((targetPath) =>
+    resolveTargetPath(targetPath),
+  );
   const first = targets[0];
   if (!first) return USAGE_ERROR;
   let serverUrl = options.serverUrl;
@@ -3104,9 +3116,7 @@ async function runWatchMany(
   if (json) {
     deps.log(
       JSON.stringify(
-        allDone
-          ? { allDone: true }
-          : { allDone: false, pending: [...pending] },
+        allDone ? { allDone: true } : { allDone: false, pending: [...pending] },
       ),
     );
   } else if (allDone) {
@@ -3345,7 +3355,8 @@ async function runTabs(
     deps.error("This Roughdraft server does not support tab windows.");
     return 1;
   }
-  const ok = action === "focus" ? payload.focused === true : payload.closed === true;
+  const ok =
+    action === "focus" ? payload.focused === true : payload.closed === true;
   if (json) {
     emitJson(deps.log, {
       path: target.openPath,
@@ -3364,8 +3375,7 @@ async function runTabs(
   return ok ? 0 : 1;
 }
 
-const CHANGES_USAGE =
-  "Usage: roughdraft changes <path> [--since <x>] [--json]";
+const CHANGES_USAGE = "Usage: roughdraft changes <path> [--since <x>] [--json]";
 
 /** `roughdraft changes <path>`: the document compared with a baseline. */
 async function runChanges(
@@ -3409,7 +3419,8 @@ async function runChanges(
   url.searchParams.set("path", path.basename(absolutePath));
   url.searchParams.set("since", options.since?.trim() || "last-review");
 
-  let baseline: { source: string; label: string; content: string } | null = null;
+  let baseline: { source: string; label: string; content: string } | null =
+    null;
   let failure = "";
   try {
     const response = await deps.fetchImpl(url, {
@@ -4073,7 +4084,9 @@ export async function runCli(
       }
 
       if (options.positionals.length < 1) {
-        deps.error("Usage: roughdraft watch <path> [<path>...] [--comments] [--json]");
+        deps.error(
+          "Usage: roughdraft watch <path> [<path>...] [--comments] [--json]",
+        );
         return USAGE_ERROR;
       }
 
@@ -4212,7 +4225,9 @@ export async function runCli(
 
       if (
         several &&
-        (options.loop || options.comments || options.afterSequence !== undefined)
+        (options.loop ||
+          options.comments ||
+          options.afterSequence !== undefined)
       ) {
         deps.error(
           "--loop, --comments and --after work on one file: open the files one by one, or watch them with `roughdraft watch a.md b.md`.",
@@ -4308,7 +4323,8 @@ export async function runCli(
               openMode = await openTabWindowUrl(deps, windowUrl);
             } else if (
               tabResults.some(
-                (entry) => entry.status === "added" || entry.status === "focused",
+                (entry) =>
+                  entry.status === "added" || entry.status === "focused",
               )
             ) {
               openMode = "existing-window";
@@ -4320,7 +4336,12 @@ export async function runCli(
               if (entry.status !== "single-page") continue;
               openMode = await openSingleDocument(deps, {
                 baseUrl,
-                targetUrl: buildTargetUrl(baseUrl, entry.path, sessionLabel, since),
+                targetUrl: buildTargetUrl(
+                  baseUrl,
+                  entry.path,
+                  sessionLabel,
+                  since,
+                ),
                 openPath: entry.path,
                 sessionLabel,
               });
@@ -4356,7 +4377,9 @@ export async function runCli(
 
       if (options.printUrl) {
         for (const entry of resolvedTargets) {
-          deps.log(buildTargetUrl(baseUrl, entry.openPath, sessionLabel, since));
+          deps.log(
+            buildTargetUrl(baseUrl, entry.openPath, sessionLabel, since),
+          );
         }
         return 0;
       }
@@ -4452,7 +4475,8 @@ export async function runCli(
       if (json) {
         if (several) {
           emitJson(deps.log, {
-            opened: tabResults?.some((entry) => entry.status !== "queued") ?? true,
+            opened:
+              tabResults?.some((entry) => entry.status !== "queued") ?? true,
             serverUrl: baseUrl,
             ...(windowUrl ? { url: windowUrl } : {}),
             openMode,
