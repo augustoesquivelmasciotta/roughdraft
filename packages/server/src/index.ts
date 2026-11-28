@@ -19,9 +19,11 @@ import {
 import {
   closeOrcaTabShowing,
   isSameRoughdraftDocument,
+  openOrcaTab,
   type RunOrcaCommand,
   runOrcaCommand,
 } from "./orca.js";
+import { detectNewReviewerComments } from "./review-comments.js";
 import { ReviewEventQueue } from "./review-events.js";
 import { ReviewRoundStore } from "./review-round.js";
 import {
@@ -29,6 +31,12 @@ import {
   reviewSuccessStatus,
   writeReviewStatus,
 } from "./review-status.js";
+import {
+  type OpenTabWindow,
+  type OrcaTargetSnapshot,
+  type TabState,
+  TabWindowRegistry,
+} from "./tab-windows.js";
 import { resolveUpdateStatus } from "./update-status.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -84,11 +92,23 @@ interface CreateAppOptions {
   remoteDocumentToken?: string;
   /** How to reach the Orca CLI when a page asks to close its Orca tab. */
   orca?: { command: string; run: RunOrcaCommand };
+  /**
+   * Opens a tab window when a queued batch is released with no window live.
+   * Defaults to an Orca tab (the target the queuing CLI saved), then the
+   * system opener the CLI uses. Tests inject a stub so nothing opens.
+   */
+  openTabWindow?: OpenTabWindow;
+  /** Read the saved tab queue and re-arm its release timer. `createServer` sets it. */
+  restoreTabQueue?: boolean;
+  /** Batch length in minutes; defaults to ROUGHDRAFT_TAB_BATCH_MINUTES, then 120. */
+  tabBatchMinutes?: number;
 }
 
 interface CreateAppResult {
   app: Express;
   port: number;
+  /** Stops the tab queue's release timer. */
+  dispose: () => void;
 }
 
 // One connected tab. `path` is the document it has open (null on the
@@ -495,6 +515,35 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   );
   const remoteSessions = new Map<string, RemoteSession>();
 
+  const publicOrigin = `http://${ROUGHDRAFT_PUBLIC_HOST}:${port}`;
+  const openTabWindow: OpenTabWindow =
+    options.openTabWindow ??
+    (async ({ url, orcaTarget }) => {
+      if (orcaTarget) {
+        const result = await openOrcaTab({
+          target: orcaTarget,
+          url,
+          run: orca.run,
+        });
+        if (result.opened) return true;
+      }
+      // Loaded here, not at the top: the CLI module imports this one's peers.
+      const { createDefaultOpenUrl } = await import("./cli.js");
+      const mode = createDefaultOpenUrl({ env: process.env })(url);
+      return mode !== "disabled" && mode !== "none";
+    });
+  const tabWindows = new TabWindowRegistry({
+    stateDir,
+    batchMinutes: options.tabBatchMinutes,
+    openWindow: (request) =>
+      openTabWindow({ ...request, url: `${publicOrigin}${request.url}` }),
+    isShownByPlainPage: (documentPath) =>
+      liveTabs().some(
+        (tab) => tab.path !== null && samePath(tab.path, documentPath),
+      ),
+  });
+  if (options.restoreTabQueue) tabWindows.restore();
+
   function isAuthorizedRemoteDocumentRequest(req: Request): boolean {
     if (!remoteDocumentToken) return true;
 
@@ -844,19 +893,26 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       typeof req.body?.timeoutSeconds === "number"
         ? req.body.timeoutSeconds
         : undefined;
-    const batchWindowSeconds =
+    const batchWindowMs =
       typeof req.body?.batchWindowSeconds === "number"
-        ? req.body.batchWindowSeconds
-        : 0.25;
+        ? req.body.batchWindowSeconds * 1000
+        : undefined;
     const afterSequence =
       typeof req.body?.afterSequence === "number" ? req.body.afterSequence : 0;
+    const includeComments = req.body?.includeComments === true;
 
     const result = await reviewEvents.wait({
       documentPath: target.absolutePath,
       afterSequence: fromNow ? reviewEvents.latestSequence() : afterSequence,
       timeoutMs:
         timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined,
-      batchWindowMs: batchWindowSeconds * 1000,
+      // Left undefined, a comments-waiter gets its longer default window.
+      batchWindowMs,
+      includeComments,
+      // A comments waiter that starts "from now" still gets the comments
+      // written since the last one it was handed; an explicit afterSequence
+      // (fromNow: false) is taken literally.
+      catchUpComments: includeComments && fromNow,
     });
 
     res.json({ ...result, instanceId });
@@ -866,8 +922,11 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const target = markdownPathFromRequest(req, res);
     if (!target) return;
 
-    const watcherCount = reviewEvents.waiterCountForDocument(
-      target.absolutePath,
+    // The grace period after a comments-waiter returns keeps the count at 1,
+    // so the «I'm done» button stays while the agent answers.
+    const watcherCount = Math.max(
+      reviewEvents.waiterCountForDocument(target.absolutePath),
+      reviewEvents.isDocumentWatched(target.absolutePath) ? 1 : 0,
     );
     res.json({
       documentPath: target.absolutePath,
@@ -926,8 +985,18 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
+    let previousContent: string | null = null;
+    try {
+      previousContent = fs.readFileSync(absolutePath, "utf-8");
+    } catch {}
+
     fs.writeFileSync(absolutePath, content);
     recordDocumentSave(absolutePath);
+    emitCommentsAddedBySave(
+      { absolutePath, projectDir, relativePath },
+      previousContent,
+      content,
+    );
     res.json(markdownPageFromFile(relativePath, absolutePath));
   });
 
@@ -985,6 +1054,27 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     return documents.sort(
       (left, right) => Date.parse(left.openedAt) - Date.parse(right.openedAt),
     );
+  }
+
+  // A save that adds reviewer comments wakes the agents watching with
+  // includeComments. It never fails the save itself.
+  function emitCommentsAddedBySave(
+    target: { absolutePath: string; projectDir: string; relativePath: string },
+    previousContent: string | null,
+    content: string,
+  ): void {
+    if (previousContent === null || typeof content !== "string") return;
+    try {
+      const comments = detectNewReviewerComments(previousContent, content);
+      if (comments.length === 0) return;
+      reviewEvents.emitComments({
+        documentPath: target.absolutePath,
+        projectPath: target.projectDir,
+        relativePath: target.relativePath,
+        version: fileVersionFromFile(target.absolutePath),
+        comments,
+      });
+    } catch {}
   }
 
   function recordDocumentSave(absolutePath: string): void {
@@ -1514,6 +1604,149 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     });
   });
 
+  // --- Tab windows and the batch queue ---
+
+  function readOrcaTarget(value: unknown): OrcaTargetSnapshot | null {
+    if (!value || typeof value !== "object") return null;
+    const { command, worktree } = value as Record<string, unknown>;
+    if (typeof command !== "string" || command.trim().length === 0) {
+      return null;
+    }
+    return {
+      command: command.trim(),
+      worktree:
+        typeof worktree === "string" && worktree.trim().length > 0
+          ? worktree.trim()
+          : null,
+    };
+  }
+
+  function readTabPath(body: unknown): string | null {
+    const value = (body as { path?: unknown } | null)?.path;
+    return typeof value === "string" && value.trim().length > 0
+      ? value.trim()
+      : null;
+  }
+
+  function readWindowId(body: unknown): string | undefined {
+    const value = (body as { windowId?: unknown } | null)?.windowId;
+    return typeof value === "string" && value.trim().length > 0
+      ? value.trim()
+      : undefined;
+  }
+
+  app.post("/api/tab-windows/poll", (req, res) => {
+    const windowId = readWindowId(req.body);
+    if (!windowId) {
+      res.status(400).json({ error: "windowId is required" });
+      return;
+    }
+    const rawTabs = (req.body as { tabs?: unknown }).tabs;
+    const tabs: TabState[] = Array.isArray(rawTabs)
+      ? rawTabs.flatMap((tab): TabState[] => {
+          const entry = tab as Partial<TabState> | null;
+          return entry && typeof entry.path === "string" && entry.path
+            ? [
+                {
+                  path: entry.path,
+                  label: normalizeSessionLabel(entry.label),
+                  active: entry.active === true,
+                  done: entry.done === true,
+                  openThreads:
+                    typeof entry.openThreads === "number"
+                      ? entry.openThreads
+                      : 0,
+                },
+              ]
+            : [];
+        })
+      : [];
+    res.json(tabWindows.poll(windowId, tabs));
+  });
+
+  app.post("/api/tabs/open", async (req, res) => {
+    const body = (req.body ?? {}) as {
+      tabs?: unknown;
+      now?: unknown;
+      windowId?: unknown;
+      orcaTarget?: unknown;
+      open?: unknown;
+    };
+    const tabs = Array.isArray(body.tabs)
+      ? body.tabs.flatMap((tab) => {
+          const entry = tab as {
+            path?: unknown;
+            label?: unknown;
+            since?: unknown;
+          } | null;
+          return entry && typeof entry.path === "string" && entry.path.trim()
+            ? [
+                {
+                  path: entry.path.trim(),
+                  label: normalizeSessionLabel(entry.label),
+                  since:
+                    typeof entry.since === "string" && entry.since.trim()
+                      ? entry.since.trim()
+                      : null,
+                },
+              ]
+            : [];
+        })
+      : [];
+    if (tabs.length === 0) {
+      res.status(400).json({ error: "tabs needs at least one path" });
+      return;
+    }
+    const orcaTarget = readOrcaTarget(body.orcaTarget);
+    const response = tabWindows.open({
+      tabs,
+      now: body.now === true,
+      windowId: readWindowId(body),
+      orcaTarget,
+    });
+
+    // The MCP has no terminal to open a window in: it asks the server to.
+    let opened: boolean | undefined;
+    if (body.open === true && response.url) {
+      try {
+        opened = await openTabWindow({
+          url: `${publicOrigin}${response.url}`,
+          orcaTarget,
+        });
+      } catch {
+        opened = false;
+      }
+    }
+    res.json(opened === undefined ? response : { ...response, opened });
+  });
+
+  app.post("/api/tabs/focus", (req, res) => {
+    const targetPath = readTabPath(req.body);
+    if (!targetPath) {
+      res.status(400).json({ error: "path is required" });
+      return;
+    }
+    res.json(tabWindows.focus(targetPath, readWindowId(req.body)));
+  });
+
+  app.post("/api/tabs/close", (req, res) => {
+    const targetPath = readTabPath(req.body);
+    if (!targetPath) {
+      res.status(400).json({ error: "path is required" });
+      return;
+    }
+    res.json(tabWindows.close(targetPath, readWindowId(req.body)));
+  });
+
+  app.post("/api/tabs/release", async (req, res) => {
+    const open = (req.body as { open?: unknown } | undefined)?.open === true;
+    res.json(await tabWindows.release({ open }));
+  });
+
+  app.get("/api/tabs", (_req, res) => {
+    res.json(tabWindows.list());
+  });
+
   // --- Static files & SPA fallback ---
 
   app.use(express.static(staticDirPath));
@@ -1522,7 +1755,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.sendFile(path.join(staticDirPath, "index.html"));
   });
 
-  return { app, port };
+  return { app, port, dispose: () => tabWindows.dispose() };
 }
 
 export const ROUGHDRAFT_TOKEN_ENV = "ROUGHDRAFT_TOKEN";
@@ -1551,6 +1784,7 @@ export async function createServer(
     projectDir,
     remoteDocumentToken:
       remoteDocumentToken.length > 0 ? remoteDocumentToken : undefined,
+    restoreTabQueue: true,
   });
   const listeningHosts: string[] = [];
 

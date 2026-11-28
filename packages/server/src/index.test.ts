@@ -1603,4 +1603,466 @@ describe("createApp", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+  describe("live comment events", () => {
+    const BASE = [
+      "# Draft",
+      "",
+      "Keep {==the claim==}{>>Why this?<<}{#c1} here.",
+      "",
+      "---",
+      "comments:",
+      "  c1:",
+      "    by: user",
+      '    at: "2026-11-28T10:00:00.000Z"',
+      "",
+    ].join("\n");
+    const C1_AT = '    at: "2026-11-28T10:00:00.000Z"\n';
+
+    function setup() {
+      fs.writeFileSync(path.join(projectDir, "draft.md"), BASE);
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const save = (content: string) =>
+        request(app)
+          .put("/api/markdown-file")
+          .query({ projectPath: projectDir, path: "draft.md" })
+          .send({ content });
+      const retainedCommentEvents = async () => {
+        const response = await request(app)
+          .post("/api/review-events/watch")
+          .send({
+            projectPath: projectDir,
+            path: "draft.md",
+            fromNow: false,
+            includeComments: true,
+            timeoutSeconds: 0,
+            batchWindowSeconds: 0,
+          });
+        return response.body.events as Array<{
+          type: string;
+          comments: Array<{
+            id: string;
+            kind: string;
+            parentId: string | null;
+          }>;
+        }>;
+      };
+      return { app, save, retainedCommentEvents };
+    }
+
+    it("emits one comment.added event for a new reviewer comment and a new reply", async () => {
+      const { save, retainedCommentEvents } = setup();
+
+      await save(
+        BASE.replace(
+          "here.",
+          "here and {==more==}{>>Cut this<<}{#c2}.",
+        ).replace(
+          C1_AT,
+          `${C1_AT}  c2:\n    by: user\n    at: "2026-11-28T10:05:00.000Z"\n`,
+        ),
+      );
+      await save(
+        BASE.replace(
+          C1_AT,
+          `${C1_AT}  c3:\n    body: Actually keep it\n    by: user\n    at: "2026-11-28T10:06:00.000Z"\n    re: c1\n`,
+        ),
+      );
+
+      const events = await retainedCommentEvents();
+      expect(events.map((event) => event.type)).toEqual([
+        "comment.added",
+        "comment.added",
+      ]);
+      expect(events[0]?.comments).toMatchObject([
+        { id: "c2", kind: "comment", parentId: null },
+      ]);
+      expect(events[1]?.comments).toMatchObject([
+        { id: "c3", kind: "reply", parentId: "c1" },
+      ]);
+    });
+
+    it("does not emit for agent items, suggestions, edits or unchanged saves", async () => {
+      const { save, retainedCommentEvents } = setup();
+
+      await save(
+        BASE.replace(
+          C1_AT,
+          `${C1_AT}  c2:\n    body: Done\n    by: AI\n    at: "2026-11-28T10:05:00.000Z"\n    re: c1\n`,
+        ),
+      );
+      await save(
+        `${BASE.replace("here.", "here {~~old~>new~~}{#s1}.")}suggestions:\n  s1:\n    by: user\n    at: "2026-11-28T10:05:00.000Z"\n`,
+      );
+      await save(BASE.replace("Why this?", "Why this, exactly?"));
+      await save(BASE);
+
+      expect(await retainedCommentEvents()).toEqual([]);
+    });
+
+    it("wakes a comments watcher but not a plain one", async () => {
+      const { app, save } = setup();
+      const watch = (extra: Record<string, unknown>) =>
+        request(app)
+          .post("/api/review-events/watch")
+          .send({
+            projectPath: projectDir,
+            path: "draft.md",
+            timeoutSeconds: 1,
+            batchWindowSeconds: 0,
+            ...extra,
+          })
+          .then((response) => response.body);
+      const commentsWatch = watch({ includeComments: true });
+      const plainWatch = watch({});
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      await save(
+        BASE.replace(
+          "here.",
+          "here and {==more==}{>>Cut this<<}{#c2}.",
+        ).replace(
+          C1_AT,
+          `${C1_AT}  c2:\n    by: user\n    at: "2026-11-28T10:05:00.000Z"\n`,
+        ),
+      );
+
+      expect(await commentsWatch).toMatchObject({
+        timedOut: false,
+        events: [{ type: "comment.added" }],
+      });
+      expect(await plainWatch).toMatchObject({ timedOut: true, events: [] });
+    });
+
+    it("returns a comment saved between two comments watches on the second one, once", async () => {
+      const { app, save } = setup();
+      const watch = (extra: Record<string, unknown> = {}) =>
+        request(app)
+          .post("/api/review-events/watch")
+          .send({
+            projectPath: projectDir,
+            path: "draft.md",
+            timeoutSeconds: 0,
+            batchWindowSeconds: 0,
+            includeComments: true,
+            ...extra,
+          })
+          .then((response) => response.body);
+      await watch();
+      await save(
+        BASE.replace(
+          "here.",
+          "here and {==more==}{>>Cut this<<}{#c2}.",
+        ).replace(
+          C1_AT,
+          `${C1_AT}  c2:\n    by: user\n    at: "2026-11-28T10:05:00.000Z"\n`,
+        ),
+      );
+
+      const second = await watch();
+      const third = await watch();
+      const explicit = await watch({ fromNow: false, afterSequence: 0 });
+
+      expect(second.events).toMatchObject([
+        { type: "comment.added", comments: [{ id: "c2" }] },
+      ]);
+      expect(third.events).toEqual([]);
+      expect(explicit.events).toHaveLength(1);
+    });
+
+    it("keeps reporting a watcher for the grace period after a comments watcher returns", async () => {
+      const { app, save } = setup();
+      const watching = request(app)
+        .post("/api/review-events/watch")
+        .send({
+          projectPath: projectDir,
+          path: "draft.md",
+          timeoutSeconds: 5,
+          batchWindowSeconds: 0,
+          includeComments: true,
+        })
+        .then((response) => response.body);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await save(
+        BASE.replace(
+          "here.",
+          "here and {==more==}{>>Cut this<<}{#c2}.",
+        ).replace(
+          C1_AT,
+          `${C1_AT}  c2:\n    by: user\n    at: "2026-11-28T10:05:00.000Z"\n`,
+        ),
+      );
+      await watching;
+
+      const status = await request(app)
+        .get("/api/review-events/status")
+        .query({ projectPath: projectDir, path: "draft.md" });
+
+      expect(status.body).toMatchObject({ watching: true, watcherCount: 1 });
+    });
+  });
+});
+
+describe("tab window routes", () => {
+  let homeDir: string;
+  let stateDir: string;
+  let opened: Array<{ url: string; orcaTarget: unknown }>;
+
+  function makeApp() {
+    return createApp({
+      homeDir,
+      stateDir,
+      port: 7373,
+      tabBatchMinutes: 120,
+      staticDirPath: homeDir,
+      openTabWindow: async (windowRequest) => {
+        opened.push(windowRequest);
+        return true;
+      },
+    });
+  }
+
+  beforeEach(() => {
+    homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "roughdraft-tabs-home-"));
+    stateDir = path.join(homeDir, "state");
+    opened = [];
+  });
+
+  afterEach(() => {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  });
+
+  it("opens the first document in a window, queues the second, and lists both", async () => {
+    const { app, dispose } = makeApp();
+    try {
+      const first = await request(app)
+        .post("/api/tabs/open")
+        .send({ tabs: [{ path: "/docs/a.md", label: "plan" }] });
+      expect(first.status).toBe(200);
+      expect(first.body.results).toEqual([
+        {
+          path: "/docs/a.md",
+          status: "open-window",
+          windowId: first.body.windowId,
+        },
+      ]);
+      expect(first.body.url).toBe(
+        `/tabs?window=${first.body.windowId}&tab=%2Fdocs%2Fa.md&active=%2Fdocs%2Fa.md`,
+      );
+
+      const second = await request(app)
+        .post("/api/tabs/open")
+        .send({ tabs: [{ path: "/docs/b.md" }] });
+      expect(second.body.results[0]).toMatchObject({
+        path: "/docs/b.md",
+        status: "queued",
+      });
+      expect(typeof second.body.results[0].releaseAt).toBe("string");
+
+      const listing = await request(app).get("/api/tabs");
+      expect(listing.body.queue.items).toMatchObject([{ path: "/docs/b.md" }]);
+      expect(listing.body.queue.releaseAt).toBe(
+        second.body.results[0].releaseAt,
+      );
+      expect(listing.body.windows).toMatchObject([
+        { id: first.body.windowId, pending: true },
+      ]);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("answers a window's poll with its commands and the queue", async () => {
+    const { app, dispose } = makeApp();
+    try {
+      const first = await request(app)
+        .post("/api/tabs/open")
+        .send({ tabs: [{ path: "/docs/a.md" }] });
+      const windowId = first.body.windowId;
+      const tab = {
+        path: "/docs/a.md",
+        label: null,
+        active: true,
+        done: false,
+        openThreads: 1,
+      };
+      const idle = await request(app)
+        .post("/api/tab-windows/poll")
+        .send({ windowId, tabs: [tab] });
+      expect(idle.body).toEqual({
+        commands: [],
+        queue: { count: 0, releaseAt: expect.any(String) },
+      });
+
+      await request(app)
+        .post("/api/tabs/open")
+        .send({ tabs: [{ path: "/docs/b.md", since: "HEAD~1" }], now: true });
+      await request(app).post("/api/tabs/focus").send({ path: "/docs/a.md" });
+      const poll = await request(app)
+        .post("/api/tab-windows/poll")
+        .send({ windowId, tabs: [tab] });
+      expect(poll.body.commands).toEqual([
+        {
+          type: "add",
+          tabs: [{ path: "/docs/b.md", label: null, since: "HEAD~1" }],
+        },
+        { type: "focus", path: "/docs/a.md" },
+      ]);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("closes a tab or drops a queued document", async () => {
+    const { app, dispose } = makeApp();
+    try {
+      const first = await request(app)
+        .post("/api/tabs/open")
+        .send({ tabs: [{ path: "/docs/a.md" }] });
+      await request(app)
+        .post("/api/tab-windows/poll")
+        .send({
+          windowId: first.body.windowId,
+          tabs: [
+            {
+              path: "/docs/a.md",
+              label: null,
+              active: true,
+              done: false,
+              openThreads: 0,
+            },
+          ],
+        });
+      await request(app)
+        .post("/api/tabs/open")
+        .send({ tabs: [{ path: "/docs/b.md" }] });
+
+      const closeTab = await request(app)
+        .post("/api/tabs/close")
+        .send({ path: "/docs/a.md" });
+      expect(closeTab.body).toMatchObject({ closed: true, from: "window" });
+      const dropQueued = await request(app)
+        .post("/api/tabs/close")
+        .send({ path: "/docs/b.md" });
+      expect(dropQueued.body).toEqual({ closed: true, from: "queue" });
+      const missing = await request(app)
+        .post("/api/tabs/focus")
+        .send({ path: "/docs/zzz.md" });
+      expect(missing.body).toEqual({ focused: false });
+    } finally {
+      dispose();
+    }
+  });
+
+  it("releases the queue and returns the window to open, or opens it itself", async () => {
+    const { app, dispose } = makeApp();
+    try {
+      await request(app)
+        .post("/api/tabs/open")
+        .send({ tabs: [{ path: "/docs/a.md" }] });
+      await request(app)
+        .post("/api/tabs/open")
+        .send({
+          tabs: [{ path: "/docs/b.md" }],
+          orcaTarget: { command: "orca", worktree: "id:w" },
+        });
+      // No window ever polled: the pending window expires after 30 s.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() + 60_000);
+      try {
+        const release = await request(app).post("/api/tabs/release").send({});
+        expect(release.body.released).toBe(1);
+        expect(release.body.url).toContain("tab=%2Fdocs%2Fb.md");
+        expect(opened).toEqual([]);
+
+        // The window the release returned is never opened: it expires too.
+        vi.setSystemTime(Date.now() + 60_000);
+        await request(app)
+          .post("/api/tabs/open")
+          .send({
+            tabs: [{ path: "/docs/c.md" }],
+            now: true,
+            orcaTarget: { command: "orca", worktree: "id:w" },
+            open: true,
+          });
+        expect(opened).toEqual([
+          {
+            url: expect.stringMatching(
+              /^http:\/\/localhost:7373\/tabs\?window=.+tab=%2Fdocs%2Fc\.md/,
+            ),
+            orcaTarget: { command: "orca", worktree: "id:w" },
+          },
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps the queue across a server restart", async () => {
+    const first = makeApp();
+    try {
+      await request(first.app)
+        .post("/api/tabs/open")
+        .send({ tabs: [{ path: "/docs/a.md" }] });
+      await request(first.app)
+        .post("/api/tabs/open")
+        .send({ tabs: [{ path: "/docs/b.md" }] });
+    } finally {
+      first.dispose();
+    }
+
+    const restarted = createApp({
+      homeDir,
+      stateDir,
+      restoreTabQueue: true,
+      staticDirPath: homeDir,
+      openTabWindow: async () => true,
+    });
+    try {
+      const listing = await request(restarted.app).get("/api/tabs");
+      expect(listing.body.queue.items).toMatchObject([{ path: "/docs/b.md" }]);
+      expect(listing.body.queue.releaseAt).toEqual(expect.any(String));
+    } finally {
+      restarted.dispose();
+    }
+  });
+
+  it("reports a plain single-document page as single-page", async () => {
+    const { app, dispose } = makeApp();
+    try {
+      await request(app)
+        .get("/api/open-requests/poll")
+        .query({ clientId: "plain", path: "/docs/a.md" });
+
+      const response = await request(app)
+        .post("/api/tabs/open")
+        .send({ tabs: [{ path: "/docs/a.md" }] });
+
+      expect(response.body.results).toEqual([
+        { path: "/docs/a.md", status: "single-page" },
+      ]);
+      expect(response.body.url).toBeUndefined();
+    } finally {
+      dispose();
+    }
+  });
+
+  it("rejects requests with no path", async () => {
+    const { app, dispose } = makeApp();
+    try {
+      expect(
+        (await request(app).post("/api/tabs/open").send({ tabs: [] })).status,
+      ).toBe(400);
+      expect((await request(app).post("/api/tabs/focus").send({})).status).toBe(
+        400,
+      );
+      expect(
+        (await request(app).post("/api/tab-windows/poll").send({})).status,
+      ).toBe(400);
+    } finally {
+      dispose();
+    }
+  });
 });

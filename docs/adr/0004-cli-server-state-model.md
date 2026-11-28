@@ -34,3 +34,10 @@ The mitigation is a shared bearer token, `ROUGHDRAFT_TOKEN`:
 - The viewerUrl printed by the CLI includes `?token=...` so the browser tab can authenticate. The frontend forwards the token as a header on fetches and as `?token=` on the EventSource.
 
 Loopback-only deployments stay back-compatible: no token required, no behavior change. The token is the contract that lets non-loopback deployments be safe; the secure-by-default startup guard is the contract that lets us ship the feature without expecting users to read documentation before exposing the endpoints.
+
+## Clarification (2026-11-28): Tab Windows and the Batch Queue
+
+Roughdraft shows review documents as tabs of one window (see `.context/roughdraft-tabs-plan.md`, Part C). The server keeps two kinds of state for it, and neither makes the state file a document model.
+
+- **The window registry is in memory**, like remote document sessions: each tab window reports its tabs on every poll (`POST /api/tab-windows/poll`), and a window that stops polling is forgotten after a few seconds. It is empty after a restart until a window polls again, and a reloaded window re-registers itself from its URL.
+- **The batch queue is a separate small file**, `<stateDir>/tab-queue.json`, written atomically (temp file and rename). It holds only paths, labels, times and the Orca target a queuing CLI saved (`{ batchOpenedAt, queued: [{ path, label, queuedAt, orcaTarget? }] }`), so a document waiting for the next batch survives a server restart and its release timer is re-armed at start. It stores no document content, review state or window layout, and `server.json` (the managed process record) is unchanged.

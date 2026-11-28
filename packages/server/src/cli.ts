@@ -22,7 +22,13 @@ import {
   runOrcaCommand,
 } from "./orca.js";
 import { findAvailablePort } from "./ports.js";
-import type { ReviewDoneReason } from "./review-events.js";
+import { replyToComment } from "./review-comments.js";
+import {
+  DEFAULT_COMMENT_BATCH_WINDOW_MS,
+  type ReviewCommentAddedEvent,
+  type ReviewCompletedEvent,
+  type ReviewDoneReason,
+} from "./review-events.js";
 import {
   ReviewWatchConnectionLostError,
   waitForReviewEvents,
@@ -46,6 +52,8 @@ const KNOWN_COMMANDS = [
   "status",
   "stop",
   "watch",
+  "reply",
+  "tabs",
   "mcp",
   "doctor",
   "help",
@@ -184,14 +192,21 @@ interface ParsedCli {
 interface ParsedCommandOptions {
   all: boolean;
   batchWindowSeconds: number;
+  batchWindowExplicit: boolean;
+  afterSequence?: number;
+  comments: boolean;
   help: boolean;
   json: boolean;
   label?: string;
   loop: boolean;
+  /** Skip the batch queue: add the tab to the window at once. */
+  now: boolean;
   noOpen: boolean;
   noWatch: boolean;
   printUrl: boolean;
   port?: string;
+  /** Tab window to act in (the `tabs` subcommands). */
+  window?: string;
   replay: boolean;
   stateDir?: string;
   stateFile?: string;
@@ -202,6 +217,11 @@ interface ParsedCommandOptions {
 
 interface ParsedWatchOptions {
   batchWindowSeconds: number;
+  /** The user passed --batch-window; otherwise --comments uses its own default. */
+  batchWindowExplicit?: boolean;
+  /** Only events after this sequence; replaces "from now". */
+  afterSequence?: number;
+  comments?: boolean;
   help: boolean;
   json: boolean;
   loop?: boolean;
@@ -310,14 +330,18 @@ function parseCommandOptions(
     allowOpen?: boolean;
     allowPort?: boolean;
     allowWatch?: boolean;
+    allowWindow?: boolean;
   },
 ): ParsedCommandOptions {
   const parsed: ParsedCommandOptions = {
     all: false,
     batchWindowSeconds: 0.25,
+    batchWindowExplicit: false,
+    comments: false,
     help: false,
     json: false,
     loop: false,
+    now: false,
     noOpen: false,
     noWatch: false,
     positionals: [],
@@ -377,6 +401,24 @@ function parseCommandOptions(
       continue;
     }
 
+    if (arg === "--now") {
+      if (!options.allowOpen) throw new Error(`Unknown flag: ${arg}`);
+      parsed.now = true;
+      continue;
+    }
+
+    if (arg === "--window" || arg.startsWith("--window=")) {
+      if (!options.allowWindow) throw new Error(`Unknown flag: --window`);
+      if (arg === "--window") {
+        const next = takeFlagValue(args, index, arg);
+        parsed.window = next.value;
+        index = next.nextIndex;
+      } else {
+        parsed.window = arg.slice("--window=".length);
+      }
+      continue;
+    }
+
     if (arg === "--watch") {
       if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
       parsed.watch = true;
@@ -401,6 +443,24 @@ function parseCommandOptions(
       continue;
     }
 
+    if (arg === "--comments") {
+      if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
+      parsed.comments = true;
+      continue;
+    }
+
+    if (arg === "--after" || arg.startsWith("--after=")) {
+      if (!options.allowWatch) throw new Error(`Unknown flag: --after`);
+      if (arg === "--after") {
+        const next = takeFlagValue(args, index, arg);
+        parsed.afterSequence = parseSequence(next.value);
+        index = next.nextIndex;
+      } else {
+        parsed.afterSequence = parseSequence(arg.slice("--after=".length));
+      }
+      continue;
+    }
+
     if (arg === "--timeout") {
       if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
       const next = takeFlagValue(args, index, arg);
@@ -422,6 +482,7 @@ function parseCommandOptions(
       if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
       const next = takeFlagValue(args, index, arg);
       parsed.batchWindowSeconds = parsePositiveNumber(next.value, arg);
+      parsed.batchWindowExplicit = true;
       index = next.nextIndex;
       continue;
     }
@@ -432,6 +493,7 @@ function parseCommandOptions(
         arg.slice("--batch-window=".length),
         "--batch-window",
       );
+      parsed.batchWindowExplicit = true;
       continue;
     }
 
@@ -532,6 +594,22 @@ function parseWatchOptions(args: string[]): ParsedWatchOptions {
       continue;
     }
 
+    if (arg === "--comments") {
+      parsed.comments = true;
+      continue;
+    }
+
+    if (arg === "--after" || arg.startsWith("--after=")) {
+      if (arg === "--after") {
+        const next = takeFlagValue(args, index, arg);
+        parsed.afterSequence = parseSequence(next.value);
+        index = next.nextIndex;
+      } else {
+        parsed.afterSequence = parseSequence(arg.slice("--after=".length));
+      }
+      continue;
+    }
+
     if (arg === "--timeout") {
       const next = takeFlagValue(args, index, arg);
       parsed.timeoutSeconds = parsePositiveNumber(next.value, arg);
@@ -550,6 +628,7 @@ function parseWatchOptions(args: string[]): ParsedWatchOptions {
     if (arg === "--batch-window") {
       const next = takeFlagValue(args, index, arg);
       parsed.batchWindowSeconds = parsePositiveNumber(next.value, arg);
+      parsed.batchWindowExplicit = true;
       index = next.nextIndex;
       continue;
     }
@@ -559,6 +638,7 @@ function parseWatchOptions(args: string[]): ParsedWatchOptions {
         arg.slice("--batch-window=".length),
         "--batch-window",
       );
+      parsed.batchWindowExplicit = true;
       continue;
     }
 
@@ -593,6 +673,14 @@ function parseWatchOptions(args: string[]): ParsedWatchOptions {
     parsed.positionals.push(arg);
   }
 
+  return parsed;
+}
+
+function parseSequence(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error("--after must be a whole number (an event sequence).");
+  }
   return parsed;
 }
 
@@ -916,7 +1004,9 @@ function printHelp(log: (message: string) => void) {
   log("  start              Start or reuse the background server");
   log("  status [<path>]    Show server status, or a document's open threads");
   log("  stop               Stop the managed background server");
-  log("  watch <path>       Wait for a Done Reviewing event");
+  log("  watch <path>...    Wait for a Done Reviewing event (or new comments)");
+  log("  tabs               List the window's tabs and queue; add, focus, close, release");
+  log("  reply <path>       Reply to a comment in a document");
   log("  mcp                Start the experimental stdio MCP server");
   log("  doctor [path]      Diagnose setup or validate Markdown");
   log("  help agent         Print the agent setup prompt");
@@ -936,7 +1026,12 @@ function printHelp(log: (message: string) => void) {
   log("  roughdraft open ./draft.md --json");
   log("  roughdraft open ./draft.md --no-watch");
   log("  roughdraft open ./draft.md --loop --json");
+  log("  roughdraft open ./a.md ./b.md --now");
+  log("  roughdraft watch ./a.md ./b.md --json");
+  log("  roughdraft tabs --json");
   log("  roughdraft watch ./draft.md --json");
+  log("  roughdraft watch ./draft.md --comments --json");
+  log('  roughdraft reply ./draft.md --to c1 "Done, moved it above."');
   log("  roughdraft status --json");
   log("  roughdraft status ./draft.md");
   log("");
@@ -951,12 +1046,29 @@ function printCommandHelp(
   if (command === "open") {
     log("Usage:");
     log(
-      "  roughdraft open <path> [--label <text>] [--no-open] [--no-watch] [--loop] [--print-url] [--port <port>]",
+      "  roughdraft open <path> [<path>...] [--now] [--label <text>] [--no-open] [--no-watch] [--loop] [--comments] [--print-url] [--port <port>]",
     );
     log("");
     log(
-      "Opens one Markdown file and waits for Done Reviewing. Starts Roughdraft if needed.",
+      "Opens Markdown files and waits for Done Reviewing. Starts Roughdraft if needed.",
     );
+    log("");
+    log(
+      "Every file is a tab of one Roughdraft window. A file opened while a batch",
+    );
+    log(
+      "is running waits in a queue and appears with the next batch (every 2 hours,",
+    );
+    log(
+      "ROUGHDRAFT_TAB_BATCH_MINUTES changes that); the command says when and",
+    );
+    log(
+      "keeps waiting. --now adds the tab at once. When no batch has opened in the",
+    );
+    log(
+      "last 2 hours, the file opens at once and starts a batch. --loop, --comments",
+    );
+    log("and --after need a single file.");
     log("");
     log(
       "Loop mode (--loop) returns after each round like the default, and also",
@@ -975,6 +1087,9 @@ function printCommandHelp(
     log("");
     log("Flags:");
     log(
+      "  --now                Add the tab to the window at once, skipping the queue",
+    );
+    log(
       "  --no-open            Start/reuse the server without opening a browser",
     );
     log(
@@ -983,6 +1098,12 @@ function printCommandHelp(
     log("  --no-watch           Open the file without waiting");
     log(
       "  --loop               Report whether the round ended with a done-signal",
+    );
+    log(
+      "  --comments           Also return on each new comment or reply (see watch --comments)",
+    );
+    log(
+      "  --after <sequence>   Only events after this sequence (the sequence of a comment line)",
     );
     log(
       "  --label <text>       Name this session; the document header shows who opened it",
@@ -1101,13 +1222,58 @@ function printCommandHelp(
 
   if (command === "watch") {
     log("Usage:");
-    log("  roughdraft watch <path> [--json] [--timeout <seconds>]");
+    log(
+      "  roughdraft watch <path> [<path>...] [--comments] [--json] [--timeout <seconds>]",
+    );
     log("");
     log(
       "Waits until Roughdraft receives Done Reviewing for one Markdown file.",
     );
     log("");
+    log(
+      "With several paths it prints one line per file as each finishes (--json:",
+    );
+    log(
+      '{path, timedOut, events}) and then {"allDone":true}. Exit 0 when every file',
+    );
+    log(
+      "is done, 1 on a timeout. --comments and --after need a single file.",
+    );
+    log("");
+    log(
+      "With --comments it also returns when the reviewer writes new comments or",
+    );
+    log(
+      "replies, so an agent can answer each one in its thread (roughdraft reply)",
+    );
+    log(
+      "and watch again while the reviewer keeps reading. Comments written within",
+    );
+    log(
+      "3 seconds come back together; --batch-window changes that. Suggestions",
+    );
+    log(
+      "and the agent's own replies do not count. It returns on Done Reviewing too.",
+    );
+    log(
+      "--json prints one line per comment: {type: comment.added, path, id, kind,",
+    );
+    log(
+      "parentId, text, anchorText, author, sequence}, or the review.completed line.",
+    );
+    log(
+      "A comment written between two watches is not lost: the server remembers",
+    );
+    log(
+      "the last comment it handed over for the document, and the next --comments",
+    );
+    log(
+      "watch returns the ones after it at once. --after <sequence> overrides that.",
+    );
+    log("Exit codes are the same as without --comments.");
+    log("");
     log("Flags:");
+    log("  --comments                Also return on each new comment or reply");
     log("  --json                    Print machine-readable output");
     log(
       "  --timeout <seconds>       Maximum wait time; omitted means no timeout",
@@ -1120,6 +1286,56 @@ function printCommandHelp(
     );
     log("  --state-file <path>       Server state file");
     log("  --state-dir <dir>         Directory containing server.json");
+    return;
+  }
+
+  if (command === "tabs") {
+    log("Usage:");
+    log("  roughdraft tabs [--json]");
+    log("  roughdraft tabs add <path> [--label <text>] [--window <id>] [--json]");
+    log("  roughdraft tabs focus <path> [--window <id>] [--json]");
+    log("  roughdraft tabs close <path> [--window <id>] [--json]");
+    log("  roughdraft tabs release [--json]");
+    log("");
+    log(
+      "Roughdraft shows every document as a tab of one window. A new document",
+    );
+    log(
+      "waits in a queue while a batch is running and joins at the next batch.",
+    );
+    log("");
+    log("  (no action)  Lists the window's tabs and the queue with its release time");
+    log("  add          Adds a tab at once, skipping the queue");
+    log("  focus        Brings a tab forward");
+    log("  close        Closes a tab, or drops a queued document from the queue");
+    log("  release      Opens the next batch now: the queue joins the window");
+    log("");
+    log("Flags:");
+    log("  --window <id>        Act in this window (default: the newest live one)");
+    log("  --label <text>       Session label for add");
+    log("  --json               Print machine-readable output");
+    log("  --state-file <path>  Server state file");
+    log("  --state-dir <dir>    Directory containing server.json");
+    return;
+  }
+
+  if (command === "reply") {
+    log("Usage:");
+    log("  roughdraft reply <path> --to <id> [--by <name>] [--json] <text...>");
+    log("");
+    log(
+      "Appends a reply to one comment or suggestion id in a Markdown file, the",
+    );
+    log("same write as the MCP roughdraft_reply_to_comment tool.");
+    log("");
+    log("Flags:");
+    log(
+      "  --to <id>            The comment or suggestion to answer (required)",
+    );
+    log('  --by <name>          Author of the reply, default "AI"');
+    log(
+      "  --json               Print {replied, id, parentId} for the new reply",
+    );
     return;
   }
 
@@ -2456,10 +2672,15 @@ async function runWatch(
       target: {
         projectPath: target.projectDir,
         path: relativePath,
-        batchWindowSeconds: options.batchWindowSeconds,
+        batchWindowSeconds:
+          options.comments && !options.batchWindowExplicit
+            ? DEFAULT_COMMENT_BATCH_WINDOW_MS / 1000
+            : options.batchWindowSeconds,
+        ...(options.comments ? { includeComments: true } : {}),
       },
       timeoutSeconds: options.timeoutSeconds,
-      fromNow: !options.replay,
+      fromNow: !options.replay && options.afterSequence === undefined,
+      afterSequence: options.afterSequence,
       failureWindowMs: reconnectSeconds * 1000,
       onConnectionLost: () => {
         deps.error(
@@ -2478,13 +2699,15 @@ async function runWatch(
     // throwing, so an agent in the loop knows to reopen rather than guess.
     const message = `Roughdraft server at ${serverUrl} did not come back within ${reconnectSeconds} s. This command cannot receive Done Reviewing for ${target.openPath}; run \`roughdraft open ${relativeDisplayPath(deps.cwd, target.openPath)}\` again to resume the review.`;
     if (json) {
-      emitJson(deps.log, {
+      const disconnected = {
         disconnected: true,
         error: message,
         timedOut: false,
         events: [],
         ...(options.loop ? { done: false, doneReason: null } : {}),
-      });
+      };
+      if (options.comments) deps.log(JSON.stringify(disconnected));
+      else emitJson(deps.log, disconnected);
     } else {
       deps.error(message);
     }
@@ -2500,6 +2723,10 @@ async function runWatch(
       }
     | undefined;
   const doneReason = latestEvent?.doneReason ?? null;
+
+  if (options.comments) {
+    return reportCommentsWatch(deps, target.openPath, payload, options, json);
+  }
 
   if (json) {
     emitJson(
@@ -2522,6 +2749,650 @@ async function runWatch(
     deps.log(describeDoneSignal(doneReason, latestEvent?.summary?.unresolved));
   }
   return 0;
+}
+
+// `watch --comments`: one JSON line per new comment, or the review.completed
+// line, as they came in this round. Exit codes as the plain watch.
+function reportCommentsWatch(
+  deps: CliDependencies,
+  openPath: string,
+  payload: Awaited<ReturnType<typeof waitForReviewEvents>>,
+  options: ParsedWatchOptions,
+  json: boolean,
+): number {
+  const events = (payload.events ?? []) as Array<
+    ReviewCommentAddedEvent | ReviewCompletedEvent
+  >;
+
+  if (json) {
+    if (payload.timedOut) {
+      deps.log(JSON.stringify({ timedOut: true, events: [] }));
+      return 1;
+    }
+    for (const event of events) {
+      if (event.type === "comment.added") {
+        for (const comment of event.comments) {
+          deps.log(
+            JSON.stringify({
+              type: "comment.added",
+              path: event.documentPath,
+              id: comment.id,
+              kind: comment.kind,
+              parentId: comment.parentId,
+              text: comment.text,
+              anchorText: comment.anchorText,
+              author: comment.author,
+              sequence: event.sequence,
+            }),
+          );
+        }
+      } else {
+        deps.log(
+          JSON.stringify(
+            options.loop
+              ? {
+                  ...event,
+                  path: event.documentPath,
+                  done: event.doneReason !== null,
+                }
+              : { ...event, path: event.documentPath },
+          ),
+        );
+      }
+    }
+    return 0;
+  }
+
+  if (payload.timedOut) {
+    deps.log(`No new comment or review completed event for ${openPath}.`);
+    return 1;
+  }
+
+  for (const event of events) {
+    if (event.type === "comment.added") {
+      for (const comment of event.comments) {
+        const where = comment.anchorText
+          ? ` on "${comment.anchorText}"`
+          : comment.parentId
+            ? ` to ${comment.parentId}`
+            : "";
+        deps.log(
+          `New ${comment.kind} ${comment.id}${where} in ${openPath}: ${comment.text}`,
+        );
+      }
+    } else {
+      deps.log(`Review completed for ${openPath}.`);
+      if (options.loop) {
+        deps.log(
+          describeDoneSignal(event.doneReason, event.summary.unresolved),
+        );
+      }
+    }
+  }
+  return 0;
+}
+
+// --- Tab windows: one window, a tab per document, a batch queue ---
+
+interface TabOpenResultPayload {
+  path: string;
+  status: string;
+  releaseAt?: string;
+  windowId?: string;
+}
+
+interface TabOpenResponsePayload {
+  results: TabOpenResultPayload[];
+  url?: string;
+  windowId?: string;
+}
+
+const TABS_API_TIMEOUT_MS = 10_000;
+
+/** POSTs to a tab route; null when the server cannot answer (older server, down). */
+async function postTabsApi(
+  deps: CliDependencies,
+  baseUrl: string,
+  route: string,
+  body: unknown,
+): Promise<unknown | null> {
+  try {
+    const response = await deps.fetchImpl(new URL(route, baseUrl), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TABS_API_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+function isTabOpenResponse(value: unknown): value is TabOpenResponsePayload {
+  if (!value || typeof value !== "object") return false;
+  const results = (value as { results?: unknown }).results;
+  return (
+    Array.isArray(results) &&
+    results.every(
+      (entry) =>
+        entry &&
+        typeof entry === "object" &&
+        typeof (entry as { path?: unknown }).path === "string" &&
+        typeof (entry as { status?: unknown }).status === "string",
+    )
+  );
+}
+
+function formatClockTime(iso: string | undefined): string {
+  const date = iso ? new Date(iso) : null;
+  if (!date || Number.isNaN(date.getTime())) return "the next batch";
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** Shows a tab window: an Orca tab first, then the system opener. */
+async function openTabWindowUrl(
+  deps: CliDependencies,
+  windowUrl: string,
+): Promise<OpenMode> {
+  return (await openInOrcaTab(deps, windowUrl)) ?? deps.openUrl(windowUrl);
+}
+
+/**
+ * Today's single-document open: an Orca tab, or the open request a page that
+ * already shows the file receives, or a new window.
+ */
+async function openSingleDocument(
+  deps: CliDependencies,
+  {
+    baseUrl,
+    targetUrl,
+    openPath,
+    sessionLabel,
+  }: {
+    baseUrl: string;
+    targetUrl: string;
+    openPath: string;
+    sessionLabel: string | null;
+  },
+): Promise<OpenMode> {
+  // Why: inside Orca the tab in the agent's worktree wins over reusing a
+  // window that may be open elsewhere, so the review shows up where the
+  // agent runs, desktop or Orca mobile.
+  const orcaOpenMode = await openInOrcaTab(deps, targetUrl);
+  if (orcaOpenMode === "existing-orca-tab") {
+    // Orca only brings the reused tab forward; the open request is
+    // what tells the page about the new session label.
+    await sendOpenRequestToExistingWindow(
+      deps,
+      baseUrl,
+      targetUrl,
+      openPath,
+      sessionLabel,
+    );
+  }
+  return (
+    orcaOpenMode ??
+    ((await sendOpenRequestToExistingWindow(
+      deps,
+      baseUrl,
+      targetUrl,
+      openPath,
+      sessionLabel,
+    ))
+      ? "existing-window"
+      : deps.openUrl(targetUrl))
+  );
+}
+
+interface MultiWatchOptions {
+  batchWindowSeconds: number;
+  replay: boolean;
+  timeoutSeconds?: number;
+  stateDir?: string;
+  stateFile?: string;
+  serverUrl?: string;
+}
+
+/**
+ * `watch a.md b.md`: one line per file as it finishes, then {"allDone":true}
+ * (JSON). Exit 0 when every file is done, 1 on a timeout or a lost server.
+ */
+async function runWatchMany(
+  deps: CliDependencies,
+  targetPaths: string[],
+  options: MultiWatchOptions,
+  json: boolean,
+): Promise<number> {
+  const targets = targetPaths.map((targetPath) => resolveTargetPath(targetPath));
+  const first = targets[0];
+  if (!first) return USAGE_ERROR;
+  let serverUrl = options.serverUrl;
+  if (!serverUrl) {
+    const result = await ensureServerRunning(deps, {
+      projectDir: first.projectDir,
+    });
+    serverUrl = result.server.url;
+  }
+  const reconnectSeconds = readReconnectWindowSeconds(deps.env);
+  const pending = new Set(targets.map((target) => target.openPath));
+  let failed = false;
+
+  await Promise.all(
+    targets.map(async (target) => {
+      let payload: Awaited<ReturnType<typeof waitForReviewEvents>>;
+      try {
+        payload = await waitForReviewEvents({
+          fetchImpl: deps.fetchImpl,
+          serverUrl: serverUrl as string,
+          target: {
+            projectPath: target.projectDir,
+            path: path.relative(target.projectDir, target.openPath),
+            batchWindowSeconds: options.batchWindowSeconds,
+          },
+          timeoutSeconds: options.timeoutSeconds,
+          fromNow: !options.replay,
+          failureWindowMs: reconnectSeconds * 1000,
+        });
+      } catch (error) {
+        if (!(error instanceof ReviewWatchConnectionLostError)) throw error;
+        failed = true;
+        if (json) {
+          deps.log(
+            JSON.stringify({
+              path: target.openPath,
+              disconnected: true,
+              timedOut: false,
+              events: [],
+            }),
+          );
+        } else {
+          deps.error(
+            `Roughdraft server at ${serverUrl} did not come back within ${reconnectSeconds} s; ${target.openPath} cannot receive Done Reviewing. Run \`roughdraft open\` again to resume.`,
+          );
+        }
+        return;
+      }
+
+      if (payload.timedOut) {
+        failed = true;
+        if (json) {
+          deps.log(
+            JSON.stringify({
+              path: target.openPath,
+              timedOut: true,
+              events: [],
+            }),
+          );
+        } else {
+          deps.log(
+            `No review completed event received for ${target.openPath}.`,
+          );
+        }
+        return;
+      }
+
+      pending.delete(target.openPath);
+      if (json) {
+        deps.log(
+          JSON.stringify({
+            path: target.openPath,
+            timedOut: false,
+            events: payload.events ?? [],
+          }),
+        );
+      } else {
+        deps.log(`Review completed for ${target.openPath}.`);
+      }
+    }),
+  );
+
+  const allDone = !failed && pending.size === 0;
+  if (json) {
+    deps.log(
+      JSON.stringify(
+        allDone
+          ? { allDone: true }
+          : { allDone: false, pending: [...pending] },
+      ),
+    );
+  } else if (allDone) {
+    deps.log(`All ${targets.length} reviews completed.`);
+  }
+  return allDone ? 0 : 1;
+}
+
+const TABS_USAGE =
+  "Usage: roughdraft tabs [--json] | tabs add|focus|close <path> [--window <id>] | tabs release [--json]";
+
+/** `roughdraft tabs ...`: list, add, focus, close, release. */
+async function runTabs(
+  deps: CliDependencies,
+  args: string[],
+  globalJson: boolean,
+): Promise<number> {
+  let options: ParsedCommandOptions;
+  try {
+    options = parseCommandOptions(args, { allowOpen: true, allowWindow: true });
+  } catch (error) {
+    deps.error(error instanceof Error ? error.message : "Invalid usage.");
+    return USAGE_ERROR;
+  }
+  if (options.help) {
+    printCommandHelp("tabs", deps.log);
+    return 0;
+  }
+  const json = globalJson || options.json;
+  deps = applyCliEnvOverrides(deps, options);
+  const [action, ...operands] = options.positionals;
+
+  const server = await findReusableServer(deps);
+  const notRunning = () => {
+    if (json) {
+      emitJson(deps.log, { running: false });
+    } else {
+      deps.log("Roughdraft is not running. Start it with `roughdraft start`.");
+    }
+    return 1;
+  };
+
+  if (!action) {
+    if (!server) {
+      if (json) {
+        emitJson(deps.log, {
+          running: false,
+          windows: [],
+          queue: { items: [], releaseAt: null, batchOpenedAt: null },
+        });
+        return 0;
+      }
+      return notRunning();
+    }
+    const baseUrl = buildPublicBaseUrl(server.port);
+    let listing: {
+      windows?: Array<{
+        id: string;
+        live?: boolean;
+        tabs: Array<{ path: string; done: boolean; openThreads: number }>;
+      }>;
+      queue?: {
+        items: Array<{ path: string }>;
+        releaseAt: string | null;
+        batchOpenedAt: string | null;
+      };
+    } | null = null;
+    try {
+      const response = await deps.fetchImpl(new URL("/api/tabs", baseUrl), {
+        signal: AbortSignal.timeout(TABS_API_TIMEOUT_MS),
+      });
+      if (response.ok) listing = await response.json();
+    } catch {}
+    if (!listing) {
+      deps.error("This Roughdraft server does not support tab windows.");
+      return 1;
+    }
+    if (json) {
+      emitJson(deps.log, { running: true, ...listing });
+      return 0;
+    }
+    const windows = (listing.windows ?? []).filter((window) => window.live);
+    if (windows.length === 0) deps.log("Windows: none open");
+    for (const window of windows) {
+      deps.log(`Window ${window.id}`);
+      for (const tab of window.tabs) {
+        deps.log(
+          `  ${tab.path}${tab.done ? " (done)" : ""}${tab.openThreads > 0 ? ` (${tab.openThreads} open threads)` : ""}`,
+        );
+      }
+    }
+    const items = listing.queue?.items ?? [];
+    if (items.length === 0) {
+      deps.log("Queue: empty");
+    } else {
+      deps.log(
+        `Queue: ${items.length} waiting for the next batch at ${formatClockTime(listing.queue?.releaseAt ?? undefined)}`,
+      );
+      for (const item of items) deps.log(`  ${item.path}`);
+    }
+    return 0;
+  }
+
+  if (action === "release") {
+    if (operands.length > 0) {
+      deps.error(TABS_USAGE);
+      return USAGE_ERROR;
+    }
+    if (!server) return notRunning();
+    const baseUrl = buildPublicBaseUrl(server.port);
+    const payload = (await postTabsApi(deps, baseUrl, "/api/tabs/release", {
+      open: false,
+    })) as {
+      released?: number;
+      url?: string;
+      windowId?: string;
+    } | null;
+    if (!payload || typeof payload.released !== "number") {
+      deps.error("This Roughdraft server does not support tab windows.");
+      return 1;
+    }
+    let openMode: OpenMode | null = null;
+    if (payload.url && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
+      try {
+        openMode = await openTabWindowUrl(
+          deps,
+          new URL(payload.url, baseUrl).toString(),
+        );
+      } catch (error) {
+        if (!(error instanceof OrcaTabRequiredError)) throw error;
+        deps.error(error.message);
+        return 1;
+      }
+    }
+    if (json) {
+      emitJson(deps.log, {
+        released: payload.released,
+        ...(payload.windowId ? { windowId: payload.windowId } : {}),
+        ...(payload.url
+          ? { url: new URL(payload.url, baseUrl).toString() }
+          : {}),
+        ...(openMode ? { openMode } : {}),
+      });
+      return 0;
+    }
+    deps.log(
+      payload.released === 0
+        ? "Nothing is queued."
+        : `Released ${payload.released} queued document(s)${payload.url ? " in a new window" : " to the open window"}.`,
+    );
+    return 0;
+  }
+
+  if (action !== "add" && action !== "focus" && action !== "close") {
+    deps.error(TABS_USAGE);
+    return USAGE_ERROR;
+  }
+  if (operands.length !== 1) {
+    deps.error(TABS_USAGE);
+    return USAGE_ERROR;
+  }
+  let target: ResolvedTargetPath;
+  try {
+    target = resolveTargetPath(operands[0] ?? "");
+  } catch (error) {
+    deps.error(error instanceof Error ? error.message : "Invalid path.");
+    return 1;
+  }
+
+  if (action === "add") {
+    const ensured = await ensureServerRunning(deps, {
+      projectDir: target.projectDir,
+    });
+    const baseUrl = buildPublicBaseUrl(ensured.server.port);
+    const payload = await postTabsApi(deps, baseUrl, "/api/tabs/open", {
+      tabs: [
+        {
+          path: target.openPath,
+          ...(options.label?.trim() ? { label: options.label.trim() } : {}),
+        },
+      ],
+      now: true,
+      ...(options.window ? { windowId: options.window } : {}),
+      orcaTarget: resolveOrcaTarget(deps.env),
+    });
+    if (!isTabOpenResponse(payload)) {
+      deps.error("This Roughdraft server does not support tab windows.");
+      return 1;
+    }
+    let openMode: OpenMode | null = null;
+    const windowUrl = payload.url
+      ? new URL(payload.url, baseUrl).toString()
+      : null;
+    if (windowUrl && !options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
+      try {
+        openMode = await openTabWindowUrl(deps, windowUrl);
+      } catch (error) {
+        if (!(error instanceof OrcaTabRequiredError)) throw error;
+        deps.error(error.message);
+        return 1;
+      }
+    }
+    const status = payload.results[0]?.status ?? "added";
+    if (json) {
+      emitJson(deps.log, {
+        path: target.openPath,
+        status,
+        ...(payload.windowId ? { windowId: payload.windowId } : {}),
+        ...(windowUrl ? { url: windowUrl } : {}),
+        ...(openMode ? { openMode } : {}),
+      });
+      return 0;
+    }
+    deps.log(
+      windowUrl
+        ? describeOpenedDocument(openMode ?? "disabled", windowUrl)
+        : status === "focused"
+          ? `Already open, focused: ${target.openPath}`
+          : `Added to the open Roughdraft window: ${target.openPath}`,
+    );
+    return 0;
+  }
+
+  if (!server) return notRunning();
+  const baseUrl = buildPublicBaseUrl(server.port);
+  const payload = (await postTabsApi(deps, baseUrl, `/api/tabs/${action}`, {
+    path: target.openPath,
+    ...(options.window ? { windowId: options.window } : {}),
+  })) as { focused?: boolean; closed?: boolean; from?: string } | null;
+  if (!payload) {
+    deps.error("This Roughdraft server does not support tab windows.");
+    return 1;
+  }
+  const ok = action === "focus" ? payload.focused === true : payload.closed === true;
+  if (json) {
+    emitJson(deps.log, {
+      path: target.openPath,
+      [action === "focus" ? "focused" : "closed"]: ok,
+      ...(payload.from ? { from: payload.from } : {}),
+    });
+    return ok ? 0 : 1;
+  }
+  deps.log(
+    ok
+      ? action === "focus"
+        ? `Focused ${target.openPath}.`
+        : `Closed ${target.openPath}${payload.from === "queue" ? " (removed from the queue)" : ""}.`
+      : `${target.openPath} is not open in a Roughdraft window.`,
+  );
+  return ok ? 0 : 1;
+}
+
+const REPLY_USAGE =
+  "Usage: roughdraft reply <path> --to <id> [--by <name>] [--json] <text...>";
+
+function runReply(
+  deps: CliDependencies,
+  args: string[],
+  globalJson: boolean,
+): number {
+  let json = globalJson;
+  let to: string | undefined;
+  let by: string | undefined;
+  const positionals: string[] = [];
+
+  try {
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index] ?? "";
+      if (arg === "--") {
+        positionals.push(...args.slice(index + 1));
+        break;
+      }
+      if (arg === "-h" || arg === "--help") {
+        printCommandHelp("reply", deps.log);
+        return 0;
+      }
+      if (arg === "--json") {
+        json = true;
+      } else if (arg === "--to" || arg === "--by") {
+        const next = takeFlagValue(args, index, arg);
+        if (arg === "--to") to = next.value;
+        else by = next.value;
+        index = next.nextIndex;
+      } else if (arg.startsWith("--to=")) {
+        to = arg.slice("--to=".length);
+      } else if (arg.startsWith("--by=")) {
+        by = arg.slice("--by=".length);
+      } else if (arg.startsWith("-") && arg.length > 1) {
+        throw new Error(`Unknown flag: ${arg}`);
+      } else {
+        positionals.push(arg);
+      }
+    }
+  } catch (error) {
+    deps.error(error instanceof Error ? error.message : "Invalid usage.");
+    return USAGE_ERROR;
+  }
+
+  const [file, ...textParts] = positionals;
+  const message = textParts.join(" ").trim();
+  if (!file || !to || to.trim().length === 0 || message.length === 0) {
+    deps.error(REPLY_USAGE);
+    return USAGE_ERROR;
+  }
+
+  const absolutePath = path.resolve(deps.cwd, file);
+  if (!isMarkdownPath(absolutePath)) {
+    deps.error(`Roughdraft can only edit .md files: ${absolutePath}`);
+    return 1;
+  }
+  if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+    deps.error(`Markdown file not found: ${absolutePath}`);
+    return 1;
+  }
+
+  try {
+    const result = replyToComment(absolutePath, {
+      parentId: to,
+      message,
+      author: by,
+    });
+    if (json) {
+      deps.log(
+        JSON.stringify({
+          replied: true,
+          id: result.id,
+          parentId: result.parentId,
+        }),
+      );
+    } else {
+      deps.log(`Replied to ${result.parentId} in ${absolutePath}.`);
+    }
+    return 0;
+  } catch (error) {
+    deps.error(error instanceof Error ? error.message : "Could not reply.");
+    return 1;
+  }
 }
 
 const DEFAULT_RECONNECT_SECONDS = 120;
@@ -3024,15 +3895,37 @@ export async function runCli(
         return 0;
       }
 
-      if (options.positionals.length !== 1) {
-        deps.error("Usage: roughdraft watch <path> [--json]");
+      if (options.positionals.length < 1) {
+        deps.error("Usage: roughdraft watch <path> [<path>...] [--comments] [--json]");
         return USAGE_ERROR;
       }
 
       deps = applyWatchEnvOverrides(deps, options);
       const json = parsed.global.json || options.json;
       shouldPrintUpdateNotice = !json;
+      if (options.positionals.length > 1) {
+        if (options.comments || options.afterSequence !== undefined) {
+          deps.error(
+            "--comments and --after work on one file: watch the files one at a time.",
+          );
+          return USAGE_ERROR;
+        }
+        return runWatchMany(
+          deps,
+          options.positionals,
+          {
+            batchWindowSeconds: options.batchWindowSeconds,
+            replay: options.replay,
+            timeoutSeconds: options.timeoutSeconds,
+          },
+          json,
+        );
+      }
       return runWatch(deps, options.positionals[0] ?? "", options, json);
+    }
+
+    if (command === "reply") {
+      return runReply(deps, rest, parsed.global.json);
     }
 
     if (command === "mcp") {
@@ -3104,16 +3997,13 @@ export async function runCli(
         return 0;
       }
 
-      const target = options.positionals[0];
+      const targets = options.positionals;
+      const target = targets[0];
       if (!target) {
-        deps.error("Usage: roughdraft open <path>");
+        deps.error("Usage: roughdraft open <path> [<path>...]");
         return USAGE_ERROR;
       }
-
-      if (options.positionals.length > 1) {
-        deps.error("Usage: roughdraft open <path>");
-        return USAGE_ERROR;
-      }
+      const several = targets.length > 1;
 
       if (options.watch && options.noWatch) {
         deps.error("Use either --watch or --no-watch, not both.");
@@ -3135,17 +4025,36 @@ export async function runCli(
         return USAGE_ERROR;
       }
 
-      deps = applyCliEnvOverrides(deps, options);
-      const json = parsed.global.json || options.json;
-      let resolvedTarget: ResolvedTargetPath;
-      try {
-        resolvedTarget = resolveTargetPath(target);
-      } catch (error) {
-        deps.error(error instanceof Error ? error.message : "Invalid path.");
-        return 1;
+      if (options.comments && (options.noWatch || options.printUrl)) {
+        deps.error(
+          "--comments needs the watch: do not combine it with --no-watch or --print-url.",
+        );
+        return USAGE_ERROR;
       }
 
-      const { projectDir, openPath } = resolvedTarget;
+      if (
+        several &&
+        (options.loop || options.comments || options.afterSequence !== undefined)
+      ) {
+        deps.error(
+          "--loop, --comments and --after work on one file: open the files one by one, or watch them with `roughdraft watch a.md b.md`.",
+        );
+        return USAGE_ERROR;
+      }
+
+      deps = applyCliEnvOverrides(deps, options);
+      const json = parsed.global.json || options.json;
+      const resolvedTargets: ResolvedTargetPath[] = [];
+      for (const entry of targets) {
+        try {
+          resolvedTargets.push(resolveTargetPath(entry));
+        } catch (error) {
+          deps.error(error instanceof Error ? error.message : "Invalid path.");
+          return 1;
+        }
+      }
+
+      const { projectDir, openPath } = resolvedTargets[0] as ResolvedTargetPath;
       const sessionLabel = options.label?.trim() || null;
 
       const remoteHost =
@@ -3153,6 +4062,12 @@ export async function runCli(
           ? deps.env.ROUGHDRAFT_HOST.trim()
           : "";
       if (remoteHost.length > 0) {
+        if (several) {
+          deps.error(
+            "ROUGHDRAFT_HOST opens one file at a time: a remote session has no tab window.",
+          );
+          return USAGE_ERROR;
+        }
         if (options.loop) {
           deps.error(
             "--loop is not supported with ROUGHDRAFT_HOST: a remote session never receives Done Reviewing.",
@@ -3180,47 +4095,74 @@ export async function runCli(
       }
 
       const targetUrl = buildTargetUrl(baseUrl, openPath, sessionLabel);
-      warnBeforeReusingAnotherSessionsTab(
-        deps,
-        result?.server.documents ?? [],
-        openPath,
-        sessionLabel,
-      );
+      if (!several) {
+        warnBeforeReusingAnotherSessionsTab(
+          deps,
+          result?.server.documents ?? [],
+          openPath,
+          sessionLabel,
+        );
+      }
       let openMode: OpenMode = "disabled";
+      let tabResults: TabOpenResultPayload[] | null = null;
+      let windowUrl: string | null = null;
       if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
-        // Why: inside Orca the tab in the agent's worktree wins over reusing a
-        // window that may be open elsewhere, so the review shows up where the
-        // agent runs, desktop or Orca mobile.
-        let orcaOpenMode: OpenMode | null;
         try {
-          orcaOpenMode = await openInOrcaTab(deps, targetUrl);
+          const tabsResponse = await postTabsApi(
+            deps,
+            baseUrl,
+            "/api/tabs/open",
+            {
+              tabs: resolvedTargets.map((entry) => ({
+                path: entry.openPath,
+                ...(sessionLabel ? { label: sessionLabel } : {}),
+              })),
+              ...(options.now ? { now: true } : {}),
+              orcaTarget: resolveOrcaTarget(deps.env),
+            },
+          );
+          if (isTabOpenResponse(tabsResponse)) {
+            tabResults = tabsResponse.results;
+            if (tabsResponse.url) {
+              windowUrl = new URL(tabsResponse.url, baseUrl).toString();
+              openMode = await openTabWindowUrl(deps, windowUrl);
+            } else if (
+              tabResults.some(
+                (entry) => entry.status === "added" || entry.status === "focused",
+              )
+            ) {
+              openMode = "existing-window";
+            } else {
+              openMode = "none";
+            }
+            // A plain page that already shows the file keeps today's delivery.
+            for (const entry of tabResults) {
+              if (entry.status !== "single-page") continue;
+              openMode = await openSingleDocument(deps, {
+                baseUrl,
+                targetUrl: buildTargetUrl(baseUrl, entry.path, sessionLabel),
+                openPath: entry.path,
+                sessionLabel,
+              });
+            }
+          } else if (several) {
+            deps.error(
+              "This Roughdraft server does not support tab windows: restart it, or open the files one by one.",
+            );
+            return 1;
+          } else {
+            openMode = await openSingleDocument(deps, {
+              baseUrl,
+              targetUrl,
+              openPath,
+              sessionLabel,
+            });
+          }
         } catch (error) {
           if (!(error instanceof OrcaTabRequiredError)) throw error;
           deps.error(error.message);
           return 1;
         }
-        if (orcaOpenMode === "existing-orca-tab") {
-          // Orca only brings the reused tab forward; the open request is
-          // what tells the page about the new session label.
-          await sendOpenRequestToExistingWindow(
-            deps,
-            baseUrl,
-            targetUrl,
-            openPath,
-            sessionLabel,
-          );
-        }
-        openMode =
-          orcaOpenMode ??
-          ((await sendOpenRequestToExistingWindow(
-            deps,
-            baseUrl,
-            targetUrl,
-            openPath,
-            sessionLabel,
-          ))
-            ? "existing-window"
-            : deps.openUrl(targetUrl));
       }
 
       if (result?.portChanged) {
@@ -3233,20 +4175,87 @@ export async function runCli(
       }
 
       if (options.printUrl) {
-        deps.log(targetUrl);
+        for (const entry of resolvedTargets) {
+          deps.log(buildTargetUrl(baseUrl, entry.openPath, sessionLabel));
+        }
         return 0;
       }
+
+      const queued = (tabResults ?? []).filter(
+        (entry) => entry.status === "queued",
+      );
+      const shownUrl = windowUrl ?? targetUrl;
+      const describeTabs = () => {
+        for (const entry of tabResults ?? []) {
+          const name = several
+            ? ` ${relativeDisplayPath(deps.cwd, entry.path)}`
+            : "";
+          if (entry.status === "queued") {
+            deps.log(
+              `Queued${name} for the next batch at ${formatClockTime(entry.releaseAt)}.`,
+            );
+          } else if (entry.status === "added") {
+            deps.log(
+              `Added${name || ""} to the open Roughdraft window${name ? "" : `: ${entry.path}`}.`,
+            );
+          } else if (entry.status === "focused") {
+            deps.log(
+              `Already open${name}, focused in the Roughdraft window${name ? "" : `: ${entry.path}`}.`,
+            );
+          }
+        }
+        if (windowUrl) deps.log(describeOpenedDocument(openMode, windowUrl));
+      };
+      const describeAll = () => {
+        if (tabResults === null) {
+          deps.log(describeOpenedDocument(openMode, shownUrl));
+        } else if (
+          tabResults.length > 0 &&
+          tabResults.every((entry) => entry.status === "single-page")
+        ) {
+          deps.log(describeOpenedDocument(openMode, targetUrl));
+        } else {
+          describeTabs();
+        }
+      };
 
       const shouldWatch = !options.noWatch && !options.printUrl;
 
       if (shouldWatch) {
         if (!json) {
-          deps.log(describeOpenedDocument(openMode, targetUrl));
+          describeAll();
           deps.log("Waiting for Done Reviewing...");
+        } else {
+          for (const entry of queued) {
+            deps.log(
+              JSON.stringify({
+                queued: true,
+                releaseAt: entry.releaseAt ?? null,
+                path: entry.path,
+              }),
+            );
+          }
         }
 
+        shouldPrintUpdateNotice = false;
+        if (several) {
+          return runWatchMany(
+            deps,
+            targets,
+            {
+              batchWindowSeconds: options.batchWindowSeconds,
+              replay: options.replay,
+              timeoutSeconds: options.timeoutSeconds,
+              serverUrl: liveDevFrontend?.apiUrl ?? undefined,
+            },
+            json,
+          );
+        }
         const watchOptions: ParsedWatchOptions = {
           batchWindowSeconds: options.batchWindowSeconds,
+          batchWindowExplicit: options.batchWindowExplicit,
+          comments: options.comments,
+          afterSequence: options.afterSequence,
           help: false,
           json,
           loop: options.loop,
@@ -3257,14 +4266,34 @@ export async function runCli(
           stateFile: options.stateFile,
           timeoutSeconds: options.timeoutSeconds,
         };
-        shouldPrintUpdateNotice = false;
         return runWatch(deps, target, watchOptions, json);
       }
 
       if (json) {
+        if (several) {
+          emitJson(deps.log, {
+            opened: tabResults?.some((entry) => entry.status !== "queued") ?? true,
+            serverUrl: baseUrl,
+            ...(windowUrl ? { url: windowUrl } : {}),
+            openMode,
+            tabs:
+              tabResults ??
+              resolvedTargets.map((entry) => ({ path: entry.openPath })),
+          });
+          return 0;
+        }
+        const only = tabResults?.[0];
+        if (only?.status === "queued") {
+          emitJson(deps.log, {
+            queued: true,
+            releaseAt: only.releaseAt ?? null,
+            path: openPath,
+          });
+          return 0;
+        }
         emitJson(deps.log, {
           opened: true,
-          url: targetUrl,
+          url: shownUrl,
           serverUrl: baseUrl,
           path: openPath,
           openMode,
@@ -3273,8 +4302,12 @@ export async function runCli(
       }
 
       shouldPrintUpdateNotice = true;
-      deps.log(describeOpenedDocument(openMode, targetUrl));
+      describeAll();
       return 0;
+    }
+
+    if (command === "tabs") {
+      return runTabs(deps, rest, parsed.global.json);
     }
 
     return USAGE_ERROR;

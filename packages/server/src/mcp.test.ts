@@ -204,4 +204,279 @@ describe("mcp", () => {
       ),
     ).rejects.toThrow(/action must be/);
   });
+  it("asks for comment events only when includeComments is set", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(
+        JSON.stringify({
+          events: [
+            {
+              type: "comment.added",
+              sequence: 3,
+              comments: [{ id: "c2", kind: "comment", text: "Cut this" }],
+            },
+          ],
+          timedOut: false,
+          nextSequence: 4,
+          instanceId: "i1",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+    const env = { ROUGHDRAFT_STATE_FILE: stateFile };
+
+    const plain = await callTool(
+      "roughdraft_watch_review_events",
+      { documentPath, timeoutSeconds: 1 },
+      env,
+      fetchImpl,
+    );
+    const withComments = await callTool(
+      "roughdraft_watch_review_events",
+      { documentPath, timeoutSeconds: 1, includeComments: true },
+      env,
+      fetchImpl,
+    );
+
+    expect(bodies[0]).not.toHaveProperty("includeComments");
+    expect(bodies[0]?.batchWindowSeconds).toBe(0.25);
+    expect(bodies[1]).toMatchObject({
+      includeComments: true,
+      batchWindowSeconds: 3,
+    });
+    // A comment event is not a done-signal.
+    expect(withComments).toMatchObject({ done: false, doneReason: null });
+    expect(plain).toMatchObject({ done: false });
+  });
+
+  it("returns the new reply id from roughdraft_reply_to_comment", async () => {
+    fs.writeFileSync(
+      documentPath,
+      '# Draft\n\nKeep {==it==}{>>Why?<<}{#c1} here.\n\n---\ncomments:\n  c1:\n    by: user\n    at: "2026-11-28T10:00:00.000Z"\n',
+    );
+
+    const result = (await callTool(
+      "roughdraft_reply_to_comment",
+      { documentPath, parentId: "c1", message: "Because." },
+      { ROUGHDRAFT_STATE_FILE: stateFile },
+    )) as { ok: boolean; id: string; parentId: string };
+
+    expect(result).toMatchObject({ ok: true, parentId: "c1" });
+    expect(result.id).not.toBe("");
+    expect(fs.readFileSync(documentPath, "utf8")).toContain("Because.");
+  });
+
+  it("sends afterSequence as a literal cursor instead of from now", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(
+        JSON.stringify({ events: [], timedOut: true, nextSequence: 9 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+
+    await callTool(
+      "roughdraft_watch_review_events",
+      {
+        documentPath,
+        timeoutSeconds: 0,
+        includeComments: true,
+        afterSequence: 4,
+      },
+      { ROUGHDRAFT_STATE_FILE: stateFile },
+      fetchImpl,
+    );
+
+    expect(bodies[0]).toMatchObject({ fromNow: false, afterSequence: 4 });
+  });
+
+  describe("tab windows", () => {
+    interface Call {
+      method: string;
+      path: string;
+      body: unknown;
+    }
+
+    function recordingFetch(answers: Record<string, unknown>) {
+      const calls: Call[] = [];
+      const fetchImpl: typeof fetch = async (input, init) => {
+        const url = new URL(String(input));
+        calls.push({
+          method: init?.method ?? "GET",
+          path: url.pathname,
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        });
+        return new Response(JSON.stringify(answers[url.pathname] ?? {}), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      };
+      return { calls, fetchImpl };
+    }
+
+    const env = () => ({ ROUGHDRAFT_STATE_FILE: stateFile });
+
+    it("opens several files as tabs and asks the server to open the window", async () => {
+      const second = path.join(projectDir, "second.md");
+      fs.writeFileSync(second, "# Second\n");
+      const answer = {
+        results: [
+          { path: documentPath, status: "open-window", windowId: "w1" },
+          { path: second, status: "queued", releaseAt: "2026-11-28T12:00:00Z" },
+        ],
+        url: "/tabs?window=w1",
+        windowId: "w1",
+        opened: true,
+      };
+      const { calls, fetchImpl } = recordingFetch({
+        "/api/tabs/open": answer,
+      });
+
+      const result = await callTool(
+        "roughdraft_open_tabs",
+        { paths: [documentPath, second], now: true, label: "plan", since: "HEAD~1" },
+        env(),
+        fetchImpl,
+      );
+
+      expect(result).toEqual(answer);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ method: "POST", path: "/api/tabs/open" });
+      expect(calls[0]?.body).toMatchObject({
+        tabs: [
+          { path: documentPath, label: "plan", since: "HEAD~1" },
+          { path: second, label: "plan", since: "HEAD~1" },
+        ],
+        now: true,
+        open: true,
+      });
+    });
+
+    it("lists the tabs and the queue, and says so when Roughdraft is not running", async () => {
+      const listing = {
+        windows: [{ id: "w1", tabs: [] }],
+        queue: { items: [], releaseAt: null, batchOpenedAt: null },
+      };
+      const { calls, fetchImpl } = recordingFetch({ "/api/tabs": listing });
+
+      expect(await callTool("roughdraft_list_tabs", {}, env(), fetchImpl)).toEqual(
+        { running: true, ...listing },
+      );
+      expect(calls[0]).toMatchObject({ method: "GET", path: "/api/tabs" });
+
+      fs.rmSync(stateFile);
+      expect(
+        await callTool("roughdraft_list_tabs", {}, env(), fetchImpl),
+      ).toMatchObject({ running: false, windows: [] });
+    });
+
+    it("adds one tab at once", async () => {
+      const { calls, fetchImpl } = recordingFetch({
+        "/api/tabs/open": { results: [{ path: documentPath, status: "added" }] },
+      });
+
+      await callTool(
+        "roughdraft_add_tab",
+        { path: documentPath, windowId: "w1" },
+        env(),
+        fetchImpl,
+      );
+
+      expect(calls[0]?.body).toMatchObject({
+        tabs: [{ path: documentPath }],
+        now: true,
+        open: true,
+        windowId: "w1",
+      });
+    });
+
+    it("focuses and closes a tab", async () => {
+      const { calls, fetchImpl } = recordingFetch({
+        "/api/tabs/focus": { focused: true },
+        "/api/tabs/close": { closed: true, from: "window" },
+      });
+
+      expect(
+        await callTool("roughdraft_focus_tab", { path: documentPath }, env(), fetchImpl),
+      ).toEqual({ focused: true });
+      expect(
+        await callTool(
+          "roughdraft_close_tab",
+          { path: documentPath, windowId: "w2" },
+          env(),
+          fetchImpl,
+        ),
+      ).toEqual({ closed: true, from: "window" });
+      expect(calls.map((call) => call.path)).toEqual([
+        "/api/tabs/focus",
+        "/api/tabs/close",
+      ]);
+      expect(calls[1]?.body).toEqual({ path: documentPath, windowId: "w2" });
+    });
+
+    it("releases the queue and lets the server open the window", async () => {
+      const { calls, fetchImpl } = recordingFetch({
+        "/api/tabs/release": { released: 2, windowId: "w1" },
+      });
+
+      expect(
+        await callTool("roughdraft_release_queued_tabs", {}, env(), fetchImpl),
+      ).toEqual({ released: 2, windowId: "w1" });
+      expect(calls[0]).toMatchObject({
+        path: "/api/tabs/release",
+        body: { open: true },
+      });
+    });
+
+    it("watches several files at once and reports each", async () => {
+      const second = path.join(projectDir, "second.md");
+      fs.writeFileSync(second, "# Second\n");
+      const bodies: Array<{ path: string }> = [];
+      const fetchImpl: typeof fetch = async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { path: string };
+        bodies.push(body);
+        const done = body.path === "draft.md";
+        return new Response(
+          JSON.stringify(
+            done
+              ? {
+                  events: [{ sequence: 1, doneReason: "threads-cleared" }],
+                  timedOut: false,
+                  nextSequence: 2,
+                }
+              : { events: [], timedOut: true, nextSequence: 1 },
+          ),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+
+      const result = (await callTool(
+        "roughdraft_watch_review_events",
+        { paths: [documentPath, second], timeoutSeconds: 0 },
+        env(),
+        fetchImpl,
+      )) as {
+        allDone: boolean;
+        documents: Array<{ documentPath: string; done: boolean; timedOut: boolean }>;
+      };
+
+      expect(bodies.map((body) => body.path).sort()).toEqual([
+        "draft.md",
+        "second.md",
+      ]);
+      expect(result.allDone).toBe(false);
+      expect(result.documents).toMatchObject([
+        { documentPath, done: true, timedOut: false },
+        { documentPath: second, done: false, timedOut: true },
+      ]);
+    });
+
+    it("rejects open_tabs without paths", async () => {
+      await expect(
+        callTool("roughdraft_open_tabs", {}, env(), recordingFetch({}).fetchImpl),
+      ).rejects.toThrow("paths is required");
+    });
+  });
 });
